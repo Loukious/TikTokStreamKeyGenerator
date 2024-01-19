@@ -34,7 +34,7 @@ class Stream:
 
 
 if len(sys.argv) < 4:
-    print("Usage: python TiktokStreamKeyGenerator.py <sid_guard_cookie> <title> <game_tag_id> [gen_replay] [close_room_when_close_stream]")
+    print("Usage: python TikTokStreamKeyGenerator.py <sid_guard_cookie> <title> <game_tag_id> [gen_replay] [close_room_when_close_stream]")
     sys.exit(1)
 
 sid_guard_cookie = sys.argv[1]

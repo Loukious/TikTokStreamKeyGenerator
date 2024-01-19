@@ -38,7 +38,7 @@ Run the script with the necessary parameters from the command line.
 
 ### Command Format
 ```bash
-python TiktokStreamKeyGenerator.py <sid_guard> <title> <game_tag_id> [gen_replay] [close_room_when_close_stream]
+python TikTokStreamKeyGenerator.py <sid_guard> <title> <game_tag_id> [gen_replay] [close_room_when_close_stream]
 ```
 
 - `sid_guard_cookie`: Your TikTok SID guard cookie.
@@ -50,7 +50,7 @@ python TiktokStreamKeyGenerator.py <sid_guard> <title> <game_tag_id> [gen_replay
 ### Example
 
 ```bash
-python TiktokStreamKeyGenerator .py "your_sid_guard_cookie" "My Stream Title" "12345" true false
+python TikTokStreamKeyGenerator .py "your_sid_guard_cookie" "My Stream Title" "12345" true false
 ```
 ## Output
 
