@@ -9,6 +9,14 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Obtain a shareable URL for the TikTok live stream.
 - Support for specifying different games by their game tag IDs.
 
+## Requirements
+- Python 3.6+
+- `requests` library
+- TikTok `sid_guard` cookie
+- Game tag ID
+- Logged into TikTok LIVE studio at least once
+- Have TikTok LIVE studio access
+
 ## Obtaining the `sid_guard` cookie
 To use this script, you need the `sid_guard` cookie from TikTok. This can be obtained through:
 
