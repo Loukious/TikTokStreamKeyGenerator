@@ -32,7 +32,10 @@ To use this script, you need the `sid_guard` cookie from TikTok. This can be obt
 3. Locate and copy the value of the `sid_guard` cookie.
 
 ## Finding Game Tag IDs
-You can find different game tag IDs for your stream at [TikTok Live API Game Tag List](https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/).
+1. Download and install this extension: [JSON Formatter](https://chromewebstore.google.com/detail/json-formatter/bcjindcccaagfpapjjmafapmmgkkhgoa) (optional but recommended).
+2. Visit this url to find [TikTok Live API Game Tag List](https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/).
+3. Use the id from the list to specify the game tag ID.
+
 
 ## Installation
 Ensure you have Python and the `requests` library installed.
@@ -67,3 +70,6 @@ The script will output:
 - **Stream key for OBS Studio integration:** Stream key that that you can use in OBS Studio to stream to TikTok.
 - **Shareable URL for the live stream:** A URL that can be shared for others to view the live stream.
 
+## FAQ
+### I'm getting a "Please login first" error. What should I do?
+Swap the url inside TikTokStreamKeyGenerator.py at the line 21.

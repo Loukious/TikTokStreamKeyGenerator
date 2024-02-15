@@ -19,6 +19,7 @@ class Stream:
 
     def createStream(self, sid_guard_cookie, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True):
         url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/create/"
+        # url = "https://webcast16-normal-c-useast1a.tiktokv.com/webcast/room/create/" # uncomment this if the above url doesn't work
         params = {
             "aid": "8311" # Not sure what this is 
         }
