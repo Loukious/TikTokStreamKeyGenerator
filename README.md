@@ -58,7 +58,7 @@ python TikTokStreamKeyGenerator.py <sid_guard> <title> <game_tag_id> [gen_replay
 ### Example
 
 ```bash
-python TikTokStreamKeyGenerator .py "your_sid_guard_cookie" "My Stream Title" "12345" true false
+python TikTokStreamKeyGenerator.py "your_sid_guard_cookie" "My Stream Title" "12345" true false
 ```
 ## Output
 
