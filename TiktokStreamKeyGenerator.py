@@ -53,6 +53,6 @@ close_room_when_close_stream = sys.argv[5].lower() == 'true' if len(sys.argv) > 
 s = Stream(sid_guard_cookie, title, game_tag_id, gen_replay, close_room_when_close_stream)
 
 if s.created:
-    print(s.baseStreamUrl)
-    print(s.streamKey)
-    print(s.streamShareUrl)
+    print("Server: " + s.baseStreamUrl)
+    print("Stream Key: " + s.streamKey)
+    print("Stream Sharing URL: " + s.streamShareUrl)
