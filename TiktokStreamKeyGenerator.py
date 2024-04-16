@@ -3,7 +3,7 @@ import json
 import sys
 
 class Stream:
-    def __init__(self, sid_guard_cookie, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True):
+    def __init__(self, sid_guard_cookie, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True, age_restricred=False):
         self.streamInfo = self.createStream(sid_guard_cookie, title, game_tag_id, gen_replay, close_room_when_close_stream)
         self.created = False
         try:
@@ -17,11 +17,11 @@ class Stream:
             print(self.streamInfo["data"]["prompts"])
 
 
-    def createStream(self, sid_guard_cookie, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True):
-        url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/create/"
-        # url = "https://webcast16-normal-c-useast1a.tiktokv.com/webcast/room/create/" # uncomment this if the above url doesn't work
+    def createStream(self, sid_guard_cookie, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True, age_restricred=False):
+        #url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/create/"
+        url = "https://webcast16-normal-c-useast1a.tiktokv.com/webcast/room/create/" # uncomment this if the above url doesn't work
         params = {
-            "aid": "8311" # Not sure what this is 
+            "aid": "8311" # Not sure what this is
         }
         data = {
             "title": title, # Title of stream
@@ -29,7 +29,8 @@ class Stream:
             "game_tag_id": game_tag_id, # Game ID find more at https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/
             "gen_replay": gen_replay, # To generate replay
             "close_room_when_close_stream": close_room_when_close_stream, # To close room when stream is closed
-            "live_studio": "1" # To mark stream as gaming stream
+            "live_studio": "1", # To mark stream as gaming stream
+            "ageRestrict" : age_restricted
         }
         headers = {
             "cookie": "sid_guard=" + sid_guard_cookie, # Your cookie
@@ -41,7 +42,7 @@ class Stream:
 
 
 if len(sys.argv) < 4:
-    print("Usage: python TikTokStreamKeyGenerator.py <sid_guard_cookie> <title> <game_tag_id> [gen_replay] [close_room_when_close_stream]")
+    print("Usage: python TikTokStreamKeyGenerator.py <sid_guard_cookie> <title> <game_tag_id> [gen_replay] [close_room_when_close_stream] [age_restricred]")
     sys.exit(1)
 
 sid_guard_cookie = sys.argv[1]
@@ -49,8 +50,9 @@ title = sys.argv[2]
 game_tag_id = sys.argv[3]
 gen_replay = sys.argv[4].lower() == 'true' if len(sys.argv) > 4 else False
 close_room_when_close_stream = sys.argv[5].lower() == 'true' if len(sys.argv) > 5 else True
+age_restricted = sys.argv[6].lower() == 'on' if sys.argv[6] == 'true' else 'off'
 
-s = Stream(sid_guard_cookie, title, game_tag_id, gen_replay, close_room_when_close_stream)
+s = Stream(sid_guard_cookie, title, game_tag_id, gen_replay, close_room_when_close_stream, age_restricted)
 
 if s.created:
     print("Server: " + s.baseStreamUrl)
