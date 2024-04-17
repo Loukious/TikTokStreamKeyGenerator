@@ -8,28 +8,18 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Generate a TikTok stream key.
 - Obtain a shareable URL for the TikTok live stream.
 - Support for specifying different games by their game tag IDs.
+- Option to enable replay generation.
+- Option to close the room when the stream ends.
+- Option to choose region priority.
+- Option to mark the stream as mature content.
 
 ## Requirements
 - Python 3.6+
-- `requests` library
-- TikTok `sid_guard` cookie
+- Google Chrome browser
 - Game tag ID
 - Logged into TikTok LIVE studio at least once
 - Have TikTok LIVE studio access
 
-## Obtaining the `sid_guard` cookie
-To use this script, you need the `sid_guard` cookie from TikTok. This can be obtained through:
-
-### Using Chrome Developer Tools
-1. Open Chrome and navigate to TikTok's website.
-2. Right-click anywhere on the page and select "Inspect" to open the Developer Tools.
-3. Navigate to the "Application" tab.
-4. Under "Cookies" on the left, find the TikTok domain and locate the `sid_guard` cookie. Copy its value.
-
-### Using EditThisCookie Extension
-1. Install [EditThisCookie](https://chromewebstore.google.com/detail/editthiscookie/fngmhnnpilhplaeedifhccceomclgfbg) for Chrome.
-2. Visit TikTok's website and click the EditThisCookie extension icon.
-3. Locate and copy the value of the `sid_guard` cookie.
 
 ## Finding Game Tag IDs
 1. Download and install this extension: [JSON Formatter](https://chromewebstore.google.com/detail/json-formatter/bcjindcccaagfpapjjmafapmmgkkhgoa) (optional but recommended).
@@ -38,31 +28,26 @@ To use this script, you need the `sid_guard` cookie from TikTok. This can be obt
 
 
 ## Installation
-Ensure you have Python and the `requests` library installed.
-
+Ensure you have Python and PIP working.
+In the command line, install the required packages using the following command (run the command in the same directory as the script):
 ```bash
-pip install requests
+pip install -r requirements.txt
+```
+or if pip is not working, try:
+```bash
+python -m pip install -r requirements.txt
 ```
 
 ## Usage
-Run the script with the necessary parameters from the command line.
+Simply run the script to open the GUI.
 
 ### Command Format
 ```bash
-python TikTokStreamKeyGenerator.py <sid_guard> <title> <game_tag_id> [gen_replay] [close_room_when_close_stream]
+python TikTokStreamKeyGenerator.py
 ```
 
-- `sid_guard_cookie`: Your TikTok SID guard cookie.
-- `title`: Title of your stream.
-- `game_tag_id`: Game tag ID from [TikTok Live API Game Tag List](https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/).
-- `gen_replay` (optional): `true` to enable replay generation.
-- `close_room_when_close_stream` (optional): `true` to close the room when the stream ends.
+Press the login button to login to TikTok. After logging in, you can enter the game tag ID, stream title, and other options. Press the go live button to generate the stream key.
 
-### Example
-
-```bash
-python TikTokStreamKeyGenerator.py "your_sid_guard_cookie" "My Stream Title" "12345" true false
-```
 ## Output
 
 The script will output:
@@ -72,4 +57,4 @@ The script will output:
 
 ## FAQ
 ### I'm getting a "Please login first" error. What should I do?
-Swap the url inside TikTokStreamKeyGenerator.py at the line 21.
+Swap the url inside TikTokStreamKeyGenerator.py at the line 27.
