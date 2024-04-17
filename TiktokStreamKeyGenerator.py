@@ -54,7 +54,7 @@ class Stream:
             cookies[cookie['name']] = cookie['value']
 
         with requests.session() as s:
-            info = s.post(url, params=params, data=data, headers=headers, cookies=cookies, verify=False).json()
+            info = s.post(url, params=params, data=data, headers=headers, cookies=cookies).json()
         return info
 
 def save_config():
