@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk, messagebox
 import json
 import os
 import threading
@@ -24,8 +24,8 @@ class Stream:
 
 
     def createStream(self, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True, age_restricted=False, priority_region=""):
-        url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/create/" # comment this line and uncomment the one below if this url doesn't work
-        # url = "https://webcast16-normal-c-useast1a.tiktokv.com/webcast/room/create/" 
+        #url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/create/" # comment this line and uncomment the one below if this url doesn't work
+        url = "https://webcast16-normal-c-useast1a.tiktokv.com/webcast/room/create/"
         params = {
             "aid": "8311", # App ID for TikTok Live Studio
             "app_name": "tiktok_live_studio", # App name for TikTok Live Studio
@@ -62,7 +62,7 @@ def save_config():
     data = {
         'title': title_entry.get(),
         'game_tag_id': game_tag_entry.get(),
-        'priority_region': region_entry.get(), 
+        'priority_region': region_entry.get(),
         'generate_replay': replay_var.get(),
         'close_room_when_close_stream': close_room_var.get(),
         'age_restricted': age_restricted_var.get()
@@ -75,7 +75,9 @@ def load_config():
     try:
         with open('config.json', 'r') as file:
             data = json.load(file)
+        title_entry.delete(0, tk.END)
         title_entry.insert(0, data['title'])
+        game_tag_entry.delete(0, tk.END)
         game_tag_entry.insert(0, data['game_tag_id'])
         region_entry.set(data['priority_region'])
         replay_var.set(data['generate_replay'])
@@ -151,57 +153,67 @@ def login_thread():
 app = tk.Tk()
 app.title("TikTok Stream Key Generator")
 
-# Input fields and labels
-tk.Label(app, text="Title").grid(row=0, column=0)
-title_entry = tk.Entry(app, width=30)
-title_entry.grid(row=0, column=1)
-title_entry.bind('<FocusOut>', lambda e: save_config())
+# Using LabelFrames for better organization
+input_frame = ttk.LabelFrame(app, text="Input")
+input_frame.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
 
-tk.Label(app, text="Game Tag ID").grid(row=1, column=0)
-game_tag_entry = tk.Entry(app)
-game_tag_entry.grid(row=1, column=1)
-game_tag_entry.bind('<FocusOut>', lambda e: save_config())
+# Input fields and labels inside the LabelFrame
+title_label = ttk.Label(input_frame, text="Title")
+title_label.grid(row=0, column=0, padx=5, pady=2, sticky="w")
 
-tk.Label(app, text="Region").grid(row=2, column=0)
-region_entry = ttk.Combobox(app, values=["", "ar", "bg", "bn-IN", "ceb-PH", "cs-CZ", "da", "de-DE", "el-GR", "en", "es", "et", "fi-FI", "fil-PH", "fr", "he-IL", "hi-IN", "hr", "hu-HU", "id-ID", "it-IT", "ja-JP", "jv-ID", "km-KH", "ko-KR", "lt", "lv", "ms-MY", "my-MM", "nb", "nl-NL", "pl-PL", "pt-BR", "ro-RO", "ru-RU", "sk", "sv-SE", "th-TH", "tr-TR", "uk-UA", "ur", "uz", "vi-VN", "zh-Hant-TW", "zh-Hans"])
-region_entry.grid(row=2, column=1)
+title_entry = ttk.Entry(input_frame)
+title_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
 
+game_tag_label = ttk.Label(input_frame, text="Game Tag ID")
+game_tag_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
+
+game_tag_entry = ttk.Entry(input_frame)
+game_tag_entry.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+
+region_label = ttk.Label(input_frame, text="Region")
+region_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
+
+region_entry = ttk.Combobox(input_frame, values=["", "ar", "bg", "bn-IN", "ceb-PH", "cs-CZ", "da", "de-DE", "el-GR", "en", "es", "et", "fi-FI", "fil-PH", "fr", "he-IL", "hi-IN", "hr", "hu-HU", "id-ID", "it-IT", "ja-JP", "jv-ID", "km-KH", "ko-KR", "lt", "lv", "ms-MY", "my-MM", "nb", "nl-NL", "pl-PL", "pt-BR", "ro-RO", "ru-RU", "sk", "sv-SE", "th-TH", "tr-TR", "uk-UA", "ur", "uz", "vi-VN", "zh-Hant-TW", "zh-Hans"])
+region_entry.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
 
 replay_var = tk.BooleanVar()
-tk.Checkbutton(app, text="Generate Replay", variable=replay_var).grid(row=3, column=0, columnspan=2)
+replay_checkbox = ttk.Checkbutton(input_frame, text="Generate Replay", variable=replay_var)
+replay_checkbox.grid(row=3, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 close_room_var = tk.BooleanVar(value=True)
-tk.Checkbutton(app, text="Close Room When Close Stream", variable=close_room_var).grid(row=4, column=0, columnspan=2)
+close_room_checkbox = ttk.Checkbutton(input_frame, text="Close Room When Close Stream", variable=close_room_var)
+close_room_checkbox.grid(row=4, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 age_restricted_var = tk.BooleanVar()
-tk.Checkbutton(app, text="Age Restricted", variable=age_restricted_var).grid(row=5, column=0, columnspan=2)
+age_restricted_checkbox = ttk.Checkbutton(input_frame, text="Age Restricted", variable=age_restricted_var)
+age_restricted_checkbox.grid(row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 # Cookies status
-cookies_status = tk.Label(app, text="Checking cookies...")
-cookies_status.grid(row=6, column=0, columnspan=2)
+cookies_status = ttk.Label(app, text="Checking cookies...")
+cookies_status.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
 
 # Buttons
-login_button = tk.Button(app, text="Login", command=login_thread, state=tk.DISABLED)
-login_button.grid(row=7, column=0)
+login_button = ttk.Button(app, text="Login", command=login_thread, state=tk.DISABLED)
+login_button.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
 
-go_live_button = tk.Button(app, text="Go Live", command=generate_stream, state=tk.DISABLED)
-go_live_button.grid(row=7, column=1)
+go_live_button = ttk.Button(app, text="Go Live", command=generate_stream, state=tk.DISABLED)
+go_live_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
 
-save_config_button = tk.Button(app, text="Save Config", command=save_config)
-save_config_button.grid(row=7, column=2)
+save_config_button = ttk.Button(app, text="Save Config", command=save_config)
+save_config_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
 
-check_cookies()
-load_config()
 # Outputs
-server_entry = tk.Entry(app, state="readonly", width=50)
-server_entry.grid(row=8, column=0, columnspan=2)
+output_frame = ttk.LabelFrame(app, text="Outputs")
+output_frame.grid(row=0, column=1, rowspan=5, padx=10, pady=5, sticky="nsew")
 
-key_entry = tk.Entry(app, state="readonly", width=50)
-key_entry.grid(row=9, column=0, columnspan=2)
+server_entry = ttk.Entry(output_frame, state="readonly")
+server_entry.grid(row=0, column=0, padx=5, pady=2, sticky="ew")
 
-url_entry = tk.Entry(app, state="readonly", width=50)
-url_entry.grid(row=10, column=0, columnspan=2)
-url_entry.grid(row=10, column=0, columnspan=2)
+key_entry = ttk.Entry(output_frame, state="readonly")
+key_entry.grid(row=1, column=0, padx=5, pady=2, sticky="ew")
+
+url_entry = ttk.Entry(output_frame, state="readonly")
+url_entry.grid(row=2, column=0, padx=5, pady=2, sticky="ew")
 
 def copy_to_clipboard(content):
     app.clipboard_clear()
@@ -209,13 +221,16 @@ def copy_to_clipboard(content):
     messagebox.showinfo("Copied", "Content copied to clipboard!")
 
 # Copy buttons for each Entry
-copy_server_button = tk.Button(app, text="Copy", command=lambda: copy_to_clipboard(server_entry.get()))
-copy_server_button.grid(row=8, column=2)
+copy_server_button = ttk.Button(output_frame, text="Copy", command=lambda: copy_to_clipboard(server_entry.get()))
+copy_server_button.grid(row=0, column=1, padx=5, pady=2)
 
-copy_key_button = tk.Button(app, text="Copy", command=lambda: copy_to_clipboard(key_entry.get()))
-copy_key_button.grid(row=9, column=2)
+copy_key_button = ttk.Button(output_frame, text="Copy", command=lambda: copy_to_clipboard(key_entry.get()))
+copy_key_button.grid(row=1, column=1, padx=5, pady=2)
 
-copy_url_button = tk.Button(app, text="Copy", command=lambda: copy_to_clipboard(url_entry.get()))
-copy_url_button.grid(row=10, column=2)
+copy_url_button = ttk.Button(output_frame, text="Copy", command=lambda: copy_to_clipboard(url_entry.get()))
+copy_url_button.grid(row=2, column=1, padx=5, pady=2)
+
+check_cookies()
+load_config()
 
 app.mainloop()
