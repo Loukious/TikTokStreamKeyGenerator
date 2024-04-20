@@ -170,6 +170,14 @@ game_tag_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
 game_tag_entry = ttk.Entry(input_frame)
 game_tag_entry.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
 
+# Button to open the list of game tags
+def open_game_tags_list():
+    import webbrowser
+    webbrowser.open("https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/")
+
+list_button = ttk.Button(input_frame, text="List", command=open_game_tags_list)
+list_button.grid(row=1, column=2, padx=5, pady=2, sticky="w")
+
 region_label = ttk.Label(input_frame, text="Region")
 region_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
 
