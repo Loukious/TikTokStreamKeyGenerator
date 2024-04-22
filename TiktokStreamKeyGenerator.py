@@ -9,8 +9,8 @@ from selenium.webdriver.support import expected_conditions as EC
 import requests
 
 class Stream:
-    def __init__(self, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True, age_restricted=False, priority_region=""):
-        self.streamInfo = self.createStream( title, game_tag_id, gen_replay, close_room_when_close_stream, age_restricted, priority_region)
+    def __init__(self, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True, age_restricted=False, priority_region="", stream_server=0):
+        self.streamInfo = self.createStream(title, game_tag_id, gen_replay, close_room_when_close_stream, age_restricted, priority_region, stream_server)
         self.created = False
         try:
             self.streamUrl = self.streamInfo["data"]["stream_url"]["rtmp_push_url"]
@@ -20,12 +20,17 @@ class Stream:
             self.streamShareUrl = self.streamInfo["data"]["share_url"]
             self.created = True
         except:
-            print(self.streamInfo["data"]["prompts"])
+            if self.streamInfo["data"]["prompts"] == "Please login first":
+                messagebox.showerror("Error", "Error creating stream. Try the other server.")
+            else:
+                messagebox.showerror("Error", self.streamInfo["data"]["prompts"])
 
 
-    def createStream(self, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True, age_restricted=False, priority_region=""):
-        #url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/create/" # comment this line and uncomment the one below if this url doesn't work
-        url = "https://webcast16-normal-c-useast1a.tiktokv.com/webcast/room/create/"
+    def createStream(self, title, game_tag_id, gen_replay=False, close_room_when_close_stream=True, age_restricted=False, priority_region="", stream_server=0):
+        if stream_server == 0:
+            url = "https://webcast16-normal-c-useast1a.tiktokv.com/webcast/room/create/" # For some reason some regions don't work with this URL
+        else:
+            url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/create/"
         params = {
             "aid": "8311", # App ID for TikTok Live Studio
             "app_name": "tiktok_live_studio", # App name for TikTok Live Studio
@@ -59,11 +64,16 @@ class Stream:
 
 def save_config():
     """Save entry values to a JSON file."""
+    if game_combobox.get() != '':
+        game_id = [game for game in games if games[game] == game_combobox.get()][0]
+    else:
+        game_id = ''
     data = {
         'title': title_entry.get(),
-        'game_tag_id': game_tag_entry.get(),
+        'game_tag_id': game_id,
         'priority_region': region_entry.get(),
         'generate_replay': replay_var.get(),
+        'selected_server': server_var.get(), 
         'close_room_when_close_stream': close_room_var.get(),
         'age_restricted': age_restricted_var.get()
     }
@@ -76,15 +86,15 @@ def load_config():
         with open('config.json', 'r') as file:
             data = json.load(file)
         title_entry.delete(0, tk.END)
-        title_entry.insert(0, data['title'])
-        game_tag_entry.delete(0, tk.END)
-        game_tag_entry.insert(0, data['game_tag_id'])
-        region_entry.set(data['priority_region'])
-        replay_var.set(data['generate_replay'])
-        close_room_var.set(data['close_room_when_close_stream'])
-        age_restricted_var.set(data['age_restricted'])
-    except FileNotFoundError:
-        print("No configuration file found. Using defaults.")
+        title_entry.insert(0, data.get('title', ''))
+        game_combobox.set(games.get(data['game_tag_id'], ''))
+        region_entry.set(data.get('priority_region', ''))
+        server_var.set(data.get('selected_server', 0))
+        replay_var.set(data.get('generate_replay', False))
+        close_room_var.set(data.get('close_room_when_close_stream', True))
+        age_restricted_var.set(data.get('age_restricted', False))
+    except:
+        print("Error loading config file.")
 
 def check_cookies():
     """Update the label based on the existence of cookies.json."""
@@ -127,8 +137,13 @@ def generate_stream():
     server_entry.config(state=tk.NORMAL)
     key_entry.config(state=tk.NORMAL)
     url_entry.config(state=tk.NORMAL)
-
-    s = Stream(title_entry.get(), game_tag_entry.get(), replay_var.get(), close_room_var.get(), age_restricted_var.get(), region_entry.get())
+    
+    if game_combobox.get() != '':
+        game_id = [game for game in games if games[game] == game_combobox.get()][0]
+    else:
+        messagebox.showerror("Error", "Please select a game tag.")
+        return
+    s = Stream(title_entry.get(), game_id, replay_var.get(), close_room_var.get(), age_restricted_var.get(), region_entry.get(), server_var.get())
     if s.created:
         server_entry.delete(0, tk.END)
         server_entry.insert(0, s.baseStreamUrl)
@@ -140,7 +155,6 @@ def generate_stream():
         server_entry.delete(0, tk.END)
         key_entry.delete(0, tk.END)
         url_entry.delete(0, tk.END)
-        messagebox.showerror("Error", "Failed to create stream")
 
     server_entry.config(state=tk.DISABLED)
     key_entry.config(state=tk.DISABLED)
@@ -150,12 +164,36 @@ def login_thread():
     """Handle the login process in a separate thread to keep UI responsive."""
     threading.Thread(target=launch_browser).start()
 
+def fetch_game_tags():
+    url = "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/"
+    try:
+        response = requests.get(url)
+        game_tags = response.json()['data']['game_tag_list']
+        return {game['id']: game['show_name'] for game in game_tags}
+    except Exception as e:
+        print(f"Failed to fetch game tags: {e}")
+        return {}
+
+def update_combobox_options(event):
+    # Get current text in the combobox
+    current_text = game_combobox.get()
+    # Filter the games dictionary
+    filtered_options = [name for name in games.values() if name.lower().startswith(current_text.lower())]
+    # Update the options displayed in the combobox
+    game_combobox['values'] = filtered_options
+
+
 app = tk.Tk()
 app.title("TikTok Stream Key Generator")
+app.columnconfigure(0, weight=1)  # This makes the first column in the main window expandable
+app.rowconfigure(0, weight=1)     # This makes the first row in the main window expandable
+app.columnconfigure(1, weight=1)  # This makes the second column in the main window expandable
+app.rowconfigure(1, weight=1)     # This makes the second row in the main window expandable
 
 # Using LabelFrames for better organization
 input_frame = ttk.LabelFrame(app, text="Input")
-input_frame.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
+input_frame.grid(row=0, column=0, padx=10, pady=5, sticky="nsew")
+input_frame.columnconfigure(1, weight=1)
 
 # Input fields and labels inside the LabelFrame
 title_label = ttk.Label(input_frame, text="Title")
@@ -164,19 +202,16 @@ title_label.grid(row=0, column=0, padx=5, pady=2, sticky="w")
 title_entry = ttk.Entry(input_frame)
 title_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
 
-game_tag_label = ttk.Label(input_frame, text="Game Tag ID")
-game_tag_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
 
-game_tag_entry = ttk.Entry(input_frame)
-game_tag_entry.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+game_combobox = ttk.Combobox(input_frame)
 
-# Button to open the list of game tags
-def open_game_tags_list():
-    import webbrowser
-    webbrowser.open("https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/")
+game_label = ttk.Label(input_frame, text="Game")
+game_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
 
-list_button = ttk.Button(input_frame, text="List", command=open_game_tags_list)
-list_button.grid(row=1, column=2, padx=5, pady=2, sticky="w")
+games = fetch_game_tags()
+game_combobox = ttk.Combobox(input_frame, values=list(games.values()))
+game_combobox.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+game_combobox.bind('<KeyRelease>', update_combobox_options)
 
 region_label = ttk.Label(input_frame, text="Region")
 region_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
@@ -184,17 +219,25 @@ region_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
 region_entry = ttk.Combobox(input_frame, values=["", "ar", "bg", "bn-IN", "ceb-PH", "cs-CZ", "da", "de-DE", "el-GR", "en", "es", "et", "fi-FI", "fil-PH", "fr", "he-IL", "hi-IN", "hr", "hu-HU", "id-ID", "it-IT", "ja-JP", "jv-ID", "km-KH", "ko-KR", "lt", "lv", "ms-MY", "my-MM", "nb", "nl-NL", "pl-PL", "pt-BR", "ro-RO", "ru-RU", "sk", "sv-SE", "th-TH", "tr-TR", "uk-UA", "ur", "uz", "vi-VN", "zh-Hant-TW", "zh-Hans"])
 region_entry.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
 
+server_var = tk.IntVar(value=0)
+
+radio_server1 = ttk.Radiobutton(input_frame, text="Server 1", variable=server_var, value=0)
+radio_server1.grid(row=3, column=0, padx=5, pady=2, sticky="w")
+
+radio_server2 = ttk.Radiobutton(input_frame, text="Server 2", variable=server_var, value=1)
+radio_server2.grid(row=3, column=1, padx=5, pady=2, sticky="w")
+
 replay_var = tk.BooleanVar()
 replay_checkbox = ttk.Checkbutton(input_frame, text="Generate Replay", variable=replay_var)
-replay_checkbox.grid(row=3, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+replay_checkbox.grid(row=4, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 close_room_var = tk.BooleanVar(value=True)
 close_room_checkbox = ttk.Checkbutton(input_frame, text="Close Room When Close Stream", variable=close_room_var)
-close_room_checkbox.grid(row=4, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+close_room_checkbox.grid(row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 age_restricted_var = tk.BooleanVar()
 age_restricted_checkbox = ttk.Checkbutton(input_frame, text="Age Restricted", variable=age_restricted_var)
-age_restricted_checkbox.grid(row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+age_restricted_checkbox.grid(row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 # Cookies status
 cookies_status = ttk.Label(app, text="Checking cookies...")
@@ -213,6 +256,7 @@ save_config_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
 # Outputs
 output_frame = ttk.LabelFrame(app, text="Outputs")
 output_frame.grid(row=0, column=1, rowspan=5, padx=10, pady=5, sticky="nsew")
+output_frame.columnconfigure(0, weight=1)
 
 server_entry = ttk.Entry(output_frame, state="readonly")
 server_entry.grid(row=0, column=0, padx=5, pady=2, sticky="ew")
