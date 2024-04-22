@@ -56,5 +56,11 @@ The script will output:
 - **Shareable URL for the live stream:** A URL that can be shared for others to view the live stream.
 
 ## FAQ
-### I'm getting a "Please login first" error. What should I do?
-Swap the url inside TikTokStreamKeyGenerator.py at the line 27.
+### I'm getting a `Please login first` error. What should I do?
+Try a different server from the one you're using.
+### I'm getting a `Maximum number of attempts reached. Try again later.` error. What should I do?
+This error sometimes occurs when TikTok detects selenium. You can use this [extension](https://chromewebstore.google.com/detail/export-cookie-json-file-f/nmckokihipjgplolmcmjakknndddifde) to export your cookies and import them into the script.
+- Start by logging into TikTok in the browser, then export the cookies using the extension (while being on TikTok's website). 
+- After that, place the file in the same directory as the script and rename it to `cookies.json` then start the app.
+### Do I need live access to use this script?
+Yes, you need to have access to TikTok LIVE to use this script.
