@@ -1,2 +1,5 @@
 cookies.json
 config.json
+TiktokStreamKeyGenerator.spec
+build/*
+dist/*

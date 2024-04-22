@@ -179,7 +179,7 @@ def launch_browser():
             "Login Status", "Login Successful and cookies saved!"
         )
     except Exception as e:
-        messagebox.showinfo("Login Status", "Login Failed or Timed Out.", e)
+        messagebox.showinfo("Login Status", "Login Failed or Timed Out.\n" + e)
     finally:
         driver.quit()
         check_cookies()
