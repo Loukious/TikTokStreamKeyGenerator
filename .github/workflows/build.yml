@@ -15,11 +15,11 @@ jobs:
         python-version: "3.12"
     - name: Install dependencies
       run: |
-          python -m pip install --upgrade pip
-          pip install flake8 pytest pyinstaller
-          if (Test-Path requirements.txt) {
-            pip install -r requirements.txt
-          }
+        python -m pip install --upgrade pip
+        pip install flake8 pytest pyinstaller
+        if (Test-Path requirements.txt) {
+          pip install -r requirements.txt
+        }
     - name: Lint with flake8
       run: |
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
@@ -35,7 +35,10 @@ jobs:
     - name: Upload DevBuild as release
       if: github.repository == 'Loukious/TikTokStreamKeyGenerator'
       run: |
-        gh release upload devbuild --clobber dist/*
+        $files = Get-ChildItem -Path dist\* -Name
+        foreach ($file in $files) {
+          gh release upload devbuild --clobber "dist/$file"
+        }
         gh release edit devbuild --title "DevBuild ${{ env.RELEASE_TAG }}"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
