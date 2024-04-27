@@ -31,7 +31,8 @@ class Stream:
     def createStream(
         self,
         title,
-        game_tag_id,
+        hashtag_id,
+        game_tag_id="0",
         gen_replay=False,
         close_room_when_close_stream=True,
         age_restricted=False,
@@ -61,7 +62,7 @@ class Stream:
             "gen_replay": gen_replay,  # To generate replay
             # To close room when stream is closed
             "close_room_when_close_stream": close_room_when_close_stream,
-            "hashtag_id": "5",  # Gaming hashtag ID
+            "hashtag_id": hashtag_id,
             "game_tag_id": game_tag_id,
         }
         if age_restricted:
@@ -128,9 +129,17 @@ def save_config():
         ][0]
     else:
         game_id = ""
+    if topic_combobox.get() != "":
+        topic_id = [
+            topic for topic in topics if topics[topic] == topic_combobox.get()
+        ][0]
+    else:
+        topic_id = ""
+
     data = {
         "title": title_entry.get(),
         "game_tag_id": game_id,
+        "hashtag_id": topic_id,
         "priority_region": region_entry.get(),
         "generate_replay": replay_var.get(),
         "selected_server": server_var.get(),
@@ -148,7 +157,12 @@ def load_config():
             data = json.load(file)
         title_entry.delete(0, tk.END)
         title_entry.insert(0, data.get("title", ""))
-        game_combobox.set(games.get(data["game_tag_id"], ""))
+        topic_combobox.set(topics.get(data.get("hashtag_id", ""), ""))
+        if topic_combobox != "5":
+            game_combobox.grid_remove()
+            game_label.grid_remove()
+        else:
+            game_combobox.set(games.get(data.get("game_tag_id", ""), ""))
         region_entry.set(data.get("priority_region", ""))
         server_var.set(data.get("selected_server", 0))
         replay_var.set(data.get("generate_replay", False))
@@ -236,22 +250,33 @@ def end_stream():
 
 def generate_stream():
     """Function for stream key generation."""
-    if game_combobox.get() != "":
+  
+    if topic_combobox.get() != "":
+        hashtag_id = [
+            topic for topic in topics if topics[topic] == topic_combobox.get()
+        ][0]
+    else:
+        messagebox.showerror("Error", "Please select a topic.")
+        return
+    if hashtag_id == "5" and game_combobox.get() == "":
+        messagebox.showerror("Error", "Please select a game tag.")
+        return
+    if hashtag_id != "5":
+        game_id = "0"
+    else:
         game_id = [
             game for game in games if games[game] == game_combobox.get()
         ][0]
-    else:
-        messagebox.showerror("Error", "Please select a game tag.")
-        return
     with Stream() as s:
         created = s.createStream(
             title_entry.get(),
+            hashtag_id,
             game_id,
             replay_var.get(),
             close_room_var.get(),
             age_restricted_var.get(),
             region_entry.get(),
-            server_var.get(),
+            server_var.get()
         )
         if created:
             messagebox.showinfo("Success", "Stream created successfully.")
@@ -295,6 +320,28 @@ def update_combobox_options(event):
     game_combobox["values"] = filtered_options
 
 
+def check_selection(event):
+    if topic_combobox.get() == "Gaming":
+        game_combobox.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
+        game_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
+    else:
+        game_combobox.grid_remove()
+        game_label.grid_remove()
+
+
+topics = {
+    "5": "Gaming",
+    "6": "Music",
+    "42": "Chat & Interview",
+    "9": "Beauty & Fashion",
+    "3": "Dance",
+    "13": "Fitness & Sports",
+    "4": "Food",
+    "43": "News & Event",
+    "45": "Education"
+}
+
+
 app = tk.Tk()
 app.title("TikTok Stream Key Generator")
 # This makes the first column in the main window expandable
@@ -318,19 +365,25 @@ title_label.grid(row=0, column=0, padx=5, pady=2, sticky="w")
 title_entry = ttk.Entry(input_frame)
 title_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
 
+topic_label = ttk.Label(input_frame, text="Topic")
+topic_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
+
+topic_combobox = ttk.Combobox(input_frame, values=list(topics.values()))
+topic_combobox.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+topic_combobox.bind('<<ComboboxSelected>>', check_selection)
 
 game_combobox = ttk.Combobox(input_frame)
 
 game_label = ttk.Label(input_frame, text="Game")
-game_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
+game_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
 
 games = fetch_game_tags()
 game_combobox = ttk.Combobox(input_frame, values=list(games.values()))
-game_combobox.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+game_combobox.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
 game_combobox.bind("<KeyRelease>", update_combobox_options)
 
 region_label = ttk.Label(input_frame, text="Region")
-region_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
+region_label.grid(row=3, column=0, padx=5, pady=2, sticky="w")
 
 region_entry = ttk.Combobox(
     input_frame,
@@ -382,32 +435,32 @@ region_entry = ttk.Combobox(
         "zh-Hans",
     ],
 )
-region_entry.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
+region_entry.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
 
 server_var = tk.IntVar(value=0)
 
 radio_server1 = ttk.Radiobutton(
     input_frame, text="Server 1", variable=server_var, value=0
 )
-radio_server1.grid(row=3, column=0, padx=5, pady=2, sticky="w")
+radio_server1.grid(row=4, column=0, padx=5, pady=2, sticky="w")
 
 radio_server2 = ttk.Radiobutton(
     input_frame, text="Server 2", variable=server_var, value=1
 )
-radio_server2.grid(row=3, column=1, padx=5, pady=2, sticky="w")
+radio_server2.grid(row=4, column=1, padx=5, pady=2, sticky="w")
 
 replay_var = tk.BooleanVar()
 replay_checkbox = ttk.Checkbutton(
     input_frame, text="Generate Replay", variable=replay_var
 )
-replay_checkbox.grid(row=4, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+replay_checkbox.grid(row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 close_room_var = tk.BooleanVar(value=True)
 close_room_checkbox = ttk.Checkbutton(
     input_frame, text="Close Room When Close Stream", variable=close_room_var
 )
 close_room_checkbox.grid(
-    row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w"
+    row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
 
 age_restricted_var = tk.BooleanVar()
@@ -415,7 +468,7 @@ age_restricted_checkbox = ttk.Checkbutton(
     input_frame, text="Age Restricted", variable=age_restricted_var
 )
 age_restricted_checkbox.grid(
-    row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w"
+    row=7, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
 
 # Cookies status
