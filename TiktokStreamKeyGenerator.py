@@ -263,7 +263,6 @@ def generate_stream():
             disable_output_fields()
 
 
-
 def login_thread():
     """Handle the login process in a separate thread to keep UI responsive."""
     threading.Thread(target=launch_browser).start()

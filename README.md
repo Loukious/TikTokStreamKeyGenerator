@@ -3,6 +3,9 @@
 ## Description
 This Python script is a valuable tool for content creators looking to broadcast on TikTok's live streaming platform using OBS Studio, an alternative to TikTok LIVE Studio. The script's standout feature is generating a stream key, a capability typically restricted and highly sought after. This stream key enables users to stream via OBS Studio, offering more control and flexibility over their live broadcasts. Additionally, the script provides the base stream URL and a shareable URL for the stream.
 
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/loukious)
+
+
 ## Features
 - Retrieve the base stream URL.
 - Generate a TikTok stream key.
@@ -12,22 +15,17 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Option to close the room when the stream ends.
 - Option to choose region priority.
 - Option to mark the stream as mature content.
+- Button to end the stream.
 
 ## Requirements
 - Python 3.6+
 - Google Chrome browser
 - Game tag ID
 - Logged into TikTok LIVE studio at least once
-- Have TikTok LIVE studio access
-
-
-## Finding Game Tag IDs
-1. Download and install this extension: [JSON Formatter](https://chromewebstore.google.com/detail/json-formatter/bcjindcccaagfpapjjmafapmmgkkhgoa) (optional but recommended).
-2. Visit this url to find [TikTok Live API Game Tag List](https://webcast16-normal-c-useast2a.tiktokv.com/webcast/room/hashtag/list/).
-3. Use the id from the list to specify the game tag ID.
-
+- Have TikTok LIVE studio access (although minor changes can be made to the script to bypass this requirement)
 
 ## Installation
+Either use the provided executable or follow the steps below to run the script.
 Ensure you have Python and PIP working.
 In the command line, install the required packages using the following command (run the command in the same directory as the script):
 ```bash
