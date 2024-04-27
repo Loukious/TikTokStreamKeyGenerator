@@ -10,7 +10,7 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Retrieve the base stream URL.
 - Generate a TikTok stream key.
 - Obtain a shareable URL for the TikTok live stream.
-- Support for specifying different games by their game tag IDs.
+- Support for specifying different topics including games, music, and more.
 - Option to enable replay generation.
 - Option to close the room when the stream ends.
 - Option to choose region priority.
