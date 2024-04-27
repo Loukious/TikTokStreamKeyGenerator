@@ -36,7 +36,7 @@ class Stream:
         close_room_when_close_stream=True,
         age_restricted=False,
         priority_region="",
-        stream_server=0,
+        stream_server=0
     ):
         if stream_server == 0:
             # For some reason some regions don't work with this URL
@@ -82,15 +82,42 @@ class Stream:
             self.streamShareUrl = streamInfo["data"]["share_url"]
             return True
         except KeyError:
-            if self.streamInfo["data"]["prompts"] == "Please login first":
+            if streamInfo["data"]["prompts"] == "Please login first":
                 messagebox.showerror(
                     "Error", "Error creating stream. Try the other server."
                 )
             else:
                 messagebox.showerror(
-                    "Error", self.streamInfo["data"]["prompts"]
+                    "Error", streamInfo["data"]["prompts"]
                 )
             return False
+
+    def endStream(self, stream_server=0):
+        if stream_server == 0:
+            # For some reason some regions don't work with this URL
+            base_url = "https://webcast16-normal-c-useast1a.tiktokv.com/"
+        else:
+            base_url = "https://webcast16-normal-c-useast2a.tiktokv.com/"
+        params = {
+            # App ID for TikTok Live Studio
+            "aid": "8311",
+            # App name for TikTok Live Studio
+            "app_name": "tiktok_live_studio",
+            # Channel for TikTok Live Studio
+            "channel": "studio",
+            "device_platform": "windows",
+            "live_mode": "6",
+        }
+        streamInfo = self.s.post(
+            base_url + "webcast/room/finish_abnormal/",
+            params=params
+        ).json()
+        if "data" in streamInfo and "prompts" in streamInfo["data"]:
+            messagebox.showerror(
+                "Error", streamInfo["data"]["prompts"]
+            )
+            return False
+        return True
 
 
 def save_config():
@@ -175,12 +202,40 @@ def launch_browser():
         check_cookies()
 
 
-def generate_stream():
-    """Function for stream key generation."""
+def enable_output_fields():
+    """Enable output fields after stream is generated."""
     server_entry.config(state=tk.NORMAL)
     key_entry.config(state=tk.NORMAL)
     url_entry.config(state=tk.NORMAL)
 
+
+def disable_output_fields():
+    """Disable output fields when stream is not generated."""
+    server_entry.config(state=tk.DISABLED)
+    key_entry.config(state=tk.DISABLED)
+    url_entry.config(state=tk.DISABLED)
+
+
+def clear_output_fields():
+    """Clear output fields."""
+    server_entry.delete(0, tk.END)
+    key_entry.delete(0, tk.END)
+    url_entry.delete(0, tk.END)
+
+
+def end_stream():
+    """End the current stream."""
+    with Stream() as s:
+        ended = s.endStream(server_var.get())
+        if ended:
+            messagebox.showinfo("Success", "Stream ended successfully.")
+            enable_output_fields()
+            clear_output_fields()
+            disable_output_fields()
+
+
+def generate_stream():
+    """Function for stream key generation."""
     if game_combobox.get() != "":
         game_id = [
             game for game in games if games[game] == game_combobox.get()
@@ -199,20 +254,14 @@ def generate_stream():
             server_var.get(),
         )
         if created:
-            server_entry.delete(0, tk.END)
+            messagebox.showinfo("Success", "Stream created successfully.")
+            enable_output_fields()
+            clear_output_fields()
             server_entry.insert(0, s.baseStreamUrl)
-            key_entry.delete(0, tk.END)
             key_entry.insert(0, s.streamKey)
-            url_entry.delete(0, tk.END)
             url_entry.insert(0, s.streamShareUrl)
-        else:
-            server_entry.delete(0, tk.END)
-            key_entry.delete(0, tk.END)
-            url_entry.delete(0, tk.END)
+            disable_output_fields()
 
-    server_entry.config(state=tk.DISABLED)
-    key_entry.config(state=tk.DISABLED)
-    url_entry.config(state=tk.DISABLED)
 
 
 def login_thread():
@@ -385,8 +434,13 @@ go_live_button = ttk.Button(
 )
 go_live_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
 
+end_live_button = ttk.Button(
+    app, text="End Live", command=end_stream
+)
+end_live_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+
 save_config_button = ttk.Button(app, text="Save Config", command=save_config)
-save_config_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+save_config_button.grid(row=5, column=0, padx=10, pady=5, sticky="ew")
 
 # Outputs
 output_frame = ttk.LabelFrame(app, text="Outputs")
