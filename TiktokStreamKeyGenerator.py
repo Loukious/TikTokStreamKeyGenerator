@@ -250,7 +250,6 @@ def end_stream():
 
 def generate_stream():
     """Function for stream key generation."""
-  
     if topic_combobox.get() != "":
         hashtag_id = [
             topic for topic in topics if topics[topic] == topic_combobox.get()
