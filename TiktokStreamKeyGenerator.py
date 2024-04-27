@@ -10,44 +10,23 @@ import requests
 
 
 class Stream:
-    def __init__(
-        self,
-        title,
-        game_tag_id,
-        gen_replay=False,
-        close_room_when_close_stream=True,
-        age_restricted=False,
-        priority_region="",
-        stream_server=0,
-    ):
-        self.streamInfo = self.createStream(
-            title,
-            game_tag_id,
-            gen_replay,
-            close_room_when_close_stream,
-            age_restricted,
-            priority_region,
-            stream_server,
-        )
-        self.created = False
-        try:
-            self.streamUrl = self.streamInfo["data"]["stream_url"][
-                "rtmp_push_url"
-            ]
-            split_index = self.streamUrl.rfind("/")
-            self.baseStreamUrl = self.streamUrl[:split_index]
-            self.streamKey = self.streamUrl[split_index + 1:]
-            self.streamShareUrl = self.streamInfo["data"]["share_url"]
-            self.created = True
-        except KeyError:
-            if self.streamInfo["data"]["prompts"] == "Please login first":
-                messagebox.showerror(
-                    "Error", "Error creating stream. Try the other server."
-                )
-            else:
-                messagebox.showerror(
-                    "Error", self.streamInfo["data"]["prompts"]
-                )
+    def __init__(self):
+        self.s = requests.session()
+        self.s.headers = {
+            "user-agent": "",
+        }
+        with open("cookies.json", "r") as file:
+            cookies_file = json.load(file)
+        cookies = {}
+        for cookie in cookies_file:
+            cookies[cookie["name"]] = cookie["value"]
+        self.s.cookies.update(cookies)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.s.close()
 
     def createStream(
         self,
@@ -87,22 +66,31 @@ class Stream:
         }
         if age_restricted:
             data["age_restricted"] = "4"
-        headers = {"user-agent": ""}
-        with open("cookies.json", "r") as file:
-            cookies_file = json.load(file)
-        cookies = {}
-        for cookie in cookies_file:
-            cookies[cookie["name"]] = cookie["value"]
 
-        with requests.session() as s:
-            info = s.post(
-                base_url + "webcast/room/create/",
-                params=params,
-                data=data,
-                headers=headers,
-                cookies=cookies,
-            ).json()
-        return info
+        streamInfo = self.s.post(
+            base_url + "webcast/room/create/",
+            params=params,
+            data=data
+        ).json()
+        try:
+            self.streamUrl = streamInfo["data"]["stream_url"][
+                "rtmp_push_url"
+            ]
+            split_index = self.streamUrl.rfind("/")
+            self.baseStreamUrl = self.streamUrl[:split_index]
+            self.streamKey = self.streamUrl[split_index + 1:]
+            self.streamShareUrl = streamInfo["data"]["share_url"]
+            return True
+        except KeyError:
+            if self.streamInfo["data"]["prompts"] == "Please login first":
+                messagebox.showerror(
+                    "Error", "Error creating stream. Try the other server."
+                )
+            else:
+                messagebox.showerror(
+                    "Error", self.streamInfo["data"]["prompts"]
+                )
+            return False
 
 
 def save_config():
@@ -200,26 +188,27 @@ def generate_stream():
     else:
         messagebox.showerror("Error", "Please select a game tag.")
         return
-    s = Stream(
-        title_entry.get(),
-        game_id,
-        replay_var.get(),
-        close_room_var.get(),
-        age_restricted_var.get(),
-        region_entry.get(),
-        server_var.get(),
-    )
-    if s.created:
-        server_entry.delete(0, tk.END)
-        server_entry.insert(0, s.baseStreamUrl)
-        key_entry.delete(0, tk.END)
-        key_entry.insert(0, s.streamKey)
-        url_entry.delete(0, tk.END)
-        url_entry.insert(0, s.streamShareUrl)
-    else:
-        server_entry.delete(0, tk.END)
-        key_entry.delete(0, tk.END)
-        url_entry.delete(0, tk.END)
+    with Stream() as s:
+        created = s.createStream(
+            title_entry.get(),
+            game_id,
+            replay_var.get(),
+            close_room_var.get(),
+            age_restricted_var.get(),
+            region_entry.get(),
+            server_var.get(),
+        )
+        if created:
+            server_entry.delete(0, tk.END)
+            server_entry.insert(0, s.baseStreamUrl)
+            key_entry.delete(0, tk.END)
+            key_entry.insert(0, s.streamKey)
+            url_entry.delete(0, tk.END)
+            url_entry.insert(0, s.streamShareUrl)
+        else:
+            server_entry.delete(0, tk.END)
+            key_entry.delete(0, tk.END)
+            url_entry.delete(0, tk.END)
 
     server_entry.config(state=tk.DISABLED)
     key_entry.config(state=tk.DISABLED)
