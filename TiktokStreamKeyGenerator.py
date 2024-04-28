@@ -125,13 +125,15 @@ def save_config():
     """Save entry values to a JSON file."""
     if game_combobox.get() != "":
         game_id = [
-            game for game in games if games[game] == game_combobox.get()
+            game for game in games
+            if games[game].lower() == game_combobox.get().lower()
         ][0]
     else:
         game_id = ""
     if topic_combobox.get() != "":
         topic_id = [
-            topic for topic in topics if topics[topic] == topic_combobox.get()
+            topic for topic in topics
+            if topics[topic].lower() == topic_combobox.get().lower()
         ][0]
     else:
         topic_id = ""
@@ -252,7 +254,8 @@ def generate_stream():
     """Function for stream key generation."""
     if topic_combobox.get() != "":
         hashtag_id = [
-            topic for topic in topics if topics[topic] == topic_combobox.get()
+            topic for topic in topics
+            if topics[topic].lower() == topic_combobox.get().lower()
         ][0]
     else:
         messagebox.showerror("Error", "Please select a topic.")
@@ -264,7 +267,8 @@ def generate_stream():
         game_id = "0"
     else:
         game_id = [
-            game for game in games if games[game] == game_combobox.get()
+            game for game in games
+            if games[game].lower() == game_combobox.get().lower()
         ][0]
     with Stream() as s:
         created = s.createStream(
