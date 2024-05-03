@@ -160,7 +160,7 @@ def load_config():
         title_entry.delete(0, tk.END)
         title_entry.insert(0, data.get("title", ""))
         topic_combobox.set(topics.get(data.get("hashtag_id", ""), ""))
-        if topic_combobox != "5":
+        if topic_combobox.get() != "Gaming":
             game_combobox.grid_remove()
             game_label.grid_remove()
         else:
