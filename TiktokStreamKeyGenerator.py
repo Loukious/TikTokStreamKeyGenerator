@@ -36,14 +36,9 @@ class Stream:
         gen_replay=False,
         close_room_when_close_stream=True,
         age_restricted=False,
-        priority_region="",
-        stream_server=0
+        priority_region=""
     ):
-        if stream_server == 0:
-            # For some reason some regions don't work with this URL
-            base_url = "https://webcast16-normal-c-useast1a.tiktokv.com/"
-        else:
-            base_url = "https://webcast16-normal-c-useast2a.tiktokv.com/"
+        base_url = self.getServerUrl()
         params = {
             # App ID for TikTok Live Studio
             "aid": "8311",
@@ -93,12 +88,8 @@ class Stream:
                 )
             return False
 
-    def endStream(self, stream_server=0):
-        if stream_server == 0:
-            # For some reason some regions don't work with this URL
-            base_url = "https://webcast16-normal-c-useast1a.tiktokv.com/"
-        else:
-            base_url = "https://webcast16-normal-c-useast2a.tiktokv.com/"
+    def endStream(self):
+        base_url = self.getServerUrl()
         params = {
             # App ID for TikTok Live Studio
             "aid": "8311",
@@ -119,7 +110,10 @@ class Stream:
             )
             return False
         return True
-
+    def getServerUrl(self):
+        url = "https://tnc16-platform-useast1a.tiktokv.com/get_domains/v4/?aid=8311&ttwebview_version=1130022000"
+        response = self.s.get(url)
+        return f"https://webcast16-normal-c-{response.url.split('/')[2].split('-')[2]}/"
 
 def save_config():
     """Save entry values to a JSON file."""
@@ -144,7 +138,6 @@ def save_config():
         "hashtag_id": topic_id,
         "priority_region": region_entry.get(),
         "generate_replay": replay_var.get(),
-        "selected_server": server_var.get(),
         "close_room_when_close_stream": close_room_var.get(),
         "age_restricted": age_restricted_var.get(),
     }
@@ -166,7 +159,6 @@ def load_config():
         else:
             game_combobox.set(games.get(data.get("game_tag_id", ""), ""))
         region_entry.set(data.get("priority_region", ""))
-        server_var.set(data.get("selected_server", 0))
         replay_var.set(data.get("generate_replay", False))
         close_room_var.set(data.get("close_room_when_close_stream", True))
         age_restricted_var.set(data.get("age_restricted", False))
@@ -242,7 +234,7 @@ def clear_output_fields():
 def end_stream():
     """End the current stream."""
     with Stream() as s:
-        ended = s.endStream(server_var.get())
+        ended = s.endStream()
         if ended:
             messagebox.showinfo("Success", "Stream ended successfully.")
             enable_output_fields()
@@ -278,8 +270,7 @@ def generate_stream():
             replay_var.get(),
             close_room_var.get(),
             age_restricted_var.get(),
-            region_entry.get(),
-            server_var.get()
+            region_entry.get()
         )
         if created:
             messagebox.showinfo("Success", "Stream created successfully.")
@@ -440,30 +431,19 @@ region_entry = ttk.Combobox(
 )
 region_entry.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
 
-server_var = tk.IntVar(value=0)
-
-radio_server1 = ttk.Radiobutton(
-    input_frame, text="Server 1", variable=server_var, value=0
-)
-radio_server1.grid(row=4, column=0, padx=5, pady=2, sticky="w")
-
-radio_server2 = ttk.Radiobutton(
-    input_frame, text="Server 2", variable=server_var, value=1
-)
-radio_server2.grid(row=4, column=1, padx=5, pady=2, sticky="w")
 
 replay_var = tk.BooleanVar()
 replay_checkbox = ttk.Checkbutton(
     input_frame, text="Generate Replay", variable=replay_var
 )
-replay_checkbox.grid(row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+replay_checkbox.grid(row=4, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 close_room_var = tk.BooleanVar(value=True)
 close_room_checkbox = ttk.Checkbutton(
     input_frame, text="Close Room When Close Stream", variable=close_room_var
 )
 close_room_checkbox.grid(
-    row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w"
+    row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
 
 age_restricted_var = tk.BooleanVar()
@@ -471,7 +451,7 @@ age_restricted_checkbox = ttk.Checkbutton(
     input_frame, text="Age Restricted", variable=age_restricted_var
 )
 age_restricted_checkbox.grid(
-    row=7, column=0, columnspan=2, padx=5, pady=2, sticky="w"
+    row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
 
 # Cookies status
