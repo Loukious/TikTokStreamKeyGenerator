@@ -110,10 +110,22 @@ class Stream:
             )
             return False
         return True
+
     def getServerUrl(self):
-        url = "https://tnc16-platform-useast1a.tiktokv.com/get_domains/v4/?aid=8311&ttwebview_version=1130022000"
-        response = self.s.get(url)
-        return f"https://webcast16-normal-c-{response.url.split('/')[2].split('-')[2]}/"
+        url = (
+            "https://tnc16-platform-useast1a.tiktokv.com/get_domains/v4/?"
+            "aid=8311&ttwebview_version=1130022001"
+        )
+        response = self.s.get(url).json()
+        for data in response["data"]["ttnet_dispatch_actions"]:
+            if "param" in data and "strategy_info" in data["param"] and \
+                    "webcast-normal.tiktokv.com" in \
+                    data["param"]["strategy_info"]:
+                server_url = data['param']['strategy_info'][
+                    'webcast-normal.tiktokv.com'
+                ]
+                return f"https://{server_url}/"
+
 
 def save_config():
     """Save entry values to a JSON file."""
