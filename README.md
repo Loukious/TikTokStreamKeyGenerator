@@ -22,7 +22,7 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Google Chrome browser
 - Game tag ID
 - Logged into TikTok LIVE studio at least once
-- Have TikTok LIVE studio access (although minor changes can be made to the script to bypass this requirement)
+- Have TikTok LIVE studio access or Live access (use spoofing if you don't have access to TikTok LIVE studio)
 
 ## Installation
 Either use the provided executable or follow the steps below to run the script.

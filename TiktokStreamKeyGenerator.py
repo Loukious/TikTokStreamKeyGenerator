@@ -21,6 +21,7 @@ class Stream:
         for cookie in cookies_file:
             cookies[cookie["name"]] = cookie["value"]
         self.s.cookies.update(cookies)
+        # self.renewCookies()
 
     def __enter__(self):
         return self
@@ -36,30 +37,72 @@ class Stream:
         gen_replay=False,
         close_room_when_close_stream=True,
         age_restricted=False,
-        priority_region=""
+        priority_region="",
+        spoof_plat=0
     ):
         base_url = self.getServerUrl()
-        params = {
-            # App ID for TikTok Live Studio
-            "aid": "8311",
-            # App name for TikTok Live Studio
-            "app_name": "tiktok_live_studio",
-            # Channel for TikTok Live Studio
-            "channel": "studio",
-            "device_platform": "windows",
-            # Priority region for the stream
-            "priority_region": priority_region,
-            "live_mode": "6",
-        }
-        data = {
-            "title": title,  # Title of stream
-            "live_studio": "1",
-            "gen_replay": gen_replay,  # To generate replay
-            # To close room when stream is closed
-            "close_room_when_close_stream": close_room_when_close_stream,
-            "hashtag_id": hashtag_id,
-            "game_tag_id": game_tag_id,
-        }
+        if spoof_plat == 1:
+            params = {
+                # App ID for Tiktok Mobile App
+                "aid": "1233",
+                # App name for Tiktok Mobile App
+                "app_name": "musical_ly",
+                # Channel for Tiktok Mobile App
+                "channel": "googleplay",
+                "device_platform": "android",
+                "iid": "0000000000000000000"
+            }
+            data = {
+                "title": title,  # Title of stream
+                "gen_replay": gen_replay,  # To generate replay
+                # To close room when stream is closed
+                "close_room_when_close_stream": close_room_when_close_stream,
+                "hashtag_id": hashtag_id,
+                "game_tag_id": game_tag_id,
+            }
+        elif spoof_plat == 2:
+            params = {
+                # App ID for Tiktok Mobile App
+                "aid": "1233",
+                # App name for Tiktok Mobile App
+                "app_name": "musical_ly",
+                # Channel for Tiktok Mobile App
+                "channel": "googleplay",
+                "device_platform": "android",
+                "iid": "0000000000000000000",
+                "screen_shot": "1"
+            }
+            data = {
+                "title": title,  # Title of stream
+                "live_room_mode": "4",
+                "gen_replay": gen_replay,  # To generate replay
+                # To close room when stream is closed
+                "close_room_when_close_stream": close_room_when_close_stream,
+                "hashtag_id": hashtag_id,
+                "game_tag_id": game_tag_id,
+            }
+        else:
+            params = {
+                # App ID for TikTok Live Studio
+                "aid": "8311",
+                # App name for TikTok Live Studio
+                "app_name": "tiktok_live_studio",
+                # Channel for TikTok Live Studio
+                "channel": "studio",
+                "device_platform": "windows",
+                # Priority region for the stream
+                "priority_region": priority_region,
+                "live_mode": "6"
+            }
+            data = {
+                "title": title,  # Title of stream
+                "live_studio": "1",
+                "gen_replay": str(gen_replay).lower(),  # To generate replay
+                # To close room when stream is closed
+                "close_room_when_close_stream": str(close_room_when_close_stream).lower(),
+                "hashtag_id": hashtag_id,
+                "game_tag_id": game_tag_id,
+            }
         if age_restricted:
             data["age_restricted"] = "4"
 
@@ -125,6 +168,30 @@ class Stream:
                     'webcast-normal.tiktokv.com'
                 ]
                 return f"https://{server_url}/"
+    def renewCookies(self):
+        response = self.s.get("https://www.tiktok.com/foryou")
+        if response.url == "https://www.tiktok.com/login/phone-or-email":
+            messagebox.showerror(
+                "Error", "Cookies are invalid. Please login again."
+            )
+            cookies_status.config(text="No cookies found")
+            go_live_button.config(state=tk.DISABLED)
+            login_button.config(state=tk.NORMAL)
+            os.remove("cookies.json")
+            return False
+        else:
+            new_cookies = []
+            cookies = dict(self.s.cookies)
+            for cookie in cookies:
+                new_cookies.append(
+                    {
+                        "name": cookie,
+                        "value": cookies[cookie]
+                    }
+                )
+            with open("cookies.json", "w") as file:
+                json.dump(new_cookies, file)
+            return True
 
 
 def save_config():
@@ -150,11 +217,14 @@ def save_config():
         "hashtag_id": topic_id,
         "priority_region": region_entry.get(),
         "generate_replay": replay_var.get(),
+        "spoof_plat": spoof_plat_var.get(),
         "close_room_when_close_stream": close_room_var.get(),
         "age_restricted": age_restricted_var.get(),
     }
     with open("config.json", "w") as file:
         json.dump(data, file)
+    messagebox.showinfo("Success", "Config saved successfully.")
+    return True
 
 
 def load_config():
@@ -172,6 +242,7 @@ def load_config():
             game_combobox.set(games.get(data.get("game_tag_id", ""), ""))
         region_entry.set(data.get("priority_region", ""))
         replay_var.set(data.get("generate_replay", False))
+        spoof_plat_var.set(data.get("spoof_plat", 0))
         close_room_var.set(data.get("close_room_when_close_stream", True))
         age_restricted_var.set(data.get("age_restricted", False))
     except FileNotFoundError:
@@ -200,7 +271,7 @@ def wait_for_page_load(driver, timeout=30):
 def launch_browser():
     """Launch Selenium to perform login and save cookies."""
     driver = uc.Chrome()
-    driver.get("https://www.tiktok.com/login/phone-or-email")
+    driver.get("https://www.tiktok.com/login?is_modal=1&hide_toggle_login_signup=1&enter_method=live_studio&enter_from=live_studio&lang=en")
     try:
         WebDriverWait(driver, 60).until(
             EC.url_contains("https://www.tiktok.com/foryou")
@@ -282,7 +353,8 @@ def generate_stream():
             replay_var.get(),
             close_room_var.get(),
             age_restricted_var.get(),
-            region_entry.get()
+            region_entry.get(),
+            spoof_plat_var.get()
         )
         if created:
             messagebox.showinfo("Success", "Stream created successfully.")
@@ -444,18 +516,35 @@ region_entry = ttk.Combobox(
 region_entry.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
 
 
+spoof_plat_var = tk.IntVar()
+spoof_plat_var.set(0)
+spoof_plat_radio1 = ttk.Radiobutton(
+    input_frame, text="No Spoofing", variable=spoof_plat_var, value=0
+)
+spoof_plat_radio1.grid(row=4, column=0, columnspan=1, padx=5, pady=2, sticky="w")
+
+spoof_plat_radio2 = ttk.Radiobutton(
+    input_frame, text="Mobile Camera Stream", variable=spoof_plat_var, value=1
+)
+spoof_plat_radio2.grid(row=4, column=1, columnspan=1, padx=5, pady=2, sticky="w")
+
+spoof_plat_radio3 = ttk.Radiobutton(
+    input_frame, text="Mobile Screenshare", variable=spoof_plat_var, value=2
+)
+spoof_plat_radio3.grid(row=4, column=2, columnspan=1, padx=5, pady=2, sticky="w")
+
 replay_var = tk.BooleanVar()
 replay_checkbox = ttk.Checkbutton(
     input_frame, text="Generate Replay", variable=replay_var
 )
-replay_checkbox.grid(row=4, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+replay_checkbox.grid(row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w")
 
 close_room_var = tk.BooleanVar(value=True)
 close_room_checkbox = ttk.Checkbutton(
     input_frame, text="Close Room When Close Stream", variable=close_room_var
 )
 close_room_checkbox.grid(
-    row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w"
+    row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
 
 age_restricted_var = tk.BooleanVar()
@@ -463,7 +552,7 @@ age_restricted_checkbox = ttk.Checkbutton(
     input_frame, text="Age Restricted", variable=age_restricted_var
 )
 age_restricted_checkbox.grid(
-    row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w"
+    row=7, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
 
 # Cookies status
