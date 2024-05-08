@@ -50,7 +50,8 @@ class Stream:
                 # Channel for Tiktok Mobile App
                 "channel": "googleplay",
                 "device_platform": "android",
-                "iid": "0000000000000000000"
+                "iid": "0000000000000000000",
+                "device_id": "0000000000000000000"
             }
             data = {
                 "title": title,  # Title of stream
@@ -70,6 +71,7 @@ class Stream:
                 "channel": "googleplay",
                 "device_platform": "android",
                 "iid": "0000000000000000000",
+                "device_id": "0000000000000000000",
                 "screen_shot": "1"
             }
             data = {
