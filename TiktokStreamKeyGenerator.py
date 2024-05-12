@@ -1,3 +1,4 @@
+import random
 import tkinter as tk
 from tkinter import ttk, messagebox
 import json
@@ -50,8 +51,8 @@ class Stream:
                 # Channel for Tiktok Mobile App
                 "channel": "googleplay",
                 "device_platform": "android",
-                "iid": "0000000000000000000",
-                "device_id": "0000000000000000000"
+                "iid": ''.join(random.choices('0123456789abcdef', k=16)),
+                "device_id": random.randint(7250000000000000000, 7351147085025500000)
             }
             data = {
                 "title": title,  # Title of stream
@@ -70,8 +71,8 @@ class Stream:
                 # Channel for Tiktok Mobile App
                 "channel": "googleplay",
                 "device_platform": "android",
-                "iid": "0000000000000000000",
-                "device_id": "0000000000000000000",
+                "iid": ''.join(random.choices('0123456789abcdef', k=16)),
+                "device_id": random.randint(7250000000000000000, 7351147085025500000),
                 "screen_shot": "1"
             }
             data = {
