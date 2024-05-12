@@ -37,7 +37,7 @@ jobs:
       with:
         name: windows
         path: |
-          TiktokStreamKeyGenerator.exe
+          dist/TiktokStreamKeyGenerator.exe
 
   release:
     runs-on: windows-latest
