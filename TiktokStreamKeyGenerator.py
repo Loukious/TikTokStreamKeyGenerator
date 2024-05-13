@@ -1,605 +1,392 @@
-import random
-import tkinter as tk
-from tkinter import ttk, messagebox
-import json
-import os
-import threading
-import undetected_chromedriver as uc
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import requests
-
-
-class Stream:
-    def __init__(self):
-        self.s = requests.session()
-        self.s.headers = {
-            "user-agent": "",
-        }
-        with open("cookies.json", "r") as file:
-            cookies_file = json.load(file)
-        cookies = {}
-        for cookie in cookies_file:
-            cookies[cookie["name"]] = cookie["value"]
-        self.s.cookies.update(cookies)
-        # self.renewCookies()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.s.close()
-
-    def createStream(
-        self,
-        title,
-        hashtag_id,
-        game_tag_id="0",
-        gen_replay=False,
-        close_room_when_close_stream=True,
-        age_restricted=False,
-        priority_region="",
-        spoof_plat=0
-    ):
-        base_url = self.getServerUrl()
-        if spoof_plat == 1:
-            params = {
-                # App ID for Tiktok Mobile App
-                "aid": "1233",
-                # App name for Tiktok Mobile App
-                "app_name": "musical_ly",
-                # Channel for Tiktok Mobile App
-                "channel": "googleplay",
-                "device_platform": "android",
-                "iid": random.randint(7250000000000000000, 7351147085025500000),
-                "device_id": random.randint(7250000000000000000, 7351147085025500000),
-                "openudid": ''.join(random.choices('0123456789abcdef', k=16))
-            }
-            data = {
-                "title": title,  # Title of stream
-                "gen_replay": gen_replay,  # To generate replay
-                # To close room when stream is closed
-                "close_room_when_close_stream": close_room_when_close_stream,
-                "hashtag_id": hashtag_id,
-                "game_tag_id": game_tag_id,
-            }
-        elif spoof_plat == 2:
-            params = {
-                # App ID for Tiktok Mobile App
-                "aid": "1233",
-                # App name for Tiktok Mobile App
-                "app_name": "musical_ly",
-                # Channel for Tiktok Mobile App
-                "channel": "googleplay",
-                "device_platform": "android",
-                "iid": random.randint(7250000000000000000, 7351147085025500000),
-                "device_id": random.randint(7250000000000000000, 7351147085025500000),
-                "openudid": ''.join(random.choices('0123456789abcdef', k=16)),
-                "screen_shot": "1"
-            }
-            data = {
-                "title": title,  # Title of stream
-                "live_room_mode": "4",
-                "gen_replay": gen_replay,  # To generate replay
-                # To close room when stream is closed
-                "close_room_when_close_stream": close_room_when_close_stream,
-                "hashtag_id": hashtag_id,
-                "game_tag_id": game_tag_id,
-            }
-        else:
-            params = {
-                # App ID for TikTok Live Studio
-                "aid": "8311",
-                # App name for TikTok Live Studio
-                "app_name": "tiktok_live_studio",
-                # Channel for TikTok Live Studio
-                "channel": "studio",
-                "device_platform": "windows",
-                # Priority region for the stream
-                "priority_region": priority_region,
-                "live_mode": "6"
-            }
-            data = {
-                "title": title,  # Title of stream
-                "live_studio": "1",
-                "gen_replay": str(gen_replay).lower(),  # To generate replay
-                # To close room when stream is closed
-                "close_room_when_close_stream": str(close_room_when_close_stream).lower(),
-                "hashtag_id": hashtag_id,
-                "game_tag_id": game_tag_id,
-            }
-        if age_restricted:
-            data["age_restricted"] = "4"
-
-        streamInfo = self.s.post(
-            base_url + "webcast/room/create/",
-            params=params,
-            data=data
-        ).json()
-        try:
-            self.streamUrl = streamInfo["data"]["stream_url"][
-                "rtmp_push_url"
-            ]
-            split_index = self.streamUrl.rfind("/")
-            self.baseStreamUrl = self.streamUrl[:split_index]
-            self.streamKey = self.streamUrl[split_index + 1:]
-            self.streamShareUrl = streamInfo["data"]["share_url"]
-            return True
-        except KeyError:
-            if streamInfo["data"]["prompts"] == "Please login first":
-                messagebox.showerror(
-                    "Error", "Error creating stream. Try the other server."
-                )
-            else:
-                messagebox.showerror(
-                    "Error", streamInfo["data"]["prompts"]
-                )
-            return False
-
-    def endStream(self):
-        base_url = self.getServerUrl()
-        params = {
-            # App ID for TikTok Live Studio
-            "aid": "8311",
-            # App name for TikTok Live Studio
-            "app_name": "tiktok_live_studio",
-            # Channel for TikTok Live Studio
-            "channel": "studio",
-            "device_platform": "windows",
-            "live_mode": "6",
-        }
-        streamInfo = self.s.post(
-            base_url + "webcast/room/finish_abnormal/",
-            params=params
-        ).json()
-        if "data" in streamInfo and "prompts" in streamInfo["data"]:
-            messagebox.showerror(
-                "Error", streamInfo["data"]["prompts"]
-            )
-            return False
-        return True
-
-    def getServerUrl(self):
-        url = (
-            "https://tnc16-platform-useast1a.tiktokv.com/get_domains/v4/?"
-            "aid=8311&ttwebview_version=1130022001"
-        )
-        response = self.s.get(url).json()
-        for data in response["data"]["ttnet_dispatch_actions"]:
-            if "param" in data and "strategy_info" in data["param"] and \
-                    "webcast-normal.tiktokv.com" in \
-                    data["param"]["strategy_info"]:
-                server_url = data['param']['strategy_info'][
-                    'webcast-normal.tiktokv.com'
-                ]
-                return f"https://{server_url}/"
-    def renewCookies(self):
-        response = self.s.get("https://www.tiktok.com/foryou")
-        if response.url == "https://www.tiktok.com/login/phone-or-email":
-            messagebox.showerror(
-                "Error", "Cookies are invalid. Please login again."
-            )
-            cookies_status.config(text="No cookies found")
-            go_live_button.config(state=tk.DISABLED)
-            login_button.config(state=tk.NORMAL)
-            os.remove("cookies.json")
-            return False
-        else:
-            new_cookies = []
-            cookies = dict(self.s.cookies)
-            for cookie in cookies:
-                new_cookies.append(
-                    {
-                        "name": cookie,
-                        "value": cookies[cookie]
-                    }
-                )
-            with open("cookies.json", "w") as file:
-                json.dump(new_cookies, file)
-            return True
-
-
-def save_config():
-    """Save entry values to a JSON file."""
-    if game_combobox.get() != "":
-        game_id = [
-            game for game in games
-            if games[game].lower() == game_combobox.get().lower()
-        ][0]
-    else:
-        game_id = ""
-    if topic_combobox.get() != "":
-        topic_id = [
-            topic for topic in topics
-            if topics[topic].lower() == topic_combobox.get().lower()
-        ][0]
-    else:
-        topic_id = ""
-
-    data = {
-        "title": title_entry.get(),
-        "game_tag_id": game_id,
-        "hashtag_id": topic_id,
-        "priority_region": region_entry.get(),
-        "generate_replay": replay_var.get(),
-        "spoof_plat": spoof_plat_var.get(),
-        "close_room_when_close_stream": close_room_var.get(),
-        "age_restricted": age_restricted_var.get(),
-    }
-    with open("config.json", "w") as file:
-        json.dump(data, file)
-    messagebox.showinfo("Success", "Config saved successfully.")
-    return True
-
-
-def load_config():
-    """Load entry values from a JSON file."""
-    try:
-        with open("config.json", "r") as file:
-            data = json.load(file)
-        title_entry.delete(0, tk.END)
-        title_entry.insert(0, data.get("title", ""))
-        topic_combobox.set(topics.get(data.get("hashtag_id", ""), ""))
-        if topic_combobox.get() != "Gaming":
-            game_combobox.grid_remove()
-            game_label.grid_remove()
-        else:
-            game_combobox.set(games.get(data.get("game_tag_id", ""), ""))
-        region_entry.set(data.get("priority_region", ""))
-        replay_var.set(data.get("generate_replay", False))
-        spoof_plat_var.set(data.get("spoof_plat", 0))
-        close_room_var.set(data.get("close_room_when_close_stream", True))
-        age_restricted_var.set(data.get("age_restricted", False))
-    except FileNotFoundError:
-        print("Error loading config file.")
-
-
-def check_cookies():
-    """Update the label based on the existence of cookies.json."""
-    if os.path.exists("cookies.json"):
-        cookies_status.config(text="Cookies are loaded")
-        go_live_button.config(state=tk.NORMAL)
-        login_button.config(state=tk.DISABLED)
-    else:
-        cookies_status.config(text="No cookies found")
-        go_live_button.config(state=tk.DISABLED)
-        login_button.config(state=tk.NORMAL)
-
-
-def wait_for_page_load(driver, timeout=30):
-    """Wait for the page's load state to be 'complete'."""
-    return WebDriverWait(driver, timeout).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
-
-
-def launch_browser():
-    """Launch Selenium to perform login and save cookies."""
-    driver = uc.Chrome()
-    driver.get("https://www.tiktok.com/login?is_modal=1&hide_toggle_login_signup=1&enter_method=live_studio&enter_from=live_studio&lang=en")
-    try:
-        WebDriverWait(driver, 60).until(
-            EC.url_contains("https://www.tiktok.com/foryou")
-        )
-        cookies = driver.get_cookies()
-        with open("cookies.json", "w") as file:
-            json.dump(cookies, file)
-        wait_for_page_load(driver)
-        driver.quit()
-        messagebox.showinfo(
-            "Login Status", "Login Successful and cookies saved!"
-        )
-    except Exception as e:
-        error_message = f"Login Failed or Timed Out.\n" \
-                        f"Error type: {type(e).__name__}, Message: {str(e)}"
-        messagebox.showinfo("Login Status", error_message)
-    finally:
-        driver.quit()
-        check_cookies()
-
-
-def enable_output_fields():
-    """Enable output fields after stream is generated."""
-    server_entry.config(state=tk.NORMAL)
-    key_entry.config(state=tk.NORMAL)
-    url_entry.config(state=tk.NORMAL)
-
-
-def disable_output_fields():
-    """Disable output fields when stream is not generated."""
-    server_entry.config(state=tk.DISABLED)
-    key_entry.config(state=tk.DISABLED)
-    url_entry.config(state=tk.DISABLED)
-
-
-def clear_output_fields():
-    """Clear output fields."""
-    server_entry.delete(0, tk.END)
-    key_entry.delete(0, tk.END)
-    url_entry.delete(0, tk.END)
-
-
-def end_stream():
-    """End the current stream."""
-    with Stream() as s:
-        ended = s.endStream()
-        if ended:
-            messagebox.showinfo("Success", "Stream ended successfully.")
-            enable_output_fields()
-            clear_output_fields()
-            disable_output_fields()
-
-
-def generate_stream():
-    """Function for stream key generation."""
-    if topic_combobox.get() != "":
-        hashtag_id = [
-            topic for topic in topics
-            if topics[topic].lower() == topic_combobox.get().lower()
-        ][0]
-    else:
-        messagebox.showerror("Error", "Please select a topic.")
-        return
-    if hashtag_id == "5" and game_combobox.get() == "":
-        messagebox.showerror("Error", "Please select a game tag.")
-        return
-    if hashtag_id != "5":
-        game_id = "0"
-    else:
-        game_id = [
-            game for game in games
-            if games[game].lower() == game_combobox.get().lower()
-        ][0]
-    with Stream() as s:
-        created = s.createStream(
-            title_entry.get(),
-            hashtag_id,
-            game_id,
-            replay_var.get(),
-            close_room_var.get(),
-            age_restricted_var.get(),
-            region_entry.get(),
-            spoof_plat_var.get()
-        )
-        if created:
-            messagebox.showinfo("Success", "Stream created successfully.")
-            enable_output_fields()
-            clear_output_fields()
-            server_entry.insert(0, s.baseStreamUrl)
-            key_entry.insert(0, s.streamKey)
-            url_entry.insert(0, s.streamShareUrl)
-            disable_output_fields()
-
-
-def login_thread():
-    """Handle the login process in a separate thread to keep UI responsive."""
-    threading.Thread(target=launch_browser).start()
-
-
-def fetch_game_tags():
-    url = (
-        "https://webcast16-normal-c-useast2a.tiktokv.com/webcast/"
-        "room/hashtag/list/"
-    )
-    try:
-        response = requests.get(url)
-        game_tags = response.json()["data"]["game_tag_list"]
-        return {game["id"]: game["show_name"] for game in game_tags}
-    except Exception as e:
-        print(f"Failed to fetch game tags: {e}")
-        return {}
-
-
-def update_combobox_options(event):
-    # Get current text in the combobox
-    current_text = game_combobox.get()
-    # Filter the games dictionary
-    filtered_options = [
-        name
-        for name in games.values()
-        if name.lower().startswith(current_text.lower())
-    ]
-    # Update the options displayed in the combobox
-    game_combobox["values"] = filtered_options
-
-
-def check_selection(event):
-    if topic_combobox.get() == "Gaming":
-        game_combobox.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
-        game_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
-    else:
-        game_combobox.grid_remove()
-        game_label.grid_remove()
-
-
-topics = {
-    "5": "Gaming",
-    "6": "Music",
-    "42": "Chat & Interview",
-    "9": "Beauty & Fashion",
-    "3": "Dance",
-    "13": "Fitness & Sports",
-    "4": "Food",
-    "43": "News & Event",
-    "45": "Education"
+[
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1715616393,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "ak_bmsc",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "F10CF73075E7D5FE377BDEB1824069BE~000000000000000000000000000000~YAAQRKTUF0PU6E+PAQAA1sRGchey/cdm3VEvWzJd6M2B0V+lSLh/n/RMQ/pQTPS0Pgj9QTVs3ugY6JlEb5JUn1OCYdEya2lyaD0rRRcznkuDqPfvAFpAtjT0mjSTlXSJDBjmOIdzXul80Bh/PZHiQyeGXC6lA8m0qaGBg6NWoc20eupbz0j+vo3xQFvQ6YuDZ7e0NCeb6a/kUF+DreNy4i15/auTiNzTWcZ0DzIfooah2HDGJUz7kQENx5FQcZKWWWJqZsNLiqeQxByiodCFHurxk7NHPQ/QpYb4wv6Kz8qMBMgtC473ZHZO42Iqn7H04l8zNvpd/L4qKfNTPmTgM6YSNFDZAJFw1Pw4r2LvhWV3ga7lz44KrWzAhlujoZ19rQWSKjUN+tc+YfY=",
+    "id": 1
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1720729988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "cmpl_token",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "AgQQAPNUF-RO0ovedm6LNpk__CC-COUTv4XfYNfRxQ",
+    "id": 2
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1716473556,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "msToken",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "VJ-bqEFUqasgmc3Ia8XTP8QcsTHv_1eGaLmsRGhGcqC1I4mHF-ainKEuYwAqAxVAQ7RJWw0yzCripo8DcO5iTfikJBxx-WyBF8yCLCl0-4rLrqGRyFX5c8uVlKTv",
+    "id": 3
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1720729988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "multi_sids",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "6620459441341087750%3Ace6a8a645a41cf8c5c7dce779ccc7bef",
+    "id": 4
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1747145197,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "odin_tt",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "7952ed6c380042d156535959a7262455e67cd3cd3dcf26596e59435a5cfd98d0fb20aa06c21b32adaf91581e1429d7b83077d152475a3e080a146adeaa0b281e6b88e0062cdfa165e236e2aa02e9278f",
+    "id": 5
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1720729977,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "passport_csrf_token",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "c14cf8eabab01257fc9df468a34a4d54",
+    "id": 6
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1720729977,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "passport_csrf_token_default",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "c14cf8eabab01257fc9df468a34a4d54",
+    "id": 7
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "sessionid",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "ce6a8a645a41cf8c5c7dce779ccc7bef",
+    "id": 8
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "sessionid_ss",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "ce6a8a645a41cf8c5c7dce779ccc7bef",
+    "id": 9
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1746649988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "sid_guard",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "ce6a8a645a41cf8c5c7dce779ccc7bef%7C1715545986%7C15552000%7CFri%2C+08-Nov-2024+20%3A33%3A06+GMT",
+    "id": 10
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "sid_tt",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "ce6a8a645a41cf8c5c7dce779ccc7bef",
+    "id": 11
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "sid_ucp_v1",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "1.0.0-KGZlNGI2MzA3YjU2MzFlZjMyZWQ5NDY0ZmJkYmJmYTY3OTE5ZjM5NmMKIAiGgJGYkJmm8FsQgs-EsgYYswsgDDD5t4LfBTgHQPQHEAMaBm1hbGl2YSIgY2U2YThhNjQ1YTQxY2Y4YzVjN2RjZTc3OWNjYzdiZWY",
+    "id": 12
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "ssid_ucp_v1",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "1.0.0-KGZlNGI2MzA3YjU2MzFlZjMyZWQ5NDY0ZmJkYmJmYTY3OTE5ZjM5NmMKIAiGgJGYkJmm8FsQgs-EsgYYswsgDDD5t4LfBTgHQPQHEAMaBm1hbGl2YSIgY2U2YThhNjQ1YTQxY2Y4YzVjN2RjZTc3OWNjYzdiZWY",
+    "id": 13
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "store-country-code",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "eg",
+    "id": 14
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "store-country-code-src",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "uid",
+    "id": 15
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "store-idc",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "maliva",
+    "id": 16
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731161193,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "tt_chain_token",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "T3VduyfILMvP4zEZX/06wg==",
+    "id": 17
+},
+{
+    "domain": ".tiktok.com",
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "tt_csrf_token",
+    "path": "/",
+    "sameSite": "lax",
+    "secure": true,
+    "session": true,
+    "storeId": "0",
+    "value": "36Toz7zx-kpI7EWnNozedlgU6JJ9C4GNDOnQ",
+    "id": 18
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "tt-target-idc",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "useast1a",
+    "id": 19
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1747081988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "tt-target-idc-sign",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "h5enf7DOOtBW8oOl0aFjNhXZ3GE7EM8FXahDaArJk6yvUmR5QoN-gdtTTqkWQ6BcX5PXTeetpfGzSIeo-kHRYh7kVfjJQFcNQ3q1yn2h1jq92uO42ajM3NGqGl6l-nzza5KRpGQY1RfJ-6401rIeTGcQmFKBWS7IhrRfqILEBoTXQYeuSunLszOebBmmgWwX-OH3J-a0xFVIWoQMdgP6BQV80gDfNS5TVUEOxwL7JwNW4P_aPHLCFMQsUrVmwynNApjvlgkvAbBqX5GUL44HyVE7j2lltiehzli4JhJHNi27KDAVMjIZUOebLyRnTqJZxf-UQgjLve-WpmNUI9BRCiiEbx4jEYb2sLqUr6OVZy6B3dqxvH3lt7fIaL8U5BwwQEM31vlNztHvK4mAf5jb6VPHMdnCppZXKUyxSo7-qHgQqz6lDRfC3USLdc1a0Gn5dYr_Pp9xJmbzO97-Z6Zdam53FdtOxvOF18eVXsKK-QDcjrBkc6IDxxtRBqdrdUZa",
+    "id": 20
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1747145195,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "ttwid",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "1%7CYDBi8aihVlbI3snLsXKMfH17Tv5rJvDxks9rGb5kDdk%7C1715609192%7C4eff1e5f278ab84f174ed917134a14b864aee66fbafd8f5ff1b2ae865d761566",
+    "id": 21
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "uid_tt",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "f1242e702e8ad8bbf923cf6bc70139e9ccf7305d7ef4e74442b9e269ade7a444",
+    "id": 22
+},
+{
+    "domain": ".tiktok.com",
+    "expirationDate": 1731097988,
+    "hostOnly": false,
+    "httpOnly": true,
+    "name": "uid_tt_ss",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "f1242e702e8ad8bbf923cf6bc70139e9ccf7305d7ef4e74442b9e269ade7a444",
+    "id": 23
+},
+{
+    "domain": ".www.tiktok.com",
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "passport_fe_beating_status",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": true,
+    "storeId": "0",
+    "value": "true",
+    "id": 24
+},
+{
+    "domain": ".www.tiktok.com",
+    "expirationDate": 1716041198,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "perf_feed_cache",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "{%22expireTimestamp%22:1715781600000%2C%22itemIds%22:[%227368197682323623186%22%2C%227366659260589018400%22%2C%227348695601296461064%22]}",
+    "id": 25
+},
+{
+    "domain": ".www.tiktok.com",
+    "expirationDate": 1741529194,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "tiktok_webapp_theme",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": true,
+    "session": false,
+    "storeId": "0",
+    "value": "light",
+    "id": 26
+},
+{
+    "domain": "www.tiktok.com",
+    "expirationDate": 1723321988,
+    "hostOnly": true,
+    "httpOnly": false,
+    "name": "last_login_method",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "QRcode",
+    "id": 27
+},
+{
+    "domain": "www.tiktok.com",
+    "expirationDate": 1723385557,
+    "hostOnly": true,
+    "httpOnly": false,
+    "name": "msToken",
+    "path": "/",
+    "sameSite": "unspecified",
+    "secure": false,
+    "session": false,
+    "storeId": "0",
+    "value": "VJ-bqEFUqasgmc3Ia8XTP8QcsTHv_1eGaLmsRGhGcqC1I4mHF-ainKEuYwAqAxVAQ7RJWw0yzCripo8DcO5iTfikJBxx-WyBF8yCLCl0-4rLrqGRyFX5c8uVlKTv",
+    "id": 28
 }
-
-
-app = tk.Tk()
-app.title("TikTok Stream Key Generator")
-# This makes the first column in the main window expandable
-app.columnconfigure(0, weight=1)
-# This makes the first row in the main window expandable
-app.rowconfigure(0, weight=1)
-# This makes the second column in the main window expandable
-app.columnconfigure(1, weight=1)
-# This makes the second row in the main window expandable
-app.rowconfigure(1, weight=1)
-
-# Using LabelFrames for better organization
-input_frame = ttk.LabelFrame(app, text="Input")
-input_frame.grid(row=0, column=0, padx=10, pady=5, sticky="nsew")
-input_frame.columnconfigure(1, weight=1)
-
-# Input fields and labels inside the LabelFrame
-title_label = ttk.Label(input_frame, text="Title")
-title_label.grid(row=0, column=0, padx=5, pady=2, sticky="w")
-
-title_entry = ttk.Entry(input_frame)
-title_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
-
-topic_label = ttk.Label(input_frame, text="Topic")
-topic_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
-
-topic_combobox = ttk.Combobox(input_frame, values=list(topics.values()))
-topic_combobox.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
-topic_combobox.bind('<<ComboboxSelected>>', check_selection)
-
-game_combobox = ttk.Combobox(input_frame)
-
-game_label = ttk.Label(input_frame, text="Game")
-game_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
-
-games = fetch_game_tags()
-game_combobox = ttk.Combobox(input_frame, values=list(games.values()))
-game_combobox.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
-game_combobox.bind("<KeyRelease>", update_combobox_options)
-
-region_label = ttk.Label(input_frame, text="Region")
-region_label.grid(row=3, column=0, padx=5, pady=2, sticky="w")
-
-region_entry = ttk.Combobox(
-    input_frame,
-    values=[
-        "", "AF", "AX", "AL", "DZ", "AS", "AD", "AO", "AI", "AQ", "AG", "AR", "AM", "AW", "AU",
-        "AT", "AZ", "BS", "BH", "BD", "BB", "BY", "BE", "BZ", "BJ", "BM", "BT", "BO", "BQ",
-        "BA", "BW", "BV", "BR", "IO", "BN", "BG", "BF", "BI", "CV", "KH", "CM", "CA", "KY",
-        "CF", "TD", "CL", "CN", "CX", "CC", "CO", "KM", "CG", "CD", "CK", "CR", "CI", "HR",
-        "CU", "CW", "CY", "CZ", "DK", "DJ", "DM", "DO", "EC", "EG", "SV", "GQ", "ER", "EE",
-        "SZ", "ET", "FK", "FO", "FJ", "FI", "FR", "GF", "PF", "TF", "GA", "GM", "GE", "DE",
-        "GH", "GI", "GR", "GL", "GD", "GP", "GU", "GT", "GG", "GN", "GW", "GY", "HT", "HM",
-        "VA", "HN", "HK", "HU", "IS", "IN", "ID", "IR", "IQ", "IE", "IM", "IL", "IT", "JM",
-        "JP", "JE", "JO", "KZ", "KE", "KI", "KP", "KR", "KW", "KG", "LA", "LV", "LB", "LS",
-        "LR", "LY", "LI", "LT", "LU", "MO", "MG", "MW", "MY", "MV", "ML", "MT", "MH", "MQ",
-        "MR", "MU", "YT", "MX", "FM", "MD", "MC", "MN", "ME", "MS", "MA", "MZ", "MM", "NA",
-        "NR", "NP", "NL", "NC", "NZ", "NI", "NE", "NG", "NU", "NF", "MK", "MP", "NO", "OM",
-        "PK", "PW", "PS", "PA", "PG", "PY", "PE", "PH", "PN", "PL", "PT", "PR", "QA", "RE",
-        "RO", "RU", "RW", "BL", "SH", "KN", "LC", "MF", "PM", "VC", "WS", "SM", "ST", "SA",
-        "SN", "RS", "SC", "SL", "SG", "SX", "SK", "SI", "SB", "SO", "ZA", "GS", "SS", "ES",
-        "LK", "SD", "SR", "SJ", "SE", "CH", "SY", "TW", "TJ", "TZ", "TH", "TL", "TG", "TK",
-        "TO", "TT", "TN", "TR", "TM", "TC", "TV", "UG", "UA", "AE", "GB", "UM", "US", "UY",
-        "UZ", "VU", "VE", "VN", "VG", "VI", "WF", "EH", "YE", "ZM", "ZW"
-    ],
-)
-region_entry.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
-
-
-spoof_plat_var = tk.IntVar()
-spoof_plat_var.set(0)
-spoof_plat_radio1 = ttk.Radiobutton(
-    input_frame, text="No Spoofing", variable=spoof_plat_var, value=0
-)
-spoof_plat_radio1.grid(row=4, column=0, columnspan=1, padx=5, pady=2, sticky="w")
-
-spoof_plat_radio2 = ttk.Radiobutton(
-    input_frame, text="Mobile Camera Stream", variable=spoof_plat_var, value=1
-)
-spoof_plat_radio2.grid(row=4, column=1, columnspan=1, padx=5, pady=2, sticky="w")
-
-spoof_plat_radio3 = ttk.Radiobutton(
-    input_frame, text="Mobile Screenshare", variable=spoof_plat_var, value=2
-)
-spoof_plat_radio3.grid(row=4, column=2, columnspan=1, padx=5, pady=2, sticky="w")
-
-replay_var = tk.BooleanVar()
-replay_checkbox = ttk.Checkbutton(
-    input_frame, text="Generate Replay", variable=replay_var
-)
-replay_checkbox.grid(row=5, column=0, columnspan=2, padx=5, pady=2, sticky="w")
-
-close_room_var = tk.BooleanVar(value=True)
-close_room_checkbox = ttk.Checkbutton(
-    input_frame, text="Close Room When Close Stream", variable=close_room_var
-)
-close_room_checkbox.grid(
-    row=6, column=0, columnspan=2, padx=5, pady=2, sticky="w"
-)
-
-age_restricted_var = tk.BooleanVar()
-age_restricted_checkbox = ttk.Checkbutton(
-    input_frame, text="Age Restricted", variable=age_restricted_var
-)
-age_restricted_checkbox.grid(
-    row=7, column=0, columnspan=2, padx=5, pady=2, sticky="w"
-)
-
-# Cookies status
-cookies_status = ttk.Label(app, text="Checking cookies...")
-cookies_status.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-
-# Buttons
-login_button = ttk.Button(
-    app, text="Login", command=login_thread, state=tk.DISABLED
-)
-login_button.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
-
-go_live_button = ttk.Button(
-    app, text="Go Live", command=generate_stream, state=tk.DISABLED
-)
-go_live_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
-
-end_live_button = ttk.Button(
-    app, text="End Live", command=end_stream
-)
-end_live_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
-
-save_config_button = ttk.Button(app, text="Save Config", command=save_config)
-save_config_button.grid(row=5, column=0, padx=10, pady=5, sticky="ew")
-
-# Outputs
-output_frame = ttk.LabelFrame(app, text="Outputs")
-output_frame.grid(row=0, column=1, rowspan=5, padx=10, pady=5, sticky="nsew")
-output_frame.columnconfigure(0, weight=1)
-
-server_entry = ttk.Entry(output_frame, state="readonly")
-server_entry.grid(row=0, column=0, padx=5, pady=2, sticky="ew")
-
-key_entry = ttk.Entry(output_frame, state="readonly")
-key_entry.grid(row=1, column=0, padx=5, pady=2, sticky="ew")
-
-url_entry = ttk.Entry(output_frame, state="readonly")
-url_entry.grid(row=2, column=0, padx=5, pady=2, sticky="ew")
-
-
-def copy_to_clipboard(content):
-    app.clipboard_clear()
-    app.clipboard_append(content)
-    messagebox.showinfo("Copied", "Content copied to clipboard!")
-
-
-# Copy buttons for each Entry
-copy_server_button = ttk.Button(
-    output_frame,
-    text="Copy",
-    command=lambda: copy_to_clipboard(server_entry.get()),
-)
-copy_server_button.grid(row=0, column=1, padx=5, pady=2)
-
-copy_key_button = ttk.Button(
-    output_frame,
-    text="Copy",
-    command=lambda: copy_to_clipboard(key_entry.get()),
-)
-copy_key_button.grid(row=1, column=1, padx=5, pady=2)
-
-copy_url_button = ttk.Button(
-    output_frame,
-    text="Copy",
-    command=lambda: copy_to_clipboard(url_entry.get()),
-)
-copy_url_button.grid(row=2, column=1, padx=5, pady=2)
-
-check_cookies()
-load_config()
-
-app.mainloop()
+]
