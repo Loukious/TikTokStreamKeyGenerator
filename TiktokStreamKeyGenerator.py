@@ -1,6 +1,5 @@
-import random
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import json
 import os
 import threading
@@ -8,7 +7,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import requests
-
+import time
 
 class Stream:
     def __init__(self):
@@ -42,7 +41,8 @@ class Stream:
         spoof_plat=0,
         openudid = "",
         device_id = "",
-        iid = ""
+        iid = "",
+        thumbnail_path = ""
     ):
         base_url = self.getServerUrl()
         if spoof_plat == 1:
@@ -113,6 +113,9 @@ class Stream:
             }
         if age_restricted:
             data["age_restricted"] = "4"
+        if thumbnail_path:
+            uri = self.uploadThumbnail(thumbnail_path, base_url, params)
+            data["cover_uri"] = uri
 
         streamInfo = self.s.post(
             base_url + "webcast/room/create/",
@@ -176,7 +179,23 @@ class Stream:
                     'webcast-normal.tiktokv.com'
                 ]
                 return f"https://{server_url}/"
-
+            
+    def uploadThumbnail(
+        self,
+        file_path,
+        base_url,
+        params
+    ):
+        files = {
+            "file": (f"crop_{round(time.time() * 1000)}.png", open(file_path, "rb"), "multipart/form-data")
+        }
+        thumbnailInfo = self.s.post(
+                    base_url + "webcast/room/upload/image/",
+                    params=params,
+                    files=files
+        ).json()
+        return thumbnailInfo.get("data", {}).get("uri", "")
+            
     def renewCookies(self):
         response = self.s.get("https://www.tiktok.com/foryou")
         if response.url == "https://www.tiktok.com/login/phone-or-email":
@@ -377,7 +396,8 @@ def generate_stream():
             spoof_plat_var.get(),
             openudid_entry.get(),
             device_id_entry.get(),
-            iid_entry.get()
+            iid_entry.get(),
+            thumbnail_path_var.get()
         )
         if created:
             messagebox.showinfo("Success", "Stream created successfully.")
@@ -437,6 +457,13 @@ def on_spoof_plat_change(*args):
     else:
         spoofing_frame.grid()
 
+def browse_image():
+    file_path = filedialog.askopenfilename(
+        title="Select a Image",
+        filetypes=[("PNG files", "*.png"), ("JPG files", "*.jpg"), ("JPEG files", "*.jpeg"), ("All files", "*.*")]
+    )
+    if file_path:
+        thumbnail_path_var.set(file_path)
 
 topics = {
     "5": "Gaming",
@@ -554,6 +581,18 @@ age_restricted_checkbox = ttk.Checkbutton(
 age_restricted_checkbox.grid(
     row=7, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
+
+# File input
+thumbnail_path_var = tk.StringVar()
+
+thumbnail_label = ttk.Label(input_frame, text="Selected Thumbnail:")
+thumbnail_label.grid(row=8, column=0, padx=5, pady=5, sticky="w")
+
+thumbnail_entry = ttk.Entry(input_frame, textvariable=thumbnail_path_var, width=50)
+thumbnail_entry.grid(row=8, column=1, padx=5, pady=5, sticky="ew")
+
+browse_button = ttk.Button(input_frame, text="Browse", command=browse_image)
+browse_button.grid(row=8, column=2, padx=5, pady=5, sticky="ew")
 
 # Using LabelFrames for better organization
 spoofing_frame = ttk.LabelFrame(app, text="Spoofing Info")
