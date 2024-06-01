@@ -39,7 +39,10 @@ class Stream:
         close_room_when_close_stream=True,
         age_restricted=False,
         priority_region="",
-        spoof_plat=0
+        spoof_plat=0,
+        openudid = "",
+        device_id = "",
+        iid = ""
     ):
         base_url = self.getServerUrl()
         if spoof_plat == 1:
@@ -51,9 +54,9 @@ class Stream:
                 # Channel for Tiktok Mobile App
                 "channel": "googleplay",
                 "device_platform": "android",
-                "iid": random.randint(7250000000000000000, 7351147085025500000),
-                "device_id": random.randint(7250000000000000000, 7351147085025500000),
-                "openudid": ''.join(random.choices('0123456789abcdef', k=16))
+                "iid": iid,
+                "device_id": device_id,
+                "openudid": openudid
             }
             data = {
                 "title": title,  # Title of stream
@@ -72,9 +75,9 @@ class Stream:
                 # Channel for Tiktok Mobile App
                 "channel": "googleplay",
                 "device_platform": "android",
-                "iid": random.randint(7250000000000000000, 7351147085025500000),
-                "device_id": random.randint(7250000000000000000, 7351147085025500000),
-                "openudid": ''.join(random.choices('0123456789abcdef', k=16)),
+                "iid": iid,
+                "device_id": device_id,
+                "openudid": openudid,
                 "screen_shot": "1"
             }
             data = {
@@ -173,6 +176,7 @@ class Stream:
                     'webcast-normal.tiktokv.com'
                 ]
                 return f"https://{server_url}/"
+
     def renewCookies(self):
         response = self.s.get("https://www.tiktok.com/foryou")
         if response.url == "https://www.tiktok.com/login/phone-or-email":
@@ -225,6 +229,9 @@ def save_config():
         "spoof_plat": spoof_plat_var.get(),
         "close_room_when_close_stream": close_room_var.get(),
         "age_restricted": age_restricted_var.get(),
+        "openudid": openudid_entry.get(),
+        "device_id": device_id_entry.get(),
+        "iid": iid_entry.get()
     }
     with open("config.json", "w") as file:
         json.dump(data, file)
@@ -248,6 +255,14 @@ def load_config():
         region_entry.set(data.get("priority_region", ""))
         replay_var.set(data.get("generate_replay", False))
         spoof_plat_var.set(data.get("spoof_plat", 0))
+        openudid_entry.delete(0, tk.END)
+        openudid_entry.insert(0, data.get("openudid", ""))
+        device_id_entry.delete(0, tk.END)
+        device_id_entry.insert(0, data.get("device_id", ""))
+        iid_entry.delete(0, tk.END)
+        iid_entry.insert(0, data.get("iid", ""))
+        if spoof_plat_var.get() == 0:
+            spoofing_frame.grid_remove()
         close_room_var.set(data.get("close_room_when_close_stream", True))
         age_restricted_var.set(data.get("age_restricted", False))
     except FileNotFoundError:
@@ -359,7 +374,10 @@ def generate_stream():
             close_room_var.get(),
             age_restricted_var.get(),
             region_entry.get(),
-            spoof_plat_var.get()
+            spoof_plat_var.get(),
+            openudid_entry.get(),
+            device_id_entry.get(),
+            iid_entry.get()
         )
         if created:
             messagebox.showinfo("Success", "Stream created successfully.")
@@ -412,6 +430,14 @@ def check_selection(event):
         game_label.grid_remove()
 
 
+def on_spoof_plat_change(*args):
+    selected_value = spoof_plat_var.get()
+    if selected_value == 0:
+        spoofing_frame.grid_remove()
+    else:
+        spoofing_frame.grid()
+
+
 topics = {
     "5": "Gaming",
     "6": "Music",
@@ -427,19 +453,14 @@ topics = {
 
 app = tk.Tk()
 app.title("TikTok Stream Key Generator")
-# This makes the first column in the main window expandable
 app.columnconfigure(0, weight=1)
-# This makes the first row in the main window expandable
-app.rowconfigure(0, weight=1)
-# This makes the second column in the main window expandable
 app.columnconfigure(1, weight=1)
-# This makes the second row in the main window expandable
-app.rowconfigure(1, weight=1)
+app.columnconfigure(2, weight=1)
 
 # Using LabelFrames for better organization
 input_frame = ttk.LabelFrame(app, text="Input")
 input_frame.grid(row=0, column=0, padx=10, pady=5, sticky="nsew")
-input_frame.columnconfigure(1, weight=1)
+input_frame.columnconfigure(0, weight=1)
 
 # Input fields and labels inside the LabelFrame
 title_label = ttk.Label(input_frame, text="Title")
@@ -496,6 +517,7 @@ region_entry.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
 
 spoof_plat_var = tk.IntVar()
 spoof_plat_var.set(0)
+spoof_plat_var.trace_add("write", on_spoof_plat_change)
 spoof_plat_radio1 = ttk.Radiobutton(
     input_frame, text="No Spoofing", variable=spoof_plat_var, value=0
 )
@@ -533,28 +555,62 @@ age_restricted_checkbox.grid(
     row=7, column=0, columnspan=2, padx=5, pady=2, sticky="w"
 )
 
+# Using LabelFrames for better organization
+spoofing_frame = ttk.LabelFrame(app, text="Spoofing Info")
+spoofing_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+spoofing_frame.columnconfigure(1, weight=1)
+
+# Additional fields for Mobile Camera Stream and Mobile Screenshare
+openudid_label = ttk.Label(spoofing_frame, text="OpenUDID")
+openudid_label.grid(row=0, column=0, padx=5, pady=2, sticky="w")
+
+openudid_entry = ttk.Entry(spoofing_frame)
+openudid_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+
+device_id_label = ttk.Label(spoofing_frame, text="Device ID")
+device_id_label.grid(row=1, column=0, padx=5, pady=2, sticky="w")
+
+device_id_entry = ttk.Entry(spoofing_frame)
+device_id_entry.grid(row=1, column=1, padx=5, pady=2, sticky="ew")
+
+iid_label = ttk.Label(spoofing_frame, text="IID")
+iid_label.grid(row=2, column=0, padx=5, pady=2, sticky="w")
+
+iid_entry = ttk.Entry(spoofing_frame)
+iid_entry.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
+
+create_device_button = ttk.Button(
+    spoofing_frame, text="How to get these info?", command=lambda: os.system("start https://github.com/Loukious/TikTokDeviceGenerator/releases/latest")
+)
+create_device_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+
+
+cookies_frame = ttk.LabelFrame(app, text="Cookies Info")
+cookies_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
+cookies_frame.columnconfigure(1, weight=1)
+
 # Cookies status
-cookies_status = ttk.Label(app, text="Checking cookies...")
+cookies_status = ttk.Label(cookies_frame, text="Checking cookies...")
 cookies_status.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
 
 # Buttons
 login_button = ttk.Button(
     app, text="Login", command=login_thread, state=tk.DISABLED
 )
-login_button.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+login_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
 
 go_live_button = ttk.Button(
     app, text="Go Live", command=generate_stream, state=tk.DISABLED
 )
-go_live_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+go_live_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
 
 end_live_button = ttk.Button(
     app, text="End Live", command=end_stream
 )
-end_live_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+end_live_button.grid(row=5, column=0, padx=10, pady=5, sticky="ew")
 
 save_config_button = ttk.Button(app, text="Save Config", command=save_config)
-save_config_button.grid(row=5, column=0, padx=10, pady=5, sticky="ew")
+save_config_button.grid(row=6, column=0, padx=10, pady=5, sticky="ew")
 
 # Outputs
 output_frame = ttk.LabelFrame(app, text="Outputs")
