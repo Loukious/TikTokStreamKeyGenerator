@@ -11,11 +11,13 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Generate a TikTok stream key.
 - Obtain a shareable URL for the TikTok live stream.
 - Support for specifying different topics including games, music, and more.
+- Spoofing support for users without TikTok LIVE Studio access.
 - Option to enable replay generation.
 - Option to close the room when the stream ends.
 - Option to choose region priority.
 - Option to mark the stream as mature content.
 - Button to end the stream.
+- Option to use custom thumbnail.
 
 ## Requirements
 - Python 3.6+
@@ -23,6 +25,9 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Game tag ID
 - Logged into TikTok LIVE studio at least once
 - Have TikTok LIVE studio access or Live access (use spoofing if you don't have access to TikTok LIVE studio)
+
+## Spoofing
+For users who want to use spoofing, you must generate a device_id, iid and openudid using the app from [here](https://github.com/Loukious/TikTokDeviceGenerator/releases/latest). After generating the device_id, iid and openudid, you can use them in the app to spoof the TikTok app.
 
 ## Installation
 Either use the provided executable or follow the steps below to run the script.
