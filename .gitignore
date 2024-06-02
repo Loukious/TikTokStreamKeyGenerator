@@ -3,3 +3,6 @@ config.json
 TiktokStreamKeyGenerator.spec
 build/*
 dist/*
+*.pem
+*/__pycache__/*
+.env

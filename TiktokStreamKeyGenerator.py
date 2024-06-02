@@ -8,6 +8,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import requests
 import time
+from urllib.parse import urlencode
+from Libs.device import Device
+from Libs.device_gen import Applog, Xlog
+from Libs.xgorgon import Gorgon
 
 class Stream:
     def __init__(self):
@@ -116,7 +120,10 @@ class Stream:
         if thumbnail_path:
             uri = self.uploadThumbnail(thumbnail_path, base_url, params)
             data["cover_uri"] = uri
-
+        if spoof_plat in [1, 2]:
+            sig = Gorgon(urlencode(params), urlencode(data), urlencode(self.s.cookies)).get_value()
+            self.s.headers.update(sig)
+            
         streamInfo = self.s.post(
             base_url + "webcast/room/create/",
             params=params,
@@ -132,14 +139,9 @@ class Stream:
             self.streamShareUrl = streamInfo["data"]["share_url"]
             return True
         except KeyError:
-            if streamInfo["data"]["prompts"] == "Please login first":
-                messagebox.showerror(
-                    "Error", "Error creating stream. Try the other server."
-                )
-            else:
-                messagebox.showerror(
-                    "Error", streamInfo["data"]["prompts"]
-                )
+            messagebox.showerror(
+                "Error", streamInfo["data"]["prompts"]
+            )
             return False
 
     def endStream(self):
@@ -465,6 +467,19 @@ def browse_image():
     if file_path:
         thumbnail_path_var.set(file_path)
 
+def generate_device():
+    device: dict = Device().create_device()
+    device_id, install_id = Applog(device).register_device()
+    Xlog(device_id).bypass()
+    openudid_entry.delete(0, tk.END)
+    openudid_entry.insert(0, device["openudid"])
+    device_id_entry.delete(0, tk.END)
+    device_id_entry.insert(0, device_id)
+    iid_entry.delete(0, tk.END)
+    iid_entry.insert(0, install_id)
+
+
+
 topics = {
     "5": "Gaming",
     "6": "Music",
@@ -619,7 +634,7 @@ iid_entry = ttk.Entry(spoofing_frame)
 iid_entry.grid(row=2, column=1, padx=5, pady=2, sticky="ew")
 
 create_device_button = ttk.Button(
-    spoofing_frame, text="How to get these info?", command=lambda: os.system("start https://github.com/Loukious/TikTokDeviceGenerator/releases/latest")
+    spoofing_frame, text="Generate Device", command=generate_device
 )
 create_device_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
 

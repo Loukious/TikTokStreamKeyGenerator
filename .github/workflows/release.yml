@@ -28,7 +28,7 @@ jobs:
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Build Executable
-      run: pyinstaller --onefile --clean TiktokStreamKeyGenerator.py
+      run: pyinstaller --add-data "Libs:Libs" --onefile --clean TiktokStreamKeyGenerator.py
     - name: Clean up obsolete files
       run: Remove-Item -Path build, TiktokStreamKeyGenerator.spec -Recurse -Force
     
