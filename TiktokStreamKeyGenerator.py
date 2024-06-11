@@ -1,3 +1,4 @@
+import hashlib
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import json
@@ -9,15 +10,22 @@ from selenium.webdriver.support import expected_conditions as EC
 import requests
 import time
 from urllib.parse import urlencode
+import urllib.parse
 from Libs.device import Device
 from Libs.device_gen import Applog, Xlog
 from Libs.xgorgon import Gorgon
+from Libs.signature import ladon_encrypt, get_x_ss_stub
+from dotenv import load_dotenv
 
+load_dotenv()
+
+
+    
 class Stream:
     def __init__(self):
         self.s = requests.session()
         self.s.headers = {
-            "user-agent": "",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/0.49.4 Chrome/104.0.5112.102 Electron/20.1.0-tt.7.release.mssdk.27 TTElectron/20.1.0-tt.7.release.mssdk.27 Safari/537.36",
         }
         with open("cookies.json", "r") as file:
             cookies_file = json.load(file)
@@ -63,13 +71,44 @@ class Stream:
                 "openudid": openudid
             }
             data = {
-                "title": title,  # Title of stream
-                "gen_replay": gen_replay,  # To generate replay
-                # To close room when stream is closed
-                "close_room_when_close_stream": close_room_when_close_stream,
                 "hashtag_id": hashtag_id,
+                "hold_living_room": "1",
+                "chat_sub_only_auth": "2",
+                "community_flagged_chat_auth": "2",
+                "ecom_bc_toggle": "3",
+                "live_sub_only": "0",
+                "chat_l_2": "1",
+                "caption": "0",
+                "title": title,
+                "live_sub_only_use_music": "0",
+                "mobile_binded": "0",
+                "create_source": "0",
+                "commercial_content_promote_third_party": "false",
+                "grant_level": "0",
+                "screenshot_cover_status": "0",
+                "mobile_validated": "0",
+                "live_agreement": "0",
+                "commercial_content_promote_myself": "false",
+                "allow_preview_duration_exp": "0",
+                "is_user_select": "0",
+                "transaction_history": "1",
+                "probe_recommend_resolution": "0",
+                "chat_auth": "1",
+                "disable_preview_sub_only": "0",
+                "grant_group": "1",
+                "gift_auth": "1",
+                "star_comment_switch": "true",
+                "has_commerce_goods": "false",
+                "open_commercial_content_toggle": "false",
+                "event_id": "-1",
+                "star_comment_qualification": "true",
                 "game_tag_id": game_tag_id,
+                "community_flagged_chat_review_auth": "2",
+                "age_restricted": "0",
+                "gen_replay": str(gen_replay).lower(),
+                "shopping_ranking": "0"
             }
+
         elif spoof_plat == 2:
             params = {
                 # App ID for Tiktok Mobile App
@@ -85,13 +124,44 @@ class Stream:
                 "screen_shot": "1"
             }
             data = {
-                "title": title,  # Title of stream
-                "live_room_mode": "4",
-                "gen_replay": gen_replay,  # To generate replay
-                # To close room when stream is closed
-                "close_room_when_close_stream": close_room_when_close_stream,
                 "hashtag_id": hashtag_id,
+                "hold_living_room": "1",
+                "chat_sub_only_auth": "2",
+                "screen_shot": "1",
+                "community_flagged_chat_auth": "2",
+                "ecom_bc_toggle": "3",
+                "live_sub_only": "0",
+                "chat_l_2": "1",
+                "caption": "0",
+                "title": title,
+                "live_sub_only_use_music": "0",
+                "mobile_binded": "0",
+                "create_source": "0",
+                "commercial_content_promote_third_party": "false",
+                "grant_level": "0",
+                "screenshot_cover_status": "1",
+                "mobile_validated": "0",
+                "live_agreement": "0",
+                "orientation": "2",
+                "commercial_content_promote_myself": "false",
+                "allow_preview_duration_exp": "0",
+                "transaction_history": "1",
+                "chat_auth": "1",
+                "disable_preview_sub_only": "0",
+                "grant_group": "1",
+                "gift_auth": "1",
+                "star_comment_switch": "true",
+                "has_commerce_goods": "false",
+                "open_commercial_content_toggle": "false",
+                "event_id": "-1",
+                "star_comment_qualification": "true",
                 "game_tag_id": game_tag_id,
+                "community_flagged_chat_review_auth": "2",
+                "age_restricted": "0",
+                "sdk_key": "hd",
+                "live_room_mode": "4",
+                "gen_replay": str(gen_replay).lower(),
+                "shopping_ranking": "0"
             }
         else:
             params = {
@@ -107,22 +177,37 @@ class Stream:
                 "live_mode": "6"
             }
             data = {
-                "title": title,  # Title of stream
+                "title": title,
                 "live_studio": "1",
-                "gen_replay": str(gen_replay).lower(),  # To generate replay
-                # To close room when stream is closed
+                "gen_replay": str(gen_replay).lower(),
+                "chat_auth": "1",
+                "cover_uri": "",
                 "close_room_when_close_stream": str(close_room_when_close_stream).lower(),
-                "hashtag_id": hashtag_id,
-                "game_tag_id": game_tag_id,
+                "hashtag_id": str(hashtag_id),
+                "game_tag_id": str(game_tag_id),
+                "screenshot_cover_status": "1",
+                "live_sub_only": "0",
+                "chat_sub_only_auth": "2",
+                "multi_stream_scene": "0",
+                "gift_auth": "1",
+                "chat_l2": "1",
+                "star_comment_switch": "true",
+                "multi_stream_source": "1"
             }
         if age_restricted:
             data["age_restricted"] = "4"
         if thumbnail_path:
             uri = self.uploadThumbnail(thumbnail_path, base_url, params)
             data["cover_uri"] = uri
+
+        sig = Gorgon(urlencode(params, quote_via=urllib.parse.quote), urlencode(data, quote_via=urllib.parse.quote), urlencode(self.s.cookies, quote_via=urllib.parse.quote)).get_value()
+        self.s.headers.update(sig)
+        x_ss_stub = get_x_ss_stub(data)
+        self.s.headers.update(x_ss_stub)
         if spoof_plat in [1, 2]:
-            sig = Gorgon(urlencode(params), urlencode(data), urlencode(self.s.cookies)).get_value()
-            self.s.headers.update(sig)
+            self.s.headers.update(ladon_encrypt(sig["x-khronos"], 1611921764, 1233))
+        else:
+            self.s.headers.update(ladon_encrypt(sig["x-khronos"], 1611921764, 8311))
             
         streamInfo = self.s.post(
             base_url + "webcast/room/create/",
