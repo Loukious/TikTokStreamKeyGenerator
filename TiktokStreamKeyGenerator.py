@@ -174,7 +174,8 @@ class Stream:
                 "device_platform": "windows",
                 # Priority region for the stream
                 "priority_region": priority_region,
-                "live_mode": "6"
+                "live_mode": "6",
+                "version_code": "9.99.9"
             }
             data = {
                 "title": title,
