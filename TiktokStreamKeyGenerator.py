@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-    
+
 class Stream:
     def __init__(self):
         self.s = requests.session()
