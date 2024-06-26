@@ -11,7 +11,7 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Generate a TikTok stream key.
 - Obtain a shareable URL for the TikTok live stream.
 - Support for specifying different topics including games, music, and more.
-- Spoofing support for users without TikTok LIVE Studio access.
+- Spoofing support for users without TikTok LIVE Studio access (Currently broken don't use it).
 - Generate a fake device for spoofing.
 - Option to enable replay generation.
 - Option to close the room when the stream ends.
@@ -28,7 +28,7 @@ This Python script is a valuable tool for content creators looking to broadcast 
 - Have TikTok LIVE studio access or Live access (use spoofing if you don't have access to TikTok LIVE studio)
 
 ## Installation
-Either use the provided executable or follow the steps below to run the script.
+Either download and use the provided exe from [here](https://github.com/Loukious/TikTokStreamKeyGenerator/releases/latest) or follow the steps below to run the script.
 Ensure you have Python and PIP working.
 In the command line, install the required packages using the following command (run the command in the same directory as the script):
 ```bash

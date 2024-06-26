@@ -652,12 +652,12 @@ spoof_plat_radio1 = ttk.Radiobutton(
 spoof_plat_radio1.grid(row=4, column=0, columnspan=1, padx=5, pady=2, sticky="w")
 
 spoof_plat_radio2 = ttk.Radiobutton(
-    input_frame, text="Mobile Camera Stream", variable=spoof_plat_var, value=1
+    input_frame, text="Mobile Camera Stream (gets no traffic)", variable=spoof_plat_var, value=1
 )
 spoof_plat_radio2.grid(row=4, column=1, columnspan=1, padx=5, pady=2, sticky="w")
 
 spoof_plat_radio3 = ttk.Radiobutton(
-    input_frame, text="Mobile Screenshare", variable=spoof_plat_var, value=2
+    input_frame, text="Mobile Screenshare (gets no traffic)", variable=spoof_plat_var, value=2
 )
 spoof_plat_radio3.grid(row=4, column=2, columnspan=1, padx=5, pady=2, sticky="w")
 
