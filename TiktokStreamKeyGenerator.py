@@ -15,9 +15,7 @@ from Libs.device import Device
 from Libs.device_gen import Applog, Xlog
 from Libs.xgorgon import Gorgon
 from Libs.signature import ladon_encrypt, get_x_ss_stub
-from dotenv import load_dotenv
 
-load_dotenv()
 
 
 
@@ -25,7 +23,7 @@ class Stream:
     def __init__(self):
         self.s = requests.session()
         self.s.headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/0.49.4 Chrome/104.0.5112.102 Electron/20.1.0-tt.7.release.mssdk.27 TTElectron/20.1.0-tt.7.release.mssdk.27 Safari/537.36",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/0.61.0 Chrome/108.0.5359.215 Electron/22.3.18-tt.8.release.main.38 TTElectron/22.3.18-tt.8.release.main.38 Safari/537.36",
         }
         with open("cookies.json", "r") as file:
             cookies_file = json.load(file)
@@ -175,7 +173,7 @@ class Stream:
                 # Priority region for the stream
                 "priority_region": priority_region,
                 "live_mode": "6",
-                "version_code": "9.99.9"
+                "version_code": "0.61.0"
             }
             data = {
                 "title": title,
