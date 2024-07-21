@@ -1,3 +1,7 @@
+# This project is discontinued!
+For a simpler solution to generate TikTok stream keys check my other project [here](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator)
+
+
 # TikTok Live Stream Key Generator for OBS Studio
 
 ## Description
