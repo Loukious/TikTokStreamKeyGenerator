@@ -1,5 +1,5 @@
-cookies.json
-config.json
+cookies*
+config*
 TiktokStreamKeyGenerator.spec
 build/*
 dist/*
