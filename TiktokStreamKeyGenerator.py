@@ -35,6 +35,22 @@ class Stream:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.s.close()
+    
+    def getLiveStudioLatestVersion(self):
+        url = "https://tron-sg.bytelemon.com/api/sdk/check_update"
+        params = {
+            "pid": "7393277106664249610",
+            "uid": "7464643088460875280",
+            "branch": "studio/release/stable",
+            "buildId": "0"
+        }
+        try:
+            with self.s.get(url, params=params) as response:
+                return response.json()["data"]["manifest"]["win32"]["version"]
+        except Exception as e:
+            print(f"Failed to fetch latest version: {e}")
+            return "0.99.0"
+        
 
     def createStream(
         self,
@@ -264,8 +280,9 @@ class Stream:
                 "shopping_ranking": "0"
             }
         else:
+            version = self.getLiveStudioLatestVersion()
             self.s.headers = {
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/0.69.2 Chrome/108.0.5359.215 Electron/22.3.18-tt.8.release.main.44 TTElectron/22.3.18-tt.8.release.main.44 Safari/537.36",
+                "user-agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/{version} Chrome/108.0.5359.215 Electron/22.3.18-tt.8.release.main.44 TTElectron/22.3.18-tt.8.release.main.44 Safari/537.36",
             }
             params = {
                 # App ID for TikTok Live Studio
@@ -278,8 +295,8 @@ class Stream:
                 # Priority region for the stream
                 "priority_region": priority_region,
                 "live_mode": "6",
-                "version_code": "0.69.2",
-                "webcast_sdk_version": "692",
+                "version_code": version,
+                "webcast_sdk_version": version.replace(".", "").replace("0", ""),
                 "webcast_language": "en",
                 "app_language": "en",
                 "language": "en",
