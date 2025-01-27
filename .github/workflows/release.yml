@@ -1,60 +1,267 @@
 name: Release
+
 on:
-  push:
-    tags:
-      - v*
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The new version number (e.g., 1.1)"
+        required: true
+      changelog:
+        description: "The changelog for this version"
+        required: true
+
 env:
   FORCE_COLOR: true
 
 jobs:
-  build:
+  create-tag:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Create Git Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v${{ github.event.inputs.version }}" || echo "Tag creation failed (possibly already exists)."
+          git push origin "v${{ github.event.inputs.version }}" || echo "Tag push failed (possibly already exists)."
+
+  build_windows:
     runs-on: windows-latest
+    needs: create-tag
+    strategy:
+      matrix:
+        build_type: [Release, Debug]
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python 3.12
-      uses: actions/setup-python@v3
-      with:
-        python-version: "3.12"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install flake8 pytest pyinstaller
-        if (Test-Path requirements.txt) {
-          pip install -r requirements.txt
-        }
-    - name: Lint with flake8
-      run: |
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Build Executable
-      run: pyinstaller --add-data "Libs:Libs" --onefile --clean TiktokStreamKeyGenerator.py
-    - name: Clean up obsolete files
-      run: Remove-Item -Path build, TiktokStreamKeyGenerator.spec -Recurse -Force
-    
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: windows
-        path: |
-          dist/TiktokStreamKeyGenerator.exe
+      - uses: actions/checkout@v3
+
+      - name: Set Release variable
+        run: |
+          echo "RELEASE=${{ matrix.build_type }}" >> $env:GITHUB_ENV
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v3
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install Nuitka clang
+          if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          }
+
+      - name: Build Executable
+        run: |
+          Write-Host "Release variable is set to: $env:Release"
+          if ($env:Release -eq 'Release') {
+            nuitka `
+            --assume-yes-for-downloads `
+            --show-scons `
+            --clang `
+            --lto=no `
+            --jobs=4 `
+            --static-libpython=no `
+            --standalone `
+            --enable-plugin=anti-bloat `
+            --enable-plugin=tk-inter `
+            --show-modules `
+            --show-anti-bloat-changes `
+            --follow-stdlib `
+            --follow-imports `
+            --nofollow-import-to="*.tests" `
+            --nofollow-import-to="unittest" `
+            --nofollow-import-to="pydoc" `
+            --nofollow-import-to="test" `
+            --prefer-source-code `
+            --windows-console-mode=disable `
+            TiktokStreamKeyGenerator.py
+          } else {
+            nuitka `
+            --assume-yes-for-downloads `
+            --show-scons `
+            --clang `
+            --lto=no `
+            --jobs=4 `
+            --static-libpython=no `
+            --standalone `
+            --enable-plugin=anti-bloat `
+            --enable-plugin=tk-inter `
+            --show-modules `
+            --show-anti-bloat-changes `
+            --follow-stdlib `
+            --follow-imports `
+            --nofollow-import-to="*.tests" `
+            --nofollow-import-to="unittest" `
+            --nofollow-import-to="pydoc" `
+            --nofollow-import-to="test" `
+            --prefer-source-code `
+            TiktokStreamKeyGenerator.py
+          }
+
+      - name: Compress Executable
+        run: Compress-Archive -Path TiktokStreamKeyGenerator.dist\* -DestinationPath TiktokStreamKeyGenerator${{ matrix.build_type }}-win.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.build_type }}
+          path: |
+            ./TiktokStreamKeyGenerator${{ matrix.build_type }}-win.zip
+
+  build_macos:
+    runs-on: macos-latest
+    needs: create-tag
+    strategy:
+      matrix:
+        architecture: [x86_64, arm64]
+        build_type: [Release]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v3
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U Nuitka clang certifi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Build Executable
+        run: |
+          arch -${{ matrix.architecture }} nuitka \
+          --assume-yes-for-downloads \
+          --show-scons \
+          --clang \
+          --lto=no \
+          --jobs=4 \
+          --static-libpython=no \
+          --standalone \
+          --enable-plugin=anti-bloat \
+          --show-modules \
+          --show-anti-bloat-changes \
+          --follow-stdlib \
+          --follow-imports \
+          --enable-plugin=tk-inter \
+          --include-package=undetected_chromedriver \
+          --include-package=certifi \
+          --nofollow-import-to="*.tests" \
+          --nofollow-import-to="unittest" \
+          --nofollow-import-to="pydoc" \
+          --nofollow-import-to="test" \
+          --prefer-source-code \
+          --macos-target-arch=${{ matrix.architecture }} \
+          TiktokStreamKeyGenerator.py
+
+      - name: Compress Executable
+        run: |
+          zip -r TiktokStreamKeyGenerator-${{ matrix.architecture }}-macos.zip TiktokStreamKeyGenerator.dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.architecture }}
+          path: |
+            TiktokStreamKeyGenerator-${{ matrix.architecture }}-macos.zip
+
+  build_linux:
+    runs-on: ubuntu-22.04
+    needs: create-tag
+    strategy:
+      matrix:
+        build_type: [Release]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache python3-pip python3-tk zip python3-distutils
+          python3 -m pip install --upgrade pip
+          pip3 install -U Nuitka clang certifi
+          if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
+
+      - name: Build Executable
+        run: |
+          nuitka \
+          --assume-yes-for-downloads \
+          --show-scons \
+          --clang \
+          --lto=no \
+          --jobs=4 \
+          --static-libpython=no \
+          --standalone \
+          --enable-plugin=anti-bloat \
+          --enable-plugin=tk-inter \
+          --include-package=undetected_chromedriver \
+          --include-package=certifi \
+          --show-modules \
+          --show-anti-bloat-changes \
+          --follow-stdlib \
+          --follow-imports \
+          --nofollow-import-to="*.tests" \
+          --nofollow-import-to="unittest" \
+          --nofollow-import-to="pydoc" \
+          --nofollow-import-to="test" \
+          --prefer-source-code \
+          TiktokStreamKeyGenerator.py
+
+      - name: Compress Executable
+        run: zip -r TiktokStreamKeyGenerator-linux.zip TiktokStreamKeyGenerator.dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-
+          path: |
+            ./TiktokStreamKeyGenerator-linux.zip
 
   release:
-    runs-on: windows-latest
-    needs: [build]
+    runs-on: ubuntu-latest
+    needs: [build_linux, build_windows, build_macos]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - uses: actions/download-artifact@v3
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          merge-multiple: true
+          path: ./windows
+
+      - name: Download MacOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: ./macos
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: ./linux
 
       - name: Create the release
-        uses: softprops/action-gh-release@1e07f4398721186383de40550babbdf2b84acfc5 # v1
+        uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: ${{ github.ref_name }}
-          prerelease: false
-          draft: false
+          tag_name: "v${{ github.event.inputs.version }}"
+          body: ${{ github.event.inputs.changelog }}
           files: |
-            windows/TiktokStreamKeyGenerator.exe
+            ./windows/TiktokStreamKeyGeneratorRelease-win.zip
+            ./windows/TiktokStreamKeyGeneratorDebug-win.zip
+            ./macos/TiktokStreamKeyGenerator-x86_64-macos.zip
+            ./macos/TiktokStreamKeyGenerator-arm64-macos.zip
+            ./linux/TiktokStreamKeyGenerator-linux.zip
