@@ -832,6 +832,7 @@ browse_button.grid(row=8, column=2, padx=5, pady=5, sticky="ew")
 spoofing_frame = ttk.LabelFrame(app, text="Spoofing Info")
 spoofing_frame.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
 spoofing_frame.columnconfigure(1, weight=1)
+spoofing_frame.grid_remove()
 
 # Additional fields for Mobile Camera Stream and Mobile Screenshare
 openudid_label = ttk.Label(spoofing_frame, text="OpenUDID")
