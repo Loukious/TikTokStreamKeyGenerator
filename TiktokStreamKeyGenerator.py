@@ -389,16 +389,16 @@ class Stream:
     def getServerUrl(self):
         url = (
             "https://tnc16-platform-useast1a.tiktokv.com/get_domains/v4/?"
-            "aid=8311&ttwebview_version=1130022001"
+            "aid=8311&ttwebview_version=1130022001&device_platform=win"
         )
         response = self.s.get(url).json()
         for data in response["data"]["ttnet_dispatch_actions"]:
-            if "param" in data and "strategy_info" in data["param"] and \
-                    "webcast-normal.tiktokv.com" in \
-                    data["param"]["strategy_info"]:
-                server_url = data['param']['strategy_info'][
-                    'webcast-normal.tiktokv.com'
-                ]
+            if "param" in data and "strategy_info" in data["param"] and "webcast-normal.tiktokv.com" in data["param"]["strategy_info"]:
+                server_url = data['param']['strategy_info']['webcast-normal.tiktokv.com']
+                for data2 in response["data"]["ttnet_dispatch_actions"]:
+                    if "param" in data2 and "strategy_info" in data2["param"] and server_url in data2["param"]["strategy_info"]:
+                        server_url = data2['param']['strategy_info'][server_url]
+                        return f"https://{server_url}/"
                 return f"https://{server_url}/"
             
     def uploadThumbnail(
