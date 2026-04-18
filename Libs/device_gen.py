@@ -2,8 +2,8 @@ import json, time, hashlib, requests
 
 from urllib.parse import *
 from .constants import *
-from .ttencrypt import TTEncrypt
-from .xgorgon import Xgorgon
+from .TTEncrypt import TT
+from .XGorgon import XGorgon
 
 
 
@@ -142,7 +142,7 @@ class Applog:
 
     @staticmethod
     def __tt_encryption(data: dict) -> str:
-        ttencrypt = TTEncrypt()
+        ttencrypt = TT()
         data_formated = json.dumps(data).replace(" ", "")
         return ttencrypt.encrypt(data_formated)
 

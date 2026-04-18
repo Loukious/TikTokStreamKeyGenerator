@@ -13,8 +13,9 @@ from urllib.parse import urlencode
 import urllib.parse
 from Libs.device import Device
 from Libs.device_gen import Applog, Xlog
-from Libs.xgorgon import Gorgon
-from Libs.signature import ladon_encrypt, get_x_ss_stub
+from Libs.XGorgon import XGorgon
+from Libs.signature import ladon_encrypt
+from Libs.XArgus import Argus
 
 
 
@@ -45,7 +46,7 @@ class Stream:
             "buildId": "0"
         }
         try:
-            with self.s.get(url, params=params) as response:
+            with self.s.get(url, params=params, verify=False) as response:
                 return response.json()["data"]["manifest"]["win32"]["version"]
         except Exception as e:
             print(f"Failed to fetch latest version: {e}")
@@ -61,122 +62,56 @@ class Stream:
         close_room_when_close_stream=True,
         age_restricted=False,
         priority_region="",
-        spoof_plat=0,
-        openudid = "",
-        device_id = "",
-        iid = "",
         thumbnail_path = ""
     ):
         base_url = self.getServerUrl()
-        if spoof_plat == 1:
-            self.s.headers = {
-                "user-agent": "com.zhiliaoapp.musically/2023508030 (Linux; U; Android 14; en_US_#u-mu-celsius; M2102J20SG; Build/AP2A.240905.003; Cronet/TTNetVersion:f58efab5 2024-06-13 QuicVersion:5d23606e 2024-05-23)",
-            }
-            params = {
-                # App ID for Tiktok Mobile App
-                "aid": "1233",
-                # App name for Tiktok Mobile App
-                "app_name": "musical_ly",
-                # Channel for Tiktok Mobile App
-                "channel": "googleplay",
-                "device_platform": "android",
-                "iid": iid,
-                "device_id": device_id,
-                "openudid": openudid,
-                "os": "android",
-                "ssmix": "a",
-                "_rticket": "1730304478660",
-                "cdid": "1fb4eb4c-99f5-4534-a637-e3ac7d52fddb",
-                "version_code": "370104",
-                "version_name": "37.1.4",
-                "manifest_version_code": "2024701040",
-                "update_version_code": "2024701040",
-                "ab_version": "37.1.4",
-                "resolution": "1080*2309",
-                "dpi": "410",
-                "device_type": "M2102J20SG",
-                "device_brand": "POCO",
-                "language": "en",
-                "os_api": "34",
-                "os_version": "14",
-                "ac": "wifi",
-                "is_pad": "0",
-                "current_region": "TN",
-                "app_type": "normal",
-                "sys_region": "US",
-                "last_install_time": "1717207722",
-                "mcc_mnc": "60501",
-                "timezone_name": "Africa/Tunis",
-                "carrier_region_v2": "605",
-                "residence": "TN",
-                "app_language": "en",
-                "carrier_region": "TN",
-                "ac2": "wifi5g",
-                "uoo": "0",
-                "op_region": "TN",
-                "timezone_offset": "3600",
-                "build_number": "37.1.4",
-                "host_abi": "arm64-v8a",
-                "locale": "en",
-                "region": "US",
-                "ts": "1730304477",
-                "webcast_sdk_version": "3590",
-                "webcast_language": "en",
-                "webcast_locale": "en_US_#u-mu-celsius",
-                "es_version": "2",
-                "effect_sdk_version": "17.0.0",
-                "current_network_quality_info": '{"tcp_rtt":64,"quic_rtt":64,"http_rtt":198,"downstream_throughput_kbps":31920,"quic_send_loss_rate":-1,"quic_receive_loss_rate":-1,"net_effective_connection_type":4,"video_download_speed":787}'
-            }
-            data = {
-                "hashtag_id": hashtag_id,
-                "hold_living_room": "1",
-                "chat_sub_only_auth": "2",
-                "community_flagged_chat_auth": "2",
-                "ecom_bc_toggle": "3",
-                "live_sub_only": "0",
-                "overwrite_push_base_parameter": "false",
-                "chat_l_2": "1",
-                "caption": "0",
-                "overwrite_push_base_min_bit_rate": "-1",
-                "title": title,
-                "live_sub_only_use_music": "0",
-                "mobile_binded": "0",
-                "create_source": "0",
-                "spam_comments": "1",
-                "commercial_content_promote_third_party": "false",
-                "grant_level": "0",
-                "screenshot_cover_status": "0",
-                "overwrite_push_base_max_bit_rate": "-1",
-                "enable_http_dns": "0",
-                "mobile_validated": "0",
-                "live_agreement": "0",
-                "commercial_content_promote_myself": "false",
-                "allow_preview_duration_exp": "0",
-                "is_user_select": "0",
-                "transaction_history": "1",
-                "probe_recommend_resolution": "1",
-                "chat_auth": "1",
-                "disable_preview_sub_only": "0",
-                "comment_tray_switch": "1",
-                "overwrite_push_base_default_bit_rate": "-1",
-                "overwrite_push_base_resolution": "1",
-                "grant_group": "1",
-                "gift_auth": "1",
-                "star_comment_switch": "true",
-                "has_commerce_goods": "false",
-                "open_commercial_content_toggle": "false",
-                "event_id": "-1",
-                "star_comment_qualification": "false",
-                "game_tag_id": game_tag_id,
-                "community_flagged_chat_review_auth": "2",
-                "age_restricted": "0",
-                "group_chat_id": "0",
-                "optout_gift_gallery": "false",
-                "gen_replay": str(gen_replay).lower(),
-                "shopping_ranking": "0"
-            }
-
-        elif spoof_plat == 2:
+        print(base_url)
+        
+        # Use TikTok Live Studio
+        version = self.getLiveStudioLatestVersion()
+        # App ID for TikTok Live Studio
+        aid = "8311"
+        self.s.headers = {
+            "user-agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/{version} Chrome/136.0.7103.59 Electron/36.4.0-rs.18.release.ls.26 TTElectron/36.4.0-rs.18.release.ls.26 Safari/537.36",
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US",
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+            "sec-fetch-storage-access": "active",
+            "x-ss-dp": "",
+            "sdk_aid": aid,
+            "sec-ch-ua": '"Not.A/Brand";v="99", "Chromium";v="136"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+        }
+        params = {
+            "aid": aid,
+            # App name for TikTok Live Studio
+            "app_name": "tiktok_live_studio",
+            "device_id": "7598549125457659393",
+            "install_id": "7598551635623053072",
+            # Channel for TikTok Live Studio
+            "channel": "studio",
+            "version_code": version,
+            "device_platform": "windows",
+            "timezone_name": "Africa/Tunis",
+            "screen_width": "1920",
+            "screen_height": "1080",
+            "browser_language": "en-US",
+            "browser_platform": "Win32",
+            "browser_name": "Mozilla",
+            "browser_version": f"5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/{version} Chrome/136.0.7103.59 Electron/36.4.0-rs.18.release.ls.26 TTElectron/36.4.0-rs.18.release.ls.26 Safari/537.36",
+            "language": "en",
+            "app_language": "en",
+            "webcast_language": "en",
+            # Priority region for the stream
+            "priority_region": priority_region,
+            "webcast_sdk_version": version.replace(".", ""),
+            "live_mode": "6",
+        }
+        data = {
             self.s.headers = {
                 "user-agent": "com.zhiliaoapp.musically/2023508030 (Linux; U; Android 14; en_US_#u-mu-celsius; M2102J20SG; Build/AP2A.240905.003; Cronet/TTNetVersion:f58efab5 2024-06-13 QuicVersion:5d23606e 2024-05-23)",
             }
@@ -281,40 +216,54 @@ class Stream:
             }
         else:
             version = self.getLiveStudioLatestVersion()
+            # App ID for TikTok Live Studio
+            aid = "8311"
             self.s.headers = {
-                "user-agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/{version} Chrome/108.0.5359.215 Electron/22.3.18-tt.8.release.main.44 TTElectron/22.3.18-tt.8.release.main.44 Safari/537.36",
+                "user-agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/{version} Chrome/136.0.7103.59 Electron/36.4.0-rs.18.release.ls.26 TTElectron/36.4.0-rs.18.release.ls.26 Safari/537.36",
+                "accept": "application/json, text/plain, */*",
+                "accept-language": "en-US",
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "cross-site",
+                "sec-fetch-storage-access": "active",
+                "x-ss-dp": "",
+                "sdk_aid": aid,
+                "sec-ch-ua": '"Not.A/Brand";v="99", "Chromium";v="136"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
             }
             params = {
-                # App ID for TikTok Live Studio
-                "aid": "8311",
+                "aid": aid,
                 # App name for TikTok Live Studio
                 "app_name": "tiktok_live_studio",
+                "device_id": "7598549125457659393",
+                "install_id": "7598551635623053072",
                 # Channel for TikTok Live Studio
                 "channel": "studio",
+                "version_code": version,
                 "device_platform": "windows",
+                "timezone_name": "Africa/Tunis",
+                "screen_width": "1920",
+                "screen_height": "1080",
+                "browser_language": "en-US",
+                "browser_platform": "Win32",
+                "browser_name": "Mozilla",
+                "browser_version": f"5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/{version} Chrome/136.0.7103.59 Electron/36.4.0-rs.18.release.ls.26 TTElectron/36.4.0-rs.18.release.ls.26 Safari/537.36",
+                "language": "en",
+                "app_language": "en",
+                "webcast_language": "en",
                 # Priority region for the stream
                 "priority_region": priority_region,
+                "webcast_sdk_version": version.replace(".", ""),
                 "live_mode": "6",
-                "version_code": version,
-                "webcast_sdk_version": version.replace(".", "").replace("0", ""),
-                "webcast_language": "en",
-                "app_language": "en",
-                "language": "en",
-                "browser_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TikTokLIVEStudio/0.69.2 Chrome/108.0.5359.215 Electron/22.3.18-tt.8.release.main.44 TTElectron/22.3.18-tt.8.release.main.44 Safari/537.36",
-                "browser_name": "Mozilla",
-                "browser_platform": "Win32",
-                "browser_language": "en-US",
-                "screen_height": "1080",
-                "screen_width": "1920",
-                "timezone_name": "Africa/Lagos",
-                "device_id": "7378193331631310352",
-                "install_id": "7378196538524927745"
             }
             data = {
                 "title": title,
                 "live_studio": "1",
                 "gen_replay": str(gen_replay).lower(),
                 "chat_auth": "1",
+                "age_restricted": "0",
                 "cover_uri": "",
                 "close_room_when_close_stream": str(close_room_when_close_stream).lower(),
                 "hashtag_id": str(hashtag_id),
@@ -326,27 +275,61 @@ class Stream:
                 "gift_auth": "1",
                 "chat_l2": "1",
                 "star_comment_switch": "true",
-                "multi_stream_source": "1"
+                "multi_stream_source": "1",
+                "is_group_live_session": "false",
+                "open_commercial_content_toggle": "false",
+                "commercial_content_promote_myself": "false",
+                "commercial_content_promote_third_party": "false",
             }
         if age_restricted:
             data["age_restricted"] = "4"
         if thumbnail_path:
             uri = self.uploadThumbnail(thumbnail_path, base_url, params)
             data["cover_uri"] = uri
-        # Signing is disabled for now
-        # sig = Gorgon(urlencode(params, quote_via=urllib.parse.quote), urlencode(data, quote_via=urllib.parse.quote), urlencode(self.s.cookies, quote_via=urllib.parse.quote)).get_value()
-        # self.s.headers.update(sig)
-        # x_ss_stub = get_x_ss_stub(data)
-        # self.s.headers.update(x_ss_stub)
-        # if spoof_plat in [1, 2]:
-        #     self.s.headers.update(ladon_encrypt(sig["x-khronos"], 1611921764, 1233))
-        # else:
-        #     self.s.headers.update(ladon_encrypt(sig["x-khronos"], 1611921764, 8311))
+        
+        # Build the URL encoded body for signing
+        body_encoded = urlencode(data)
+        
+        # Generate signing headers for Live Studio requests
+        if spoof_plat == 0:
+            # Get current timestamp for signing
+            timestamp = int(time.time())
+            
+            # Calculate x-ss-stub (MD5 hash of the POST body)
+            x_ss_stub = hashlib.md5(body_encoded.encode()).hexdigest()
+            
+            # Generate x-ladon signature
+            x_ladon = ladon_encrypt(
+                timestamp=timestamp,
+                license_id=1611921764,
+                aid=int(params["aid"])
+            )
+            
+            # Build query string for x-argus
+            query_string = urlencode(params)
+            
+            # Generate x-argus signature
+            x_argus = Argus.get_sign(
+                params=query_string,
+                stub=x_ss_stub,
+                timestamp=timestamp,
+                aid=int(params["aid"]),
+                license_id=1611921764,
+                platform=0,  # Windows
+                channel=params.get("channel", "studio"),
+            )
+            
+            # Add signing headers
+            self.s.headers["x-ss-stub"] = x_ss_stub
+            self.s.headers["x-khronos"] = str(timestamp)
+            self.s.headers["x-ladon"] = x_ladon
+            self.s.headers["x-argus"] = x_argus
             
         streamInfo = self.s.post(
             base_url + "webcast/room/create/",
             params=params,
-            data=data
+            data=data,
+            verify=False
         ).json()
         try:
             self.streamUrl = streamInfo["data"]["stream_url"][
@@ -377,7 +360,8 @@ class Stream:
         }
         streamInfo = self.s.post(
             base_url + "webcast/room/finish_abnormal/",
-            params=params
+            params=params,
+            verify=False
         ).json()
         if "data" in streamInfo and "prompts" in streamInfo["data"]:
             messagebox.showerror(
@@ -391,7 +375,7 @@ class Stream:
             "https://tnc16-platform-useast1a.tiktokv.com/get_domains/v4/?"
             "aid=8311&ttwebview_version=1130022001&device_platform=win"
         )
-        response = self.s.get(url).json()
+        response = self.s.get(url, verify=False).json()
         for data in response["data"]["ttnet_dispatch_actions"]:
             if "param" in data and "strategy_info" in data["param"] and "webcast-normal.tiktokv.com" in data["param"]["strategy_info"]:
                 server_url = data['param']['strategy_info']['webcast-normal.tiktokv.com']
@@ -413,7 +397,8 @@ class Stream:
         thumbnailInfo = self.s.post(
                     base_url + "webcast/room/upload/image/",
                     params=params,
-                    files=files
+                    files=files,
+                    verify=False
         ).json()
         return thumbnailInfo.get("data", {}).get("uri", "")
             
