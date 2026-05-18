@@ -107,6 +107,21 @@ jobs:
             TiktokStreamKeyGenerator.py
           }
 
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          New-Item -ItemType Directory -Force -Path ffmpeg_extract | Out-Null
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_extract -Force
+          New-Item -ItemType Directory -Force -Path TiktokStreamKeyGenerator.dist\bin | Out-Null
+          $ffmpeg = Get-ChildItem ffmpeg_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $ffmpeg) {
+            throw "ffmpeg.exe was not found in downloaded archive."
+          }
+          Copy-Item $ffmpeg.FullName TiktokStreamKeyGenerator.dist\bin\ffmpeg.exe -Force
+          TiktokStreamKeyGenerator.dist\bin\ffmpeg.exe -version
+
       - name: Compress Executable
         run: Compress-Archive -Path TiktokStreamKeyGenerator.dist\* -DestinationPath TiktokStreamKeyGenerator${{ matrix.build_type }}-win-${{ github.event.inputs.version }}.zip
 
@@ -158,6 +173,26 @@ jobs:
           --macos-app-name="TikTok Stream Key Generator" \
           TiktokStreamKeyGenerator.py
 
+      - name: Download FFmpeg
+        run: |
+          if [ "${{ matrix.architecture }}" = "arm64" ]; then
+            url="https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/snapshot/ffmpeg.zip"
+          else
+            url="https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/snapshot/ffmpeg.zip"
+          fi
+          curl -L "$url" -o ffmpeg.zip
+          mkdir -p ffmpeg_extract
+          unzip -q ffmpeg.zip -d ffmpeg_extract
+          mkdir -p TiktokStreamKeyGenerator.app/Contents/MacOS/bin
+          ffmpeg_path="$(find ffmpeg_extract -type f -name ffmpeg | head -n 1)"
+          if [ -z "$ffmpeg_path" ]; then
+            echo "ffmpeg was not found in downloaded archive."
+            exit 1
+          fi
+          cp "$ffmpeg_path" TiktokStreamKeyGenerator.app/Contents/MacOS/bin/ffmpeg
+          chmod +x TiktokStreamKeyGenerator.app/Contents/MacOS/bin/ffmpeg
+          TiktokStreamKeyGenerator.app/Contents/MacOS/bin/ffmpeg -version
+
       - name: Compress Executable
         run: |
           zip -r TiktokStreamKeyGenerator-${{ matrix.architecture }}-macos-${{ github.event.inputs.version }}.zip TiktokStreamKeyGenerator.app
@@ -205,6 +240,20 @@ jobs:
           --follow-imports \
           --prefer-source-code \
           TiktokStreamKeyGenerator.py
+
+      - name: Download FFmpeg
+        run: |
+          curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz" -o ffmpeg.tar.xz
+          mkdir -p ffmpeg_extract TiktokStreamKeyGenerator.dist/bin
+          tar -xf ffmpeg.tar.xz -C ffmpeg_extract
+          ffmpeg_path="$(find ffmpeg_extract -type f -name ffmpeg | head -n 1)"
+          if [ -z "$ffmpeg_path" ]; then
+            echo "ffmpeg was not found in downloaded archive."
+            exit 1
+          fi
+          cp "$ffmpeg_path" TiktokStreamKeyGenerator.dist/bin/ffmpeg
+          chmod +x TiktokStreamKeyGenerator.dist/bin/ffmpeg
+          TiktokStreamKeyGenerator.dist/bin/ffmpeg -version
 
       - name: Compress Executable
         run: zip -r TiktokStreamKeyGenerator-linux-${{ github.event.inputs.version }}.zip TiktokStreamKeyGenerator.dist/*
