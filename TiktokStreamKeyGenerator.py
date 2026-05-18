@@ -82,8 +82,6 @@ REGIONS = [""] + (
     "to tt tn tr tm tc tv ug ua ae gb um us uy uz vu ve vn vg vi wf eh ye zm zw"
 ).split()
 
-ENABLE_X_GORGON_MARKER = os.getenv("TIKTOK_X_GORGON_MARKER", "1").strip() != "0"
-
 LIVE_STUDIO_CLIENT_ID = "abad793d-e940-42cb-bc89-e6939b1b3b4d"
 LIVE_STUDIO_REDIRECT_URI = "live-studio-app://login/continue"
 DEFAULT_OS_VERSION = "10.0.26200"
@@ -113,6 +111,54 @@ TT_TICKET_GUARD_VERSION = "2"
 TT_TICKET_GUARD_WEB_VERSION = "1"
 TT_TICKET_GUARD_ITERATION_VERSION = "0"
 LADON_LOCAL_ID = 1877999593
+
+ANCHOR_STATUS_DEFAULT = 0
+ANCHOR_STATUS_PREPARE = 1
+ANCHOR_STATUS_LIVING = 2
+ANCHOR_STATUS_PAUSE = 3
+ANCHOR_STATUS_FINISH = 4
+PING_ANCHOR_TIMEOUT_SECONDS = 2.5
+ROOM_HAS_FINISHED_CODES = {"30003", "30003001"}
+ROOM_IS_LIVING_CODE = "4003150"
+
+
+class WebcastError(RuntimeError):
+    def __init__(self, message, *, status_code=None, payload=None, action=""):
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload
+        self.action = action
+
+
+def _is_already_ended_payload(payload):
+    if not isinstance(payload, dict):
+        return False
+
+    status_code = payload.get("status_code")
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+
+    text = " ".join(
+        str(part or "")
+        for part in (
+            data.get("prompts"),
+            data.get("message"),
+            payload.get("prompts"),
+            payload.get("message"),
+        )
+    ).lower()
+
+    return str(status_code) in ROOM_HAS_FINISHED_CODES and (
+        "ended" in text or "finished" in text or "end" in text
+    )
+
+
+def _is_already_ended_error(exc):
+    if isinstance(exc, WebcastError):
+        return _is_already_ended_payload(exc.payload)
+    text = str(exc).lower()
+    return "live has ended" in text or "room has finished" in text
 
 
 def _param_value(params, name, default=None):
@@ -168,6 +214,57 @@ def _make_x_ss_stub(data):
     return hashlib.md5(body).hexdigest() if body else None
 
 
+def _payload_status_code(payload):
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("status_code")
+
+
+def _is_room_is_living_payload(payload):
+    return str(_payload_status_code(payload)) == ROOM_IS_LIVING_CODE
+
+
+def _is_update_in_lock_payload(payload):
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+    message = str(data.get("message") or payload.get("message") or "")
+    return "StatusMessage:update_in_lock" in message
+
+
+def _webcast_error_message(payload, action):
+    if not isinstance(payload, dict):
+        return f"{action} failed: invalid response: {payload!r}"
+
+    status_code = payload.get("status_code", 0)
+    if status_code in (0, "0", None) or str(status_code) == ROOM_IS_LIVING_CODE:
+        return ""
+
+    data = payload.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+
+    message = (
+        data.get("prompts")
+        or data.get("message")
+        or payload.get("prompts")
+        or payload.get("message")
+    )
+    if message:
+        return f"{action} failed: {message} (status_code={status_code})"
+
+    return f"{action} failed: TikTok returned status_code={status_code}. Response={json.dumps(payload, ensure_ascii=False)[:1000]}"
+
+
+def _raise_for_webcast_error(payload, action):
+    message = _webcast_error_message(payload, action)
+    if message:
+        status_code = payload.get("status_code") if isinstance(payload, dict) else None
+        raise WebcastError(message, status_code=status_code, payload=payload, action=action)
+
+
 def _encode_multipart_form_data(fields, files, boundary=None):
     boundary = boundary or f"----WebKitFormBoundary{secrets.token_urlsafe(12).replace('_', 'A').replace('-', 'B')[:16]}"
     chunks = []
@@ -199,6 +296,7 @@ class Stream:
         self.s.headers.update(build_common_headers(self.s))
         self.roomId = ""
         self.streamId = ""
+        self._cached_live_studio_version = None
         with open("cookies.json", "r", encoding="utf-8") as file:
             cookies_file = json.load(file)
 
@@ -213,6 +311,47 @@ class Stream:
     def __exit__(self, exc_type, exc_value, traceback):
         self.s.close()
 
+    def _apply_room_info(self, room, *, require_stream_url=True):
+        living_room_attrs = room.get("living_room_attrs") or {}
+        self.roomId = (
+            living_room_attrs.get("room_id_str")
+            or str(living_room_attrs.get("room_id", ""))
+            or room.get("id_str")
+            or str(room.get("id", ""))
+        )
+        self.streamId = room.get("stream_id_str") or str(room.get("stream_id", ""))
+        self.streamUrl = (room.get("stream_url") or {}).get("rtmp_push_url", "")
+        if self.streamUrl:
+            split_index = self.streamUrl.rfind("/")
+            self.baseStreamUrl = self.streamUrl[:split_index]
+            self.streamKey = self.streamUrl[split_index + 1 :]
+        else:
+            self.baseStreamUrl = ""
+            self.streamKey = ""
+
+        multi_stream_url = room.get("multi_stream_url") or {}
+        self.multiStreamUrl = multi_stream_url.get("rtmp_push_url", "")
+        if self.multiStreamUrl:
+            split_index = self.multiStreamUrl.rfind("/")
+            self.multiBaseStreamUrl = self.multiStreamUrl[:split_index]
+            self.multiStreamKey = self.multiStreamUrl[split_index + 1 :]
+        else:
+            self.multiBaseStreamUrl = ""
+            self.multiStreamKey = ""
+
+        self.multiStreamScene = room.get("multi_stream_scene")
+        self.multiStreamId = (
+            room.get("multi_stream_id_str")
+            or str(room.get("multi_stream_id", ""))
+            or multi_stream_url.get("id_str")
+            or str(multi_stream_url.get("id", ""))
+        )
+        self.streamShareUrl = room.get("share_url", "")
+        self.roomStatus = room.get("status")
+        has_ids = bool(self.roomId and self.streamId)
+        has_push_url = bool(self.streamUrl)
+        return has_ids and (has_push_url or not require_stream_url)
+
     def save_cookies(self, path="cookies.json"):
         cookies = _export_cookie_jar(self.s.cookies)
         if cookies:
@@ -221,11 +360,66 @@ class Stream:
         return cookies
 
     def getLiveStudioLatestVersion(self):
-        return fetch_live_studio_latest_version(self.s)
+        if not self._cached_live_studio_version:
+            self._cached_live_studio_version = fetch_live_studio_latest_version(self.s)
+        return self._cached_live_studio_version
+
+    def _cookie_value(self, name, default=""):
+        try:
+            return self.s.cookies.get(name) or default
+        except Exception:
+            return default
+
+    def _effective_priority_region(self, priority_region=""):
+        region = str(priority_region or "").strip().lower()
+        if region:
+            return region
+
+        cookie_region = str(self._cookie_value("store-country-code", "") or "").strip().lower()
+        if len(cookie_region) == 2:
+            return cookie_region
+
+        return ""
+
+    def _priority_region_candidates(self, priority_region=""):
+        candidates = []
+        for candidate in (
+            priority_region,
+            self._effective_priority_region(priority_region),
+            self._cookie_value("store-country-code", ""),
+            "",
+        ):
+            candidate = str(candidate or "").strip().lower()
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    def _apply_live_studio_headers(self):
+        version = self.getLiveStudioLatestVersion()
+        browser_version = build_live_studio_browser_version(version)
+        self.s.headers.update(
+            {
+                "user-agent": f"Mozilla/{browser_version}",
+                "accept": "application/json, text/plain, */*",
+                "accept-language": "en-US",
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "cross-site",
+                "sec-fetch-storage-access": "active",
+                "X-SS-DP": "",
+                "sdk_aid": "8311",
+                "sec-ch-ua": '"Not.A/Brand";v="99", "Chromium";v="136"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            }
+        )
+        return version, browser_version
 
     def _studio_params(self, *, device_id="", install_id="", priority_region=""):
         version = self.getLiveStudioLatestVersion()
         browser_version = build_live_studio_browser_version(version)
+        priority_region = self._effective_priority_region(priority_region)
         return {
             "aid": "8311",
             "app_name": "tiktok_live_studio",
@@ -250,15 +444,21 @@ class Stream:
         }
 
     def _signed_get_json(self, url, *, params, priority_region=""):
+        self._apply_live_studio_headers()
         timestamp = get_synced_unix_seconds()
-        headers = _build_signature_headers(
-            timestamp,
-            params.get("aid", "8311"),
-            params=params,
-            x_ss_stub=None,
-        )
-        if priority_region:
-            headers["x-tt-store-region"] = priority_region
+        headers = {
+            "pragma": "no-cache",
+            "cache-control": "no-cache",
+            **_build_signature_headers(
+                timestamp,
+                params.get("aid", "8311"),
+                params=params,
+                x_ss_stub=None,
+            ),
+        }
+        region = params.get("priority_region") or self._effective_priority_region(priority_region)
+        if region:
+            headers["x-tt-store-region"] = region
         return self._request_json("GET", url, params=params, headers=headers)
 
     def _request_json(
@@ -271,13 +471,10 @@ class Stream:
         files=None,
         verify=True,
         timeout=None,
-        include_x_gorgon_marker=False,
         headers=None,
     ):
         request_headers = dict(headers or {})
         t0_ms = attach_webcast_ntp_t0(request_headers)
-        if include_x_gorgon_marker and ENABLE_X_GORGON_MARKER:
-            request_headers["x-gorgon"] = "1"
 
         response = self.s.request(
             method=method,
@@ -313,25 +510,7 @@ class Stream:
     ):
         base_url = self.getServerUrl()
         aid = "8311"
-        version = self.getLiveStudioLatestVersion()
-        browser_version = build_live_studio_browser_version(version)
-        user_agent = f"Mozilla/{browser_version}"
-
-        self.s.headers = {
-            "user-agent": user_agent,
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "en-US",
-            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-            "sec-fetch-storage-access": "active",
-            "X-SS-DP": "",
-            "sdk_aid": aid,
-            "sec-ch-ua": '"Not.A/Brand";v="99", "Chromium";v="136"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        }
+        self._apply_live_studio_headers()
 
         params = self._studio_params(
             device_id=device_id,
@@ -385,8 +564,8 @@ class Stream:
                 x_ss_stub=x_ss_stub,
             ),
         }
-        if priority_region:
-            request_headers["x-tt-store-region"] = priority_region
+        if params.get("priority_region"):
+            request_headers["x-tt-store-region"] = params["priority_region"]
 
         streamInfo = self._request_json(
             "POST",
@@ -394,31 +573,12 @@ class Stream:
             params=params,
             data=body_encoded,
             headers=request_headers,
-            include_x_gorgon_marker=True,
         )
         self.lastCreateStreamResponse = streamInfo
 
         try:
-            self.streamUrl = streamInfo["data"]["stream_url"]["rtmp_push_url"]
-            split_index = self.streamUrl.rfind("/")
-            self.baseStreamUrl = self.streamUrl[:split_index]
-            self.streamKey = self.streamUrl[split_index + 1 :]
-            multi_stream_url = streamInfo["data"].get("multi_stream_url") or {}
-            self.multiStreamUrl = multi_stream_url.get("rtmp_push_url", "")
-            if self.multiStreamUrl:
-                split_index = self.multiStreamUrl.rfind("/")
-                self.multiBaseStreamUrl = self.multiStreamUrl[:split_index]
-                self.multiStreamKey = self.multiStreamUrl[split_index + 1 :]
-            else:
-                self.multiBaseStreamUrl = ""
-                self.multiStreamKey = ""
-            self.multiStreamScene = streamInfo["data"].get("multi_stream_scene")
-            self.multiStreamId = streamInfo["data"].get("multi_stream_id_str") or str(
-                streamInfo["data"].get("multi_stream_id", "")
-            )
-            self.roomId = streamInfo["data"].get("id_str") or str(streamInfo["data"].get("id", ""))
-            self.streamId = streamInfo["data"].get("stream_id_str") or str(streamInfo["data"].get("stream_id", ""))
-            self.streamShareUrl = streamInfo["data"]["share_url"]
+            if not self._apply_room_info(streamInfo["data"], require_stream_url=True):
+                raise KeyError("stream_url")
             return True
         except KeyError as exc:
             prompt = streamInfo.get("data", {}).get("prompts") or streamInfo.get("prompts")
@@ -426,12 +586,272 @@ class Stream:
                 prompt = "Failed to create stream: " + json.dumps(streamInfo, ensure_ascii=False)[:1000]
             raise RuntimeError(prompt) from exc
 
+    def getCreateRoomInfo(self, device_id="", install_id="", priority_region="", last_time_hashtag_id="5"):
+        base_url = self.getServerUrl()
+        params = self._studio_params(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        params.update(
+            {
+                "last_time_hashtag_id": str(last_time_hashtag_id or "5"),
+                "live_studio": "1",
+            }
+        )
+        return self._signed_get_json(
+            base_url + "webcast/room/create_info/",
+            params=params,
+            priority_region=params.get("priority_region", ""),
+        )
+
+    def getContinuableStreamInfo(self, device_id="", install_id="", priority_region=""):
+        base_url = self.getServerUrl()
+        last_payload = None
+        last_reason = "No continuable stream was returned."
+
+        for candidate_region in self._priority_region_candidates(priority_region):
+            params = self._studio_params(
+                device_id=device_id,
+                install_id=install_id,
+                priority_region=candidate_region,
+            )
+            payload = self._signed_get_json(
+                base_url + "webcast/room/continue/",
+                params=params,
+                priority_region=params.get("priority_region", ""),
+            )
+            last_payload = payload
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            room = data.get("room") if isinstance(data, dict) else None
+            if not isinstance(room, dict) or not room:
+                message = (
+                    payload.get("message")
+                    or data.get("message") if isinstance(data, dict) else None
+                )
+                last_reason = message or last_reason
+                continue
+
+            self._apply_room_info(room, require_stream_url=False)
+            has_ids = bool(self.roomId and self.streamId)
+            has_push_url = bool(self.streamUrl)
+            reason = ""
+            if not has_ids:
+                reason = "The continuable room did not include room_id and stream_id."
+            elif not has_push_url:
+                reason = "The continuable room did not include an RTMP push URL."
+
+            return {
+                "payload": payload,
+                "data": data,
+                "room": room,
+                "has_room": True,
+                "can_resume": has_ids and has_push_url,
+                "reason": reason,
+                "room_id": self.roomId,
+                "stream_id": self.streamId,
+                "stream_url": self.streamUrl,
+                "priority_region": params.get("priority_region", ""),
+                "continue_scene": data.get("continue_scene"),
+                "cross_device_continue_scene": data.get("cross_device_continue_scene"),
+                "link_mic_user_num": data.get("link_mic_user_num"),
+            }
+
+        return {
+            "payload": last_payload,
+            "data": {},
+            "room": None,
+            "has_room": False,
+            "can_resume": False,
+            "reason": last_reason,
+            "room_id": "",
+            "stream_id": "",
+            "stream_url": "",
+            "priority_region": "",
+            "continue_scene": None,
+            "cross_device_continue_scene": None,
+            "link_mic_user_num": None,
+        }
+
+    def getContinuableStream(self, device_id="", install_id="", priority_region="", require_stream_url=True):
+        info = self.getContinuableStreamInfo(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        if not info.get("has_room"):
+            return None
+        if require_stream_url and not info.get("can_resume"):
+            return None
+        return info.get("room")
+
+    def _pingAnchorStatus(
+        self,
+        status,
+        *,
+        device_id="",
+        install_id="",
+        priority_region="",
+        room_id="",
+        stream_id="",
+        repeat=1,
+    ):
+        self._apply_live_studio_headers()
+        base_url = self.getServerUrl()
+        room_id = str(room_id or self.roomId or "").strip()
+        stream_id = str(stream_id or self.streamId or "").strip()
+        if not room_id or not stream_id:
+            raise RuntimeError("Missing room_id or stream_id.")
+
+        params = self._studio_params(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        data = {
+            "status": str(status),
+            "room_id": room_id,
+            "stream_id": stream_id,
+        }
+        body_encoded = _encode_form_body(data)
+        x_ss_stub = _make_x_ss_stub(body_encoded)
+        streamInfo = None
+        for _ in range(max(1, int(repeat))):
+            request_headers = {
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "pragma": "no-cache",
+                "cache-control": "no-cache",
+                "x-ss-stub": x_ss_stub,
+                **_build_signature_headers(
+                    get_synced_unix_seconds(),
+                    params["aid"],
+                    params=params,
+                    x_ss_stub=x_ss_stub,
+                ),
+            }
+            region = params.get("priority_region")
+            if region:
+                request_headers["x-tt-store-region"] = region
+
+            try:
+                streamInfo = self._request_json(
+                    "POST",
+                    base_url + "webcast/room/ping/anchor/",
+                    params=params,
+                    data=body_encoded,
+                    headers=request_headers,
+                    timeout=PING_ANCHOR_TIMEOUT_SECONDS,
+                )
+            except requests.Timeout:
+                streamInfo = self._request_json(
+                    "POST",
+                    base_url + "webcast/room/ping/anchor/",
+                    params=params,
+                    data=body_encoded,
+                    headers=request_headers,
+                    timeout=PING_ANCHOR_TIMEOUT_SECONDS,
+                )
+
+            if _is_update_in_lock_payload(streamInfo):
+                streamInfo = self._request_json(
+                    "POST",
+                    base_url + "webcast/room/ping/anchor/",
+                    params=params,
+                    data=body_encoded,
+                    headers=request_headers,
+                    timeout=PING_ANCHOR_TIMEOUT_SECONDS,
+                )
+
+        return streamInfo
+
+    def anchorHeartbeat(self, status, device_id="", install_id="", priority_region="", room_id="", stream_id="", action="Anchor heartbeat"):
+        streamInfo = self._pingAnchorStatus(
+            status,
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+        )
+        _raise_for_webcast_error(streamInfo, action)
+        return streamInfo
+
+    def prepareStream(self, device_id="", install_id="", priority_region="", room_id="", stream_id=""):
+        # Official Live Studio starts anchor pings in prepare state.
+        # It only switches to living after the backend reports RoomIsLiving or after SDK connection.
+        return self.anchorHeartbeat(
+            ANCHOR_STATUS_PREPARE,
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+            action="Prepare stream",
+        )
+
+    def pauseStream(self, device_id="", install_id="", priority_region="", room_id="", stream_id=""):
+        return self.anchorHeartbeat(
+            ANCHOR_STATUS_PAUSE,
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+            action="Pause stream",
+        )
+
+    def pausedHeartbeat(self, device_id="", install_id="", priority_region="", room_id="", stream_id=""):
+        return self.anchorHeartbeat(
+            ANCHOR_STATUS_PAUSE,
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+            action="Paused heartbeat",
+        )
+
+    def resumeStream(self, device_id="", install_id="", priority_region="", room_id="", stream_id=""):
+        # Resume-existing after /continue/ behaves like Live Studio startup: start from prepare.
+        if not room_id or not stream_id:
+            self.getContinuableStream(device_id=device_id, install_id=install_id, priority_region=priority_region)
+
+        return self.prepareStream(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+        )
+
+    def resumePausedStream(self, device_id="", install_id="", priority_region="", room_id="", stream_id=""):
+        return self.anchorHeartbeat(
+            ANCHOR_STATUS_LIVING,
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+            action="Resume stream",
+        )
+
+    def liveHeartbeat(self, device_id="", install_id="", priority_region="", room_id="", stream_id=""):
+        return self.anchorHeartbeat(
+            ANCHOR_STATUS_LIVING,
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+            action="Live heartbeat",
+        )
+
     def endStream(self, device_id="", install_id="", priority_region="", room_id="", stream_id=""):
         base_url = self.getServerUrl()
         room_id = str(room_id or self.roomId or "").strip()
         stream_id = str(stream_id or self.streamId or "").strip()
         if not room_id or not stream_id:
-            raise RuntimeError("Missing room_id or stream_id. Create a stream before ending it.")
+            raise RuntimeError("Missing room_id or stream_id. Create or resume a stream before ending it.")
 
         params = self._studio_params(
             device_id=device_id,
@@ -443,42 +863,58 @@ class Stream:
             params={**params, "room_id": room_id},
             priority_region=priority_region,
         )
+        streamInfo = self._pingAnchorStatus(
+            ANCHOR_STATUS_FINISH,
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+            room_id=room_id,
+            stream_id=stream_id,
+            repeat=2,
+        )
 
-        data = {
-            "status": "4",
-            "room_id": room_id,
-            "stream_id": stream_id,
-        }
-        body_encoded = _encode_form_body(data)
-        x_ss_stub = _make_x_ss_stub(body_encoded)
-        streamInfo = None
-        for _ in range(2):
-            request_headers = {
-                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "x-ss-stub": x_ss_stub,
-                **_build_signature_headers(
-                    get_synced_unix_seconds(),
-                    params["aid"],
-                    params=params,
-                    x_ss_stub=x_ss_stub,
-                ),
-            }
-            if priority_region:
-                request_headers["x-tt-store-region"] = priority_region
-
-            streamInfo = self._request_json(
-                "POST",
-                base_url + "webcast/room/ping/anchor/",
-                params=params,
-                data=body_encoded,
-                headers=request_headers,
-                include_x_gorgon_marker=True,
-            )
-
-        if "data" in streamInfo and "prompts" in streamInfo["data"]:
-            raise RuntimeError(streamInfo["data"]["prompts"])
+        _raise_for_webcast_error(streamInfo, "End stream")
 
         return True
+
+    def getRealtimeStats(self, device_id="", install_id="", priority_region="", room_id=""):
+        base_url = self.getServerUrl()
+        room_id = str(room_id or self.roomId or "").strip()
+        if not room_id:
+            raise RuntimeError("Missing room_id. Create or resume a stream before loading realtime stats.")
+
+        params = self._studio_params(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        params["room_id"] = room_id
+
+        payload = self._signed_get_json(
+            base_url + "webcast/game/studio/realtime_stats/",
+            params=params,
+            priority_region=params.get("priority_region", ""),
+        )
+        _raise_for_webcast_error(payload, "Realtime stats")
+
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        room_stats = data.get("room_stats") or {}
+
+        return {
+            "is_live": data.get("is_live"),
+            "room_id": room_stats.get("room_id") or room_id,
+            "watch_count": room_stats.get("live_watch_cnt"),
+            "comment_count": room_stats.get("live_comment_cnt"),
+            "like_count": room_stats.get("live_like_cnt"),
+            "share_count": room_stats.get("room_share_cnt"),
+            "total_coin": room_stats.get("total_score"),
+            "consume_user_count": room_stats.get("live_consume_ucnt"),
+            "new_fans_count": room_stats.get("live_new_fans_ucnt"),
+            "new_subscribers_count": room_stats.get("new_subscribers_cnt"),
+            "fans_club_count": room_stats.get("fans_club_ucnt"),
+            "new_fans_club_count": room_stats.get("live_new_fans_club_ucnt"),
+            "raw": payload,
+        }
 
     def getServerUrl(self):
         return resolve_webcast_base_url(self.s)
@@ -609,8 +1045,8 @@ class Stream:
             "cache-control": "no-cache",
         }
         priority_region = params.get("priority_region")
-        if priority_region:
-            request_headers["x-tt-store-region"] = priority_region
+        if params.get("priority_region"):
+            request_headers["x-tt-store-region"] = params["priority_region"]
 
         thumbnailInfo = self._request_json(
             "POST",
@@ -1043,6 +1479,9 @@ class StreamKeyGeneratorWindow(QWidget):
     update_checked = Signal(object)
     account_info_loaded = Signal(object)
     account_info_failed = Signal(str)
+    realtime_stats_loaded = Signal(object)
+    realtime_stats_failed = Signal(str)
+    stream_ended_remotely = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -1053,13 +1492,29 @@ class StreamKeyGeneratorWindow(QWidget):
         self.install_id = ""
         self.current_room_id = ""
         self.current_stream_id = ""
+        self.stream_priority_region = ""
         self.is_live = False
+        self.is_paused = False
+        self.account_can_go_live = None
         self.suppress_donation_reminder = False
+        self.anchor_heartbeat_in_flight = False
+        self.anchor_heartbeat_error_count = 0
+        self.anchor_ping_status = ANCHOR_STATUS_DEFAULT
+        self.anchor_heartbeat_timer = QTimer(self)
+        self.anchor_heartbeat_timer.setInterval(5000)
+        self.anchor_heartbeat_timer.timeout.connect(self.send_anchor_heartbeat)
+        self.realtime_stats_in_flight = False
+        self.realtime_stats_timer = QTimer(self)
+        self.realtime_stats_timer.setInterval(5000)
+        self.realtime_stats_timer.timeout.connect(self.refresh_realtime_stats)
 
         self._build_ui()
         self.update_checked.connect(self.handle_update_check)
         self.account_info_loaded.connect(self.apply_account_info)
         self.account_info_failed.connect(self.handle_account_info_error)
+        self.realtime_stats_loaded.connect(self.apply_realtime_stats)
+        self.realtime_stats_failed.connect(self.handle_realtime_stats_error)
+        self.stream_ended_remotely.connect(self.handle_stream_ended_remotely)
         self.check_cookies()
         self.load_config()
         self.ensure_device_identifiers(show_popup=True)
@@ -1239,6 +1694,18 @@ class StreamKeyGeneratorWindow(QWidget):
         self.go_live_button.setFixedHeight(32)
         button_row.addWidget(self.go_live_button)
 
+        self.pause_live_button = QPushButton("Pause")
+        self.pause_live_button.setEnabled(False)
+        self.pause_live_button.clicked.connect(self.pause_stream)
+        self.pause_live_button.setFixedHeight(32)
+        button_row.addWidget(self.pause_live_button)
+
+        self.resume_live_button = QPushButton("Resume")
+        self.resume_live_button.setEnabled(False)
+        self.resume_live_button.clicked.connect(self.resume_stream)
+        self.resume_live_button.setFixedHeight(32)
+        button_row.addWidget(self.resume_live_button)
+
         self.end_live_button = QPushButton("End Live")
         self.end_live_button.setEnabled(False)
         self.end_live_button.clicked.connect(self.end_stream)
@@ -1275,6 +1742,56 @@ class StreamKeyGeneratorWindow(QWidget):
         add_output_row("Stream URL:", self.url_output, "Copy")
         add_output_row("Stream Key:", self.key_output, "Copy")
         add_output_row("Share URL:", self.share_url_output, "Copy")
+
+        stats_group = QGroupBox("Realtime Stats")
+        stats_layout = QGridLayout(stats_group)
+        stats_layout.setHorizontalSpacing(8)
+        stats_layout.setVerticalSpacing(5)
+
+        def add_stats_field(row, column, label_text, widget):
+            label = QLabel(label_text)
+            label.setMinimumWidth(70)
+            stats_layout.addWidget(label, row, column)
+            stats_layout.addWidget(widget, row, column + 1)
+
+        self.live_status_stats_output = QLineEdit()
+        self.live_status_stats_output.setReadOnly(True)
+        self.live_status_stats_output.setFixedHeight(28)
+        add_stats_field(0, 0, "Live", self.live_status_stats_output)
+
+        self.viewer_count_output = QLineEdit()
+        self.viewer_count_output.setReadOnly(True)
+        self.viewer_count_output.setFixedHeight(28)
+        add_stats_field(0, 2, "Viewers", self.viewer_count_output)
+
+        self.like_count_output = QLineEdit()
+        self.like_count_output.setReadOnly(True)
+        self.like_count_output.setFixedHeight(28)
+        add_stats_field(1, 0, "Likes", self.like_count_output)
+
+        self.comment_count_output = QLineEdit()
+        self.comment_count_output.setReadOnly(True)
+        self.comment_count_output.setFixedHeight(28)
+        add_stats_field(1, 2, "Comments", self.comment_count_output)
+
+        self.share_count_output = QLineEdit()
+        self.share_count_output.setReadOnly(True)
+        self.share_count_output.setFixedHeight(28)
+        add_stats_field(2, 0, "Shares", self.share_count_output)
+
+        self.new_fans_count_output = QLineEdit()
+        self.new_fans_count_output.setReadOnly(True)
+        self.new_fans_count_output.setFixedHeight(28)
+        add_stats_field(2, 2, "New Fans", self.new_fans_count_output)
+
+        self.refresh_stats_button = QPushButton("Refresh Stats")
+        self.refresh_stats_button.clicked.connect(lambda: self.refresh_realtime_stats(force=True))
+        self.refresh_stats_button.setFixedHeight(28)
+        stats_layout.addWidget(self.refresh_stats_button, 3, 0, 1, 4)
+
+        stats_layout.setColumnStretch(1, 1)
+        stats_layout.setColumnStretch(3, 1)
+        output_layout.addWidget(stats_group)
 
         output_layout.addStretch()
 
@@ -1345,6 +1862,90 @@ class StreamKeyGeneratorWindow(QWidget):
         self.url_output.clear()
         self.key_output.clear()
         self.share_url_output.clear()
+        self.clear_realtime_stats_fields()
+
+    def clear_realtime_stats_fields(self):
+        self.live_status_stats_output.clear()
+        self.viewer_count_output.clear()
+        self.like_count_output.clear()
+        self.comment_count_output.clear()
+        self.share_count_output.clear()
+        self.new_fans_count_output.clear()
+
+    def format_stat_value(self, value):
+        if value in (None, ""):
+            return ""
+        try:
+            return f"{int(value):,}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def sync_realtime_stats_timer(self):
+        should_run = bool(self.is_live and self.current_room_id)
+        if should_run:
+            if not self.realtime_stats_timer.isActive():
+                self.realtime_stats_timer.start()
+        else:
+            self.realtime_stats_timer.stop()
+
+    def refresh_realtime_stats(self, force=False):
+        if self.realtime_stats_in_flight:
+            return
+        if not self.current_room_id:
+            self.sync_realtime_stats_timer()
+            return
+        if not self.is_live and not force:
+            self.sync_realtime_stats_timer()
+            return
+        if not os.path.exists("cookies.json"):
+            return
+
+        self.realtime_stats_in_flight = True
+        if force:
+            self.refresh_stats_button.setEnabled(False)
+            self.refresh_stats_button.setText("Refreshing...")
+
+        room_id = self.current_room_id
+        priority_region = self.stream_priority_region or self.region_combo.currentText()
+
+        def worker():
+            try:
+                with Stream() as stream:
+                    stats = stream.getRealtimeStats(
+                        device_id=self.device_id,
+                        install_id=self.install_id,
+                        priority_region=priority_region,
+                        room_id=room_id,
+                    )
+                self.realtime_stats_loaded.emit(stats)
+            except Exception as exc:
+                self.realtime_stats_failed.emit(str(exc))
+            finally:
+                self.realtime_stats_in_flight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_realtime_stats(self, stats):
+        self.refresh_stats_button.setEnabled(True)
+        self.refresh_stats_button.setText("Refresh Stats")
+        is_live = stats.get("is_live")
+        if is_live is True:
+            self.live_status_stats_output.setText("Yes")
+        elif is_live is False:
+            self.live_status_stats_output.setText("No")
+        else:
+            self.live_status_stats_output.setText("")
+        self.viewer_count_output.setText(self.format_stat_value(stats.get("watch_count")))
+        self.like_count_output.setText(self.format_stat_value(stats.get("like_count")))
+        self.comment_count_output.setText(self.format_stat_value(stats.get("comment_count")))
+        self.share_count_output.setText(self.format_stat_value(stats.get("share_count")))
+        self.new_fans_count_output.setText(self.format_stat_value(stats.get("new_fans_count")))
+
+    def handle_realtime_stats_error(self, message):
+        self.refresh_stats_button.setEnabled(True)
+        self.refresh_stats_button.setText("Refresh Stats")
+        if message:
+            print(f"Realtime stats refresh failed: {message}")
 
     def refresh_device_identifier_fields(self):
         self.device_id_display.setText(self.device_id)
@@ -1392,10 +1993,133 @@ class StreamKeyGeneratorWindow(QWidget):
             self.cookies_status_label.setText("Cookies are loaded")
         else:
             self.cookies_status_label.setText("No cookies found")
+            self.account_can_go_live = None
 
         self.login_button.setEnabled(True)
-        self.go_live_button.setEnabled(has_cookies and not self.is_live)
-        self.end_live_button.setEnabled(self.is_live)
+        self.update_stream_controls(has_cookies=has_cookies)
+
+    def update_stream_controls(self, has_cookies=None):
+        if has_cookies is None:
+            has_cookies = os.path.exists("cookies.json")
+
+        can_start = has_cookies and not self.is_live
+
+        self.go_live_button.setEnabled(can_start)
+        self.pause_live_button.setEnabled(has_cookies and self.is_live and not self.is_paused)
+        self.resume_live_button.setEnabled(has_cookies and self.is_live and self.is_paused)
+        self.end_live_button.setEnabled(has_cookies and self.is_live)
+        self.refresh_stats_button.setEnabled(has_cookies and bool(self.current_room_id))
+
+    def apply_stream_outputs(self, stream, priority_region=""):
+        self.clear_output_fields()
+        self.url_output.setText(getattr(stream, "baseStreamUrl", ""))
+        self.key_output.setText(getattr(stream, "streamKey", ""))
+        self.share_url_output.setText(getattr(stream, "streamShareUrl", ""))
+        self.current_room_id = getattr(stream, "roomId", "")
+        self.current_stream_id = getattr(stream, "streamId", "")
+        if priority_region:
+            self.stream_priority_region = str(priority_region).strip().lower()
+        self.sync_realtime_stats_timer()
+
+    def sync_anchor_heartbeat_timer(self):
+        should_run = bool(
+            self.is_live
+            and self.current_room_id
+            and self.current_stream_id
+            and self.anchor_ping_status not in (ANCHOR_STATUS_DEFAULT, ANCHOR_STATUS_FINISH)
+        )
+        if should_run:
+            if not self.anchor_heartbeat_timer.isActive():
+                self.anchor_heartbeat_timer.start()
+        else:
+            self.anchor_heartbeat_timer.stop()
+
+    def set_stream_state(self, *, is_live, is_paused=False):
+        previous_live = self.is_live
+        previous_paused = self.is_paused
+        self.is_live = bool(is_live)
+        self.is_paused = bool(is_paused) if self.is_live else False
+        if previous_live != self.is_live or previous_paused != self.is_paused:
+            self.anchor_heartbeat_error_count = 0
+        if not self.is_live:
+            self.current_room_id = ""
+            self.current_stream_id = ""
+            self.stream_priority_region = ""
+            self.anchor_ping_status = ANCHOR_STATUS_DEFAULT
+        elif self.is_paused:
+            self.anchor_ping_status = ANCHOR_STATUS_PAUSE
+        elif self.anchor_ping_status in (ANCHOR_STATUS_DEFAULT, ANCHOR_STATUS_FINISH, ANCHOR_STATUS_PAUSE):
+            self.anchor_ping_status = ANCHOR_STATUS_PREPARE
+        self.sync_anchor_heartbeat_timer()
+        self.sync_realtime_stats_timer()
+        self.update_stream_controls()
+
+    def start_anchor_ping_loop(self, status=ANCHOR_STATUS_PREPARE, send_immediately=True):
+        self.anchor_ping_status = status
+        self.anchor_heartbeat_error_count = 0
+        self.sync_anchor_heartbeat_timer()
+        if send_immediately:
+            self.send_anchor_heartbeat(force=True)
+
+    def send_anchor_heartbeat(self, force=False):
+        if self.anchor_heartbeat_in_flight or not self.is_live:
+            return
+
+        room_id = self.current_room_id
+        stream_id = self.current_stream_id
+        if not room_id or not stream_id:
+            self.sync_anchor_heartbeat_timer()
+            return
+
+        status = ANCHOR_STATUS_PAUSE if self.is_paused else self.anchor_ping_status
+        if status in (ANCHOR_STATUS_DEFAULT, ANCHOR_STATUS_FINISH):
+            self.sync_anchor_heartbeat_timer()
+            return
+
+        self.anchor_heartbeat_in_flight = True
+        priority_region = self.stream_priority_region or self.region_combo.currentText()
+
+        def worker():
+            try:
+                with Stream() as stream:
+                    payload = stream.anchorHeartbeat(
+                        status,
+                        device_id=self.device_id,
+                        install_id=self.install_id,
+                        priority_region=priority_region,
+                        room_id=room_id,
+                        stream_id=stream_id,
+                        action="Anchor heartbeat",
+                    )
+
+                self.anchor_heartbeat_error_count = 0
+                if _is_room_is_living_payload(payload) and self.anchor_ping_status == ANCHOR_STATUS_PREPARE:
+                    self.anchor_ping_status = ANCHOR_STATUS_LIVING
+            except Exception as exc:
+                label = {
+                    ANCHOR_STATUS_PREPARE: "Prepare",
+                    ANCHOR_STATUS_LIVING: "Live",
+                    ANCHOR_STATUS_PAUSE: "Paused",
+                    ANCHOR_STATUS_FINISH: "Finish",
+                }.get(status, "Anchor")
+                print(f"{label} heartbeat failed: {exc}")
+                if _is_already_ended_error(exc):
+                    self.anchor_heartbeat_error_count += 1
+                    if self.anchor_heartbeat_error_count >= 3:
+                        self.stream_ended_remotely.emit("TikTok reports that this LIVE has already ended.")
+                else:
+                    # Official Studio logs unknown ping errors and keeps the loop alive.
+                    self.anchor_heartbeat_error_count = 0
+            finally:
+                self.anchor_heartbeat_in_flight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def handle_stream_ended_remotely(self, message):
+        self.set_stream_state(is_live=False)
+        self.clear_output_fields()
+        if message:
+            self.show_info(message)
 
     def refresh_account_info(self, show_errors=True):
         if not os.path.exists("cookies.json"):
@@ -1441,9 +2165,10 @@ class StreamKeyGeneratorWindow(QWidget):
         self.account_username.setText(username)
         self.account_user_id.setText(user_id)
         self.account_status.setText(info.get("status", "Unknown"))
-        self.can_go_live_output.setText(str(info.get("can_go_live", False)))
+        self.account_can_go_live = bool(info.get("can_go_live", False))
+        self.can_go_live_output.setText(str(self.account_can_go_live))
 
-        self.go_live_button.setEnabled(bool(info.get("can_go_live", False)) and os.path.exists("cookies.json") and not self.is_live)
+        self.update_stream_controls()
 
     def handle_account_info_error(self, message):
         self.refresh_account_button.setEnabled(True)
@@ -1669,12 +2394,128 @@ class StreamKeyGeneratorWindow(QWidget):
         if not self.ensure_device_identifiers(show_popup=True):
             return
 
-        stream_created = False
+        stream_started = False
         self.go_live_button.setEnabled(False)
+        self.pause_live_button.setEnabled(False)
+        self.resume_live_button.setEnabled(False)
         self.end_live_button.setEnabled(False)
 
         try:
             with Stream() as stream:
+                selected_region = self.region_combo.currentText()
+
+                create_info_payload = stream.getCreateRoomInfo(
+                    device_id=self.device_id,
+                    install_id=self.install_id,
+                    priority_region=selected_region,
+                    last_time_hashtag_id=topic_id,
+                )
+                create_data = create_info_payload.get("data", {}) if isinstance(create_info_payload, dict) else {}
+                live_status = create_data.get("live_status")
+                last_room_id = create_data.get("last_room_id_str") or str(create_data.get("last_room_id") or "")
+                already_live_hint = str(live_status) == "2"
+
+                continuable = stream.getContinuableStreamInfo(
+                    device_id=self.device_id,
+                    install_id=self.install_id,
+                    priority_region=selected_region,
+                )
+
+                if continuable.get("has_room"):
+                    room = continuable.get("room") or {}
+                    title = room.get("title") or "Untitled"
+                    room_id = continuable.get("room_id") or stream.roomId
+                    stream_id = continuable.get("stream_id") or stream.streamId
+                    effective_region = continuable.get("priority_region") or selected_region
+
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Question)
+                    msg.setWindowTitle("Existing Live Room")
+                    details = [
+                        "TikTok reports an existing LIVE room.",
+                        "",
+                        f"Title: {title}",
+                        f"Room ID: {room_id}",
+                    ]
+                    if continuable.get("can_resume"):
+                        details.append("")
+                        details.append("You can resume this room or end it.")
+                    else:
+                        details.append("")
+                        details.append("This room was detected, but TikTok did not return a reusable RTMP push URL.")
+                        if continuable.get("reason"):
+                            details.append(continuable["reason"])
+                        details.append("You can end it if the room_id and stream_id were returned.")
+                    msg.setText("\n".join(details))
+
+                    resume_button = None
+                    if continuable.get("can_resume"):
+                        resume_button = msg.addButton("Resume Existing", QMessageBox.AcceptRole)
+
+                    end_button = None
+                    if room_id and stream_id:
+                        end_button = msg.addButton("End Existing", QMessageBox.DestructiveRole)
+
+                    cancel_button = msg.addButton(QMessageBox.Cancel)
+                    msg.setDefaultButton(resume_button or cancel_button)
+                    msg.exec()
+
+                    clicked = msg.clickedButton()
+                    if clicked == cancel_button:
+                        return
+
+                    if resume_button is not None and clicked == resume_button:
+                        stream.resumeStream(
+                            device_id=self.device_id,
+                            install_id=self.install_id,
+                            priority_region=effective_region,
+                            room_id=room_id,
+                            stream_id=stream_id,
+                        )
+                        stream_started = True
+                        self.apply_stream_outputs(stream, priority_region=effective_region)
+                        self.anchor_ping_status = ANCHOR_STATUS_PREPARE
+                        self.set_stream_state(is_live=True, is_paused=False)
+                        self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
+                        self.show_info("Existing stream resumed successfully.")
+                        return
+
+                    if end_button is not None and clicked == end_button:
+                        confirm = QMessageBox.question(
+                            self,
+                            "End Existing Live Room",
+                            "End the existing LIVE room now?",
+                            QMessageBox.Yes | QMessageBox.No,
+                            QMessageBox.No,
+                        )
+                        if confirm != QMessageBox.Yes:
+                            return
+
+                        stream.endStream(
+                            device_id=self.device_id,
+                            install_id=self.install_id,
+                            priority_region=effective_region,
+                            room_id=room_id,
+                            stream_id=stream_id,
+                        )
+                        self.set_stream_state(is_live=False)
+                        self.clear_output_fields()
+                        self.show_info("Existing stream ended successfully.")
+                        return
+
+                if already_live_hint:
+                    hint_parts = [
+                        "TikTok reports that your account already has an active LIVE room, but this app could not recover the stream_id/RTMP details from /webcast/room/continue/.",
+                    ]
+                    if last_room_id and last_room_id != "0":
+                        hint_parts.append(f"Last room ID: {last_room_id}")
+                    if continuable.get("reason"):
+                        hint_parts.append(f"Continue check: {continuable['reason']}")
+                    hint_parts.append("")
+                    hint_parts.append("End the LIVE from the device/platform that started it, or try again after selecting the same region used by Live Studio.")
+                    self.show_error("\n".join(hint_parts))
+                    return
+
                 created = stream.createStream(
                     self.title_edit.text(),
                     topic_id,
@@ -1682,35 +2523,129 @@ class StreamKeyGeneratorWindow(QWidget):
                     self.replay_checkbox.isChecked(),
                     self.close_room_checkbox.isChecked(),
                     self.age_restricted_checkbox.isChecked(),
-                    self.region_combo.currentText(),
+                    selected_region,
                     self.thumbnail_edit.text(),
                     self.device_id,
                     self.install_id,
                 )
 
                 if created:
-                    stream_created = True
-                    self.is_live = True
+                    stream_started = True
+                    self.apply_stream_outputs(stream, priority_region=selected_region)
+                    self.anchor_ping_status = ANCHOR_STATUS_PREPARE
+                    self.set_stream_state(is_live=True, is_paused=False)
+                    self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
+                    self.refresh_realtime_stats(force=True)
                     self.show_info("Stream created successfully.")
-                    self.clear_output_fields()
-                    self.url_output.setText(stream.baseStreamUrl)
-                    self.key_output.setText(stream.streamKey)
-                    self.share_url_output.setText(stream.streamShareUrl)
-                    self.current_room_id = stream.roomId
-                    self.current_stream_id = stream.streamId
-                    self.go_live_button.setEnabled(False)
-                    self.end_live_button.setEnabled(True)
         except FileNotFoundError:
             self.show_error("cookies.json not found. Please login first.")
         except RuntimeError as exc:
             self.show_error(str(exc))
         except Exception as exc:
-            self.show_error(f"Failed to create stream: {exc}")
+            self.show_error(f"Failed to create or resume stream: {exc}")
         finally:
-            if not stream_created:
-                self.is_live = False
-                self.go_live_button.setEnabled(os.path.exists("cookies.json"))
-                self.end_live_button.setEnabled(False)
+            if not stream_started:
+                self.set_stream_state(is_live=False)
+                self.clear_output_fields()
+
+    def pause_stream(self):
+        if not self.is_live:
+            self.show_error("No active stream to pause.")
+            return
+        if self.is_paused:
+            self.show_error("The stream is already paused.")
+            return
+
+        stream_paused = False
+        self.anchor_heartbeat_timer.stop()
+        self.pause_live_button.setEnabled(False)
+        self.resume_live_button.setEnabled(False)
+        self.end_live_button.setEnabled(False)
+
+        try:
+            with Stream() as stream:
+                stream.pauseStream(
+                    device_id=self.device_id,
+                    install_id=self.install_id,
+                    priority_region=self.stream_priority_region or self.region_combo.currentText(),
+                    room_id=self.current_room_id,
+                    stream_id=self.current_stream_id,
+                )
+                stream_paused = True
+                self.anchor_heartbeat_error_count = 0
+                self.anchor_ping_status = ANCHOR_STATUS_PAUSE
+                self.set_stream_state(is_live=True, is_paused=True)
+                self.refresh_realtime_stats(force=True)
+                self.show_info("Stream paused successfully.")
+        except FileNotFoundError:
+            self.show_error("cookies.json not found. Please login first.")
+        except RuntimeError as exc:
+            self.show_error(str(exc))
+        except Exception as exc:
+            self.show_error(f"Failed to pause stream: {exc}")
+        finally:
+            if not stream_paused:
+                self.sync_anchor_heartbeat_timer()
+                self.update_stream_controls()
+
+    def resume_stream(self):
+        if not self.is_live:
+            self.show_error("No paused stream to resume. Use Go Live to check for a continuable stream.")
+            return
+        if not self.is_paused:
+            self.show_error("The stream is not paused.")
+            return
+
+        stream_resumed = False
+        self.anchor_heartbeat_timer.stop()
+        self.pause_live_button.setEnabled(False)
+        self.resume_live_button.setEnabled(False)
+        self.end_live_button.setEnabled(False)
+
+        try:
+            with Stream() as stream:
+                room_id = self.current_room_id
+                stream_id = self.current_stream_id
+
+                if not room_id or not stream_id:
+                    if not stream.getContinuableStream(
+                        device_id=self.device_id,
+                        install_id=self.install_id,
+                        priority_region=self.stream_priority_region or self.region_combo.currentText(),
+                    ):
+                        raise RuntimeError("No continuable stream found.")
+                    self.apply_stream_outputs(stream, priority_region=self.region_combo.currentText())
+                    room_id = self.current_room_id
+                    stream_id = self.current_stream_id
+
+                stream.resumePausedStream(
+                    device_id=self.device_id,
+                    install_id=self.install_id,
+                    priority_region=self.stream_priority_region or self.region_combo.currentText(),
+                    room_id=room_id,
+                    stream_id=stream_id,
+                )
+                stream_resumed = True
+                self.anchor_heartbeat_error_count = 0
+                self.anchor_ping_status = ANCHOR_STATUS_LIVING
+                self.set_stream_state(is_live=True, is_paused=False)
+                self.refresh_realtime_stats(force=True)
+                self.show_info("Stream resumed successfully.")
+        except FileNotFoundError:
+            self.show_error("cookies.json not found. Please login first.")
+        except RuntimeError as exc:
+            if _is_already_ended_error(exc):
+                self.set_stream_state(is_live=False)
+                self.clear_output_fields()
+                self.show_error(f"Resume failed because TikTok says this LIVE has already ended: {exc}")
+            else:
+                self.show_error(str(exc))
+        except Exception as exc:
+            self.show_error(f"Failed to resume stream: {exc}")
+        finally:
+            if not stream_resumed:
+                self.sync_anchor_heartbeat_timer()
+                self.update_stream_controls()
 
     def end_stream(self):
         if not self.is_live:
@@ -1718,6 +2653,9 @@ class StreamKeyGeneratorWindow(QWidget):
             return
 
         stream_ended = False
+        self.anchor_heartbeat_timer.stop()
+        self.pause_live_button.setEnabled(False)
+        self.resume_live_button.setEnabled(False)
         self.end_live_button.setEnabled(False)
 
         try:
@@ -1725,27 +2663,30 @@ class StreamKeyGeneratorWindow(QWidget):
                 if stream.endStream(
                     device_id=self.device_id,
                     install_id=self.install_id,
-                    priority_region=self.region_combo.currentText(),
+                    priority_region=self.stream_priority_region or self.region_combo.currentText(),
                     room_id=self.current_room_id,
                     stream_id=self.current_stream_id,
                 ):
                     stream_ended = True
-                    self.is_live = False
-                    self.current_room_id = ""
-                    self.current_stream_id = ""
+                    self.set_stream_state(is_live=False)
                     self.show_info("Stream ended successfully.")
                     self.clear_output_fields()
-                    self.go_live_button.setEnabled(os.path.exists("cookies.json"))
-                    self.end_live_button.setEnabled(False)
         except FileNotFoundError:
             self.show_error("cookies.json not found. Please login first.")
         except RuntimeError as exc:
-            self.show_error(str(exc))
+            if _is_already_ended_error(exc):
+                stream_ended = True
+                self.set_stream_state(is_live=False)
+                self.clear_output_fields()
+                self.show_info("TikTok reports that this LIVE has already ended, so the local stream state was cleared.")
+            else:
+                self.show_error(str(exc))
         except Exception as exc:
             self.show_error(f"Failed to end stream: {exc}")
         finally:
             if not stream_ended:
-                self.end_live_button.setEnabled(self.is_live)
+                self.sync_anchor_heartbeat_timer()
+                self.update_stream_controls()
 
 
 class LoginDialog(QDialog):
