@@ -1,198 +1,286 @@
-import json, time, hashlib, requests
+import json
+import hashlib
+import os
+import random
+import string
+import uuid
 
-from urllib.parse import *
-from .constants import *
-from .TTEncrypt import TT
-from .XGorgon import XGorgon
+import requests
+
+from .log_encrypt_codec import DEFAULT_LOG_ENCRYPT_KEY, log_encrypt
+from .domain_routing import (
+    attach_webcast_ntp_t0,
+    build_common_headers,
+    build_endpoint,
+    update_ntp_from_response,
+)
 
 
+DEVICE_REGISTER_PATH = "/service/2/desktop/device_register/"
+LIVE_STUDIO_UPDATE_ENDPOINT = os.getenv(
+    "TIKTOK_TRON_UPDATE_ENDPOINT",
+    "https://tron-sg.bytelemon.com/api/sdk/check_update",
+)
+
+DESKTOP_DEVICE_MODELS = (
+    "z790 taichi lite",
+    "rog strix b760-f",
+    "b550 aorus elite",
+    "prime z690-p",
+    "tomahawk x670e",
+)
+
+WINDOWS_OS_VERSIONS = (
+    "10.0.19045",
+    "10.0.22621",
+    "10.0.22631",
+    "10.0.26100",
+    "10.0.26200",
+)
+
+COMMON_RESOLUTIONS = (
+    "1920x1080",
+    "2560x1440",
+    "1600x900",
+    "1366x768",
+)
+
+TIMEZONE_PROFILES = (
+    {
+        "timezone_name": "Africa/Tunis",
+        "time_zone": "GMT+0100",
+        "tz_name": "Central European Standard Time",
+        "tz_offset": 3600,
+    },
+    {
+        "timezone_name": "Europe/Berlin",
+        "time_zone": "GMT+0100",
+        "tz_name": "W. Europe Standard Time",
+        "tz_offset": 3600,
+    },
+    {
+        "timezone_name": "Europe/London",
+        "time_zone": "GMT+0000",
+        "tz_name": "GMT Standard Time",
+        "tz_offset": 0,
+    },
+    {
+        "timezone_name": "America/New_York",
+        "time_zone": "GMT-0500",
+        "tz_name": "Eastern Standard Time",
+        "tz_offset": -18000,
+    },
+    {
+        "timezone_name": "Asia/Kolkata",
+        "time_zone": "GMT+0530",
+        "tz_name": "India Standard Time",
+        "tz_offset": 19800,
+    },
+)
 
 
-class Applog:
-    def __init__(self, device: dict, proxy = None):
-        self.__device = device
-        self.__host = "log-va.tiktokv.com"
+def fetch_live_studio_latest_version(session=None):
+    params = {
+        "pid": "7393277106664249610",
+        "uid": "0",
+        "branch": "studio/release/stable",
+        "buildId": "0",
+    }
 
-    def __headers(self, params: str, payload: (str or bool) = None) -> dict: # type: ignore
-        sig = Xgorgon().calculate(params, payload, None)
+    close_session = session is None
+    client = session if session is not None else requests.session()
+    try:
+        with client.get(
+            LIVE_STUDIO_UPDATE_ENDPOINT,
+            params=params,
+            headers=build_common_headers(client),
+            timeout=15,
+        ) as response:
+            return response.json()["data"]["manifest"]["win32"]["version"]
+    except Exception:
+        return "0.99.0"
+    finally:
+        if close_session:
+            client.close()
 
-        headers = {
-            "x-ss-stub": str(hashlib.md5(str(payload).encode()).hexdigest()).upper(),
-            "accept-encoding": "gzip",
-            "passport-sdk-version": "19",
-            "sdk-version": "2",
-            "x-ss-req-ticket": str(int(time.time())) + "000",
-            "x-tt-dm-status": "login=0;ct=0",
-            "host": self.__host,
-            "connection": "Keep-Alive",
-            "content-type": "application/octet-stream",
-            "user-agent": (
-                f"com.zhiliaoapp.musically/{application['version_code']} "
-                + f"(Linux; U; Android {self.__device['os']}; pt_BR; {self.__device['device_model']}; "
-                + f"Build/{self.__device['build']}; "
-                + "Cronet/TTNetVersion:5f9640e3 2021-04-21 QuicVersion:47946d2a 2020-10-14)"
-            ),
-            "x-gorgon": sig["x-gorgon"],
-            "x-khronos": str(sig["x-khronos"]),
-        }
 
-        return headers
+def build_live_studio_browser_version(version):
+    return (
+        "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) TikTokLIVEStudio/{version} Chrome/136.0.7103.59 "
+        "Electron/36.4.0-alpha.17 "
+        "TTElectron/36.4.0-alpha.17 Safari/537.36"
+    )
 
-    def __params(self) -> str:
-        __base_params = {
-            "ac": "wifi",
-            "channel": "googleplay",
-            "aid": application["aid"],
-            "app_name": "musical_ly",
-            "version_code": application["version_code"],
-            "version_name": application["version_name"],
-            "device_platform": "android",
-            "ab_version": application["ab_version"],
-            "ssmix": "a",
-            "device_type": self.__device["device_model"],
-            "device_brand": self.__device["device_brand"],
-            "language": self.__device["language"],
-            "os_api": self.__device["os_api"],
-            "os_version": self.__device["os"],
-            "openudid": self.__device["openudid"],
-            "manifest_version_code": application["manifest_version_code"],
-            "resolution": str(self.__device["resolution"]).split("x")[1]
-            + "*"
-            + str(self.__device["resolution"]).split("x")[0],
-            "dpi": self.__device["dpi"],
-            "update_version_code": application["update_version_code"],
-            "_rticket": round(time.time() * 1000),
-            "app_type": "normal",
-            "sys_region": self.__device["sys_region"],
-            "timezone_name": self.__device["timezone_name"],
-            "app_language": self.__device["app_language"],
-            "ac2": "wifi",
-            "uoo": "0",
-            "op_region": self.__device["op_region"],
-            "timezone_offset": self.__device["offset"],
-            "build_number": application["build_number"],
-            "locale": self.__device["locale"],
-            "region": self.__device["region"],
-            "ts": int(time.time()),
-            "cdid": self.__device["cdid"],
-            "cpu_support64": "true",
-            "host_abi": "armeabi-v7a",
-        }
 
-        return urlencode(__base_params)
+def get_device_register_endpoint(session=None):
+    return build_endpoint(
+        "log.tiktokv.com",
+        DEVICE_REGISTER_PATH,
+        session=session,
+    )
 
-    def __payload(self):
 
-        payload = {
-            "magic_tag": "ss_app_log",
-            "header": {
-                "display_name": "TikTok",
-                "update_version_code": application["update_version_code"],
-                "manifest_version_code": application["manifest_version_code"],
-                "app_version_minor": "",
-                "aid": application["aid"],
-                "channel": "googleplay",
-                "package": "com.zhiliaoapp.musically",
-                "app_version": application["app_version"],
-                "version_code": application["version_code"],
-                "sdk_version": "2.12.1-rc.17",
-                "sdk_target_version": 29,
-                "git_hash": application["git_hash"],
-                "os": "Android",
-                "os_version": str(self.__device["os"]),
-                "os_api": self.__device["os_api"],
-                "device_model": self.__device["device_model"],
-                "device_brand": self.__device["device_brand"],
-                "device_manufacturer": self.__device["device_brand"],
-                "cpu_abi": "armeabi-v7a",
-                "release_build": application["release_build"],
-                "density_dpi": self.__device["dpi"],
-                "display_density": self.__device["display_density"],
-                "resolution": self.__device["resolution"],
-                "language": self.__device["language"],
-                "timezone": self.__device["timezone"],
-                "access": "wifi",
-                "not_request_sender": 0,
-                "rom": self.__device["rom"],
-                "rom_version": self.__device["rom_version"],
-                "cdid": self.__device["cdid"],
-                "sig_hash": application["sig_hash"],
-                "gaid_limited": 0,
-                "google_aid": self.__device["google_aid"],
-                "openudid": self.__device["openudid"],
-                "clientudid": self.__device["clientudid"],
-                "region": self.__device["region"],
-                "tz_name": f"{self.__device['timezone_name'].split('/')[0]}/{self.__device['timezone_name'].split('/')[1]}",
-                "tz_offset": self.__device["offset"],
-                "req_id": self.__device["req_id"],
-                "custom": {
-                    "is_kids_mode": 0,
-                    "filter_warn": 0,
-                    "web_ua": f"Dalvik/2.1.0 (Linux; U; Android {self.__device['os']}; {self.__device['device_model']} Build/{self.__device['build']})",
-                    "user_period": 0,
-                    "user_mode": -1,
-                },
-                "apk_first_install_time": self.__device["install_time"],
-                "is_system_app": 0,
-                "sdk_flavor": "global",
-            },
-            "_gen_time": round(time.time() * 1000),
-        }
-        return payload
+def generate_private_pc_identifiers():
+    serial_chars = string.ascii_lowercase + string.digits
+    pc_serial = "".join(random.choices(serial_chars, k=20))
+    pc_uuid = f"{uuid.uuid4()}-{''.join(random.choices(serial_chars, k=16))}"
+    return pc_uuid, pc_serial
 
-    @staticmethod
-    def __tt_encryption(data: dict) -> str:
-        ttencrypt = TT()
-        data_formated = json.dumps(data).replace(" ", "")
-        return ttencrypt.encrypt(data_formated)
 
-    def register_device(self):
-        params = self.__params()
-        payload = self.__payload()
+def generate_random_mac():
+    octets = [random.randint(0, 255) for _ in range(6)]
+    octets[0] = (octets[0] | 0x02) & 0xFE
+    return ":".join(f"{value:02x}" for value in octets)
 
-        r = requests.post(
-            url=("https://" + self.__host + "/service/2/device_register/?" + params),
-            headers=self.__headers(params),
-            data=bytes.fromhex(self.__tt_encryption(payload)),
+
+def _split_resolution(resolution):
+    width, height = resolution.split("x", 1)
+    return width, height
+
+
+def generate_desktop_fingerprint():
+    timezone_profile = random.choice(TIMEZONE_PROFILES)
+    resolution = random.choice(COMMON_RESOLUTIONS)
+    screen_width, screen_height = _split_resolution(resolution)
+    return {
+        "mac": generate_random_mac(),
+        "os_version": random.choice(WINDOWS_OS_VERSIONS),
+        "device_model": random.choice(DESKTOP_DEVICE_MODELS),
+        "timezone_name": timezone_profile["timezone_name"],
+        "time_zone": timezone_profile["time_zone"],
+        "tz_name": timezone_profile["tz_name"],
+        "tz_offset": timezone_profile["tz_offset"],
+        "resolution": resolution,
+        "screen_width": screen_width,
+        "screen_height": screen_height,
+    }
+
+
+def _build_device_register_query_params(version, pc_uuid, pc_serial, browser_version, fingerprint):
+    return [
+        ("aid", "8311"),
+        ("channel", "studio"),
+        ("os", "Windows"),
+        ("os_version", fingerprint["os_version"]),
+        ("device_type", "PC"),
+        ("device_platform", "PC"),
+        ("version_code", version),
+        ("pc_uuid", pc_uuid),
+        ("pc_serial", pc_serial),
+        ("aid", "8311"),
+        ("app_name", "tiktok_live_studio"),
+        ("device_id", "0"),
+        ("install_id", "0"),
+        ("channel", "studio"),
+        ("version_code", version),
+        ("device_platform", "windows"),
+        ("timezone_name", fingerprint["timezone_name"]),
+        ("screen_width", fingerprint["screen_width"]),
+        ("screen_height", fingerprint["screen_height"]),
+        ("browser_language", "en-US"),
+        ("browser_platform", "Win32"),
+        ("browser_name", "Mozilla"),
+        ("browser_version", browser_version),
+        ("language", "en"),
+        ("app_language", "en"),
+        ("webcast_language", "en"),
+        ("webcast_sdk_version", version.replace(".", "")),
+        ("live_mode", "6"),
+    ]
+
+
+def _build_device_register_payload(version, pc_uuid, pc_serial, fingerprint):
+    return {
+        "header": {
+            "device_id": 0,
+            "install_id": 0,
+            "os": "Windows",
+            "device_platform": "PC",
+            "sdk_version": "1.0.2",
+            "aid": "8311",
+            "mc": fingerprint["mac"],
+            "channel": "studio",
+            "package": "tiktok_live_studio",
+            "language": "en-US",
+            "app_version": version,
+            "os_version": fingerprint["os_version"],
+            "device_model": fingerprint["device_model"],
+            "time_zone": fingerprint["time_zone"],
+            "tz_name": fingerprint["tz_name"],
+            "tz_offset": fingerprint["tz_offset"],
+            "resolution": fingerprint["resolution"],
+            "app_region": "",
+            "app_language": "",
+            "display_name": "tiktok_live_studio",
+            "pc_uuid": pc_uuid,
+            "pc_serial": pc_serial,
+        },
+        "_gen_time": 0,
+        "magic_tag": "ss_app_log",
+    }
+
+
+def register_desktop_device_identifiers(session=None, timeout=25):
+    close_session = session is None
+    client = session if session is not None else requests.session()
+    try:
+        client.headers.update(build_common_headers(client))
+
+        version = fetch_live_studio_latest_version(client)
+        pc_uuid, pc_serial = generate_private_pc_identifiers()
+        fingerprint = generate_desktop_fingerprint()
+        browser_version = build_live_studio_browser_version(version)
+
+        params = _build_device_register_query_params(
+            version,
+            pc_uuid,
+            pc_serial,
+            browser_version,
+            fingerprint,
+        )
+        payload = _build_device_register_payload(version, pc_uuid, pc_serial, fingerprint)
+        payload_text = json.dumps(payload, separators=(",", ":"))
+
+        encrypted_payload = log_encrypt(
+            payload_text,
+            magic_number=29795,
+            version=3,
+            sub_version=3,
+            key=DEFAULT_LOG_ENCRYPT_KEY,
         )
 
-        if r.json()["device_id"] == 0 or r.json()["device_id"] == "0":
-            self.register_device()
-
-        return r.json()["device_id"], r.json()["install_id"]
-
-
-class Xlog:
-    def __init__(self, __device_id):
-        self.__device_id = __device_id
-
-    def bypass(self):
-        params = urlencode(
-            {
-                "os": "0",
-                "ver": "0.6.11.29.19-MT",
-                "m": "2",
-                "app_ver": "19.1.3",
-                "region": "en_US",
-                "aid": "1233",
-                "did": self.__device_id,
-            }
-        )
-        sig = Xgorgon().calculate(params, None, None)
-
         headers = {
-            "accept-encoding": "gzip",
-            "cookie": "sessionid=",
-            "x-ss-req-ticket": str("".join(str(time.time()).split(".")))[:13],
-            "x-tt-dm-status": "login=0;ct=0",
-            "x-gorgon": sig["x-gorgon"],
-            "x-khronos": str(sig["x-khronos"]),
-            "host": "xlog-va.tiktokv.com",
-            "connection": "Keep-Alive",
-            "user-agent": "okhttp/3.10.0.1",
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "user-agent": "TTNetwork PC",
+            "x-ss-dp": "",
+            "sdk_aid": "8311",
+            "x-ss-stub": hashlib.md5(encrypted_payload).hexdigest(),
         }
+        t0_ms = attach_webcast_ntp_t0(headers)
 
-        url = "https://xlog-va.tiktokv.com/v2/s?" + params
+        device_register_endpoint = get_device_register_endpoint(client)
 
-        response = requests.get(url, headers=headers)
-        
+        response = client.post(
+            device_register_endpoint,
+            params=params,
+            headers=headers,
+            data=encrypted_payload,
+            timeout=timeout,
+        )
+        update_ntp_from_response(t0_ms, response)
+        response.raise_for_status()
+
+        response_data = response.json()
+        source = response_data.get("data", response_data)
+        device_id = str(source.get("device_id", "")).strip()
+        install_id = str(source.get("install_id", "")).strip()
+
+        if not device_id or device_id == "0" or not install_id or install_id == "0":
+            raise RuntimeError(f"Device registration failed: {response_data}")
+
+        return device_id, install_id
+    finally:
+        if close_session:
+            client.close()

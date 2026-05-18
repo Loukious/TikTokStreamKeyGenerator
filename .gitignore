@@ -4,6 +4,6 @@ TiktokStreamKeyGenerator.spec
 build/*
 dist/*
 *.pem
-*/__pycache__/*
+__pycache__/
 .env
-__pycache__/*
+DevTools/
