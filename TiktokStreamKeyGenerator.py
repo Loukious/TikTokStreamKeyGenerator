@@ -3440,13 +3440,6 @@ class StreamKeyGeneratorWindow(QWidget):
         perception_countdown = safety.get("perception_summary") or "None"
         if perception_countdown not in ("None", "Unavailable", ""):
             self._add_safety_detail_row("Countdown", "Active", perception_countdown)
-
-        errors = safety.get("errors") or []
-        for error in errors[:4]:
-            self._add_safety_detail_row("Optional", "Unavailable", error)
-        if len(errors) > 4:
-            self._add_safety_detail_row("Optional", "More", f"{len(errors) - 4} more optional checks unavailable")
-
         if self.violation_details_output.rowCount() == 0:
             self._add_safety_detail_row("Status", "OK", "No safety details available yet")
         self.violation_details_output.resizeRowsToContents()
