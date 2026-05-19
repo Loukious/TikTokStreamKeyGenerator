@@ -1302,7 +1302,9 @@ class Stream:
         return item
 
     def getEcoViolationList(self, device_id="", install_id="", priority_region="", violation_list_type=1):
-        # This endpoint uses the eco/live-center app id from the official request, not aid 8311.
+        # Captured Live Studio-compatible request uses aid=8311 for this endpoint.
+        # The response may return records even when active_count/history_count are 0,
+        # so do not rely on those counters for GUI history/recent display.
         params = {
             "aid": "8311",
             "violation_list_type": str(violation_list_type),
@@ -1318,16 +1320,39 @@ class Stream:
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         if not isinstance(data, dict):
             data = {}
+
+        records = data.get("records") or []
+        if not isinstance(records, list):
+            records = []
+
         active_records = self._active_eco_violation_records(payload)
+        active_ids = [
+            self._eco_violation_id(record)
+            for record in active_records
+            if self._eco_violation_id(record)
+        ]
+        recent_ids = [
+            self._eco_violation_id(record)
+            for record in records
+            if isinstance(record, dict) and self._eco_violation_id(record)
+        ]
+
         return {
-            "active_count": data.get("active_count", len(active_records)),
+            "server_active_count": data.get("active_count"),
+            "active_count": len(active_records),
+            "server_history_count": data.get("history_count"),
             "history_count": data.get("history_count"),
+            "record_count": len(records),
+            "recent_count": len(records),
             "is_eea": data.get("is_eea"),
             "has_more": data.get("has_more"),
-            "records": data.get("records") or [],
+            "records": records,
+            "recent_records": records,
             "active_records": active_records,
-            "active_ids": [self._eco_violation_id(record) for record in active_records if self._eco_violation_id(record)],
+            "active_ids": active_ids,
+            "recent_ids": recent_ids,
             "active_summaries": [self._format_eco_violation_record(record) for record in active_records],
+            "recent_summaries": [self._format_eco_violation_record(record) for record in records if isinstance(record, dict)],
             "raw": payload,
         }
 
@@ -1385,7 +1410,17 @@ class Stream:
         if not perception_countdown.get("ok") and perception_countdown.get("error"):
             errors.append(f"perception_countdown: {perception_countdown['error']}")
 
-        eco_violation_list = {"active_records": [], "active_ids": [], "active_summaries": [], "active_count": 0, "history_count": None}
+        eco_violation_list = {
+            "active_records": [],
+            "active_ids": [],
+            "active_summaries": [],
+            "active_count": 0,
+            "history_count": None,
+            "record_count": 0,
+            "recent_count": 0,
+            "recent_records": [],
+            "recent_summaries": [],
+        }
         try:
             eco_violation_list = self.getEcoViolationList(
                 device_id=device_id,
@@ -1443,6 +1478,8 @@ class Stream:
             "active_violation_ids": sorted(active_violation_ids),
             "active_violation_summaries": active_eco_summaries + [item.get("summary", "") for item in active_perception_statuses],
             "history_violation_count": eco_violation_list.get("history_count"),
+            "recent_violation_count": eco_violation_list.get("record_count", 0),
+            "recent_violation_summaries": eco_violation_list.get("recent_summaries", []),
             "errors": errors,
             "raw": {
                 "create_info": create_data,
@@ -3159,16 +3196,26 @@ class StreamKeyGeneratorWindow(QWidget):
 
         active_count = safety.get("active_violation_count", 0) or 0
         history_count = safety.get("history_violation_count")
+        recent_count = safety.get("recent_violation_count", 0) or 0
+        recent_summaries = safety.get("recent_violation_summaries") or []
         self.violation_details_output.setRowCount(0)
         self._add_safety_detail_row("Active", self.format_stat_value(active_count), "No active violations" if not active_count else "Active moderation item detected")
-        if history_count not in (None, ""):
-            self._add_safety_detail_row("History", self.format_stat_value(history_count), "Past records hidden from active status")
+        self._add_safety_detail_row("Recent", self.format_stat_value(recent_count), "Records returned by violation_list" if recent_count else "No recent violation records")
+        if history_count not in (None, "") and str(history_count) != str(recent_count):
+            self._add_safety_detail_row("API history_count", self.format_stat_value(history_count), "Server counter, not used as the recent-record count")
 
         if active_summaries:
             for line in active_summaries[:8]:
                 self._add_safety_detail_row("Violation", "Active", line)
             if len(active_summaries) > 8:
                 self._add_safety_detail_row("Violation", "More", f"{len(active_summaries) - 8} more active items")
+
+        expired_recent = [line for line in recent_summaries if line not in active_summaries]
+        if expired_recent:
+            for line in expired_recent[:8]:
+                self._add_safety_detail_row("Violation", "Recent", line)
+            if len(expired_recent) > 8:
+                self._add_safety_detail_row("Violation", "More", f"{len(expired_recent) - 8} more recent items")
 
         perception_statuses = safety.get("perception_violation_statuses") or []
         for item in perception_statuses[:8]:
