@@ -130,7 +130,7 @@ jobs:
         with:
           name: windows-${{ matrix.build_type }}
           path: |
-            *.zip
+            TiktokStreamKeyGenerator*.zip
 
   build_macos:
     runs-on: macos-latest
@@ -201,7 +201,7 @@ jobs:
         with:
           name: macos-${{ matrix.architecture }}
           path: |
-            *.zip
+            TiktokStreamKeyGenerator*.zip
 
   build_linux:
     runs-on: ubuntu-22.04
@@ -262,7 +262,7 @@ jobs:
         with:
           name: linux-
           path: |
-            *.zip
+            TiktokStreamKeyGenerator*.zip
 
   release:
     runs-on: ubuntu-latest
