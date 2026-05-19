@@ -1304,7 +1304,7 @@ class Stream:
     def getEcoViolationList(self, device_id="", install_id="", priority_region="", violation_list_type=1):
         # This endpoint uses the eco/live-center app id from the official request, not aid 8311.
         params = {
-            "aid": "304449",
+            "aid": "8311",
             "violation_list_type": str(violation_list_type),
         }
         url = build_endpoint("webcast16-normal-no1a.tiktokv.eu", "webcast/eco/violation_list/", self.s)
