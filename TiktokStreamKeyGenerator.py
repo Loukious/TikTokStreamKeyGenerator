@@ -12,6 +12,9 @@ import urllib.parse
 import base64
 import mimetypes
 import secrets
+import signal
+import shutil
+import subprocess
 from urllib.parse import urlencode
 
 import requests
@@ -120,6 +123,11 @@ ANCHOR_STATUS_FINISH = 4
 PING_ANCHOR_TIMEOUT_SECONDS = 2.5
 ROOM_HAS_FINISHED_CODES = {"30003", "30003001"}
 ROOM_IS_LIVING_CODE = "4003150"
+LOCAL_PROXY_DEFAULT_PORT = 1935
+LOCAL_PROXY_APP_NAME = "live"
+LOCAL_PROXY_STREAM_KEY = "obs"
+LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS = 120
+LOCAL_PROXY_LOG_NAME = "ffmpeg_proxy.log"
 
 
 class WebcastError(RuntimeError):
@@ -916,6 +924,38 @@ class Stream:
             "raw": payload,
         }
 
+    def getTrendsStats(self, device_id="", install_id="", priority_region="", room_id=""):
+        base_url = self.getServerUrl()
+        room_id = str(room_id or self.roomId or "").strip()
+        if not room_id:
+            raise RuntimeError("Missing room_id. Create or resume a stream before loading trends stats.")
+
+        params = self._studio_params(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        params["room_id"] = room_id
+
+        payload = self._signed_get_json(
+            base_url + "webcast/game/studio/trends_stats/",
+            params=params,
+            priority_region=params.get("priority_region", ""),
+        )
+        _raise_for_webcast_error(payload, "Trends stats")
+
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        trends = data.get("room_trends_stats") or {}
+
+        return {
+            "room_id": room_id,
+            "current_viewers": trends.get("room_user_count"),
+            "current_viewers_followed": trends.get("room_user_followed_count"),
+            "current_viewers_trends": trends.get("current_viewers_trends"),
+            "total_viewers_trends": trends.get("total_viewers_trends"),
+            "raw": payload,
+        }
+
     def getServerUrl(self):
         return resolve_webcast_base_url(self.s)
 
@@ -1360,6 +1400,72 @@ def fetch_game_tags():
         return {}
 
 
+
+def _runtime_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _runtime_logs_dir():
+    preferred = os.path.join(_runtime_base_dir(), "logs")
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        return preferred
+    except OSError:
+        fallback = os.path.join(os.getcwd(), "logs")
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+def _bundled_ffmpeg_path():
+    exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    base_dir = _runtime_base_dir()
+    candidates = [
+        os.path.join(base_dir, "bin", exe_name),
+        os.path.join(base_dir, exe_name),
+        os.path.join(os.getcwd(), "bin", exe_name),
+        os.path.join(os.getcwd(), exe_name),
+    ]
+    found_in_path = shutil.which("ffmpeg")
+    if found_in_path:
+        candidates.append(found_in_path)
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "FFmpeg was not found. Put ffmpeg in the app's bin folder or add it to PATH."
+    )
+
+
+def _is_tcp_port_available(host, port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, int(port)))
+            return True
+        except OSError:
+            return False
+
+
+def _pick_local_proxy_port(preferred_port=LOCAL_PROXY_DEFAULT_PORT):
+    if preferred_port and _is_tcp_port_available("127.0.0.1", preferred_port):
+        return int(preferred_port)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _safe_log_tail(path, max_lines=30):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as file:
+            return "".join(file.readlines()[-max_lines:]).strip()
+    except OSError:
+        return ""
+
+
 # ----------------------------------------------------------------------
 # Protocol hijacking helpers (Windows only)
 # ----------------------------------------------------------------------
@@ -1507,6 +1613,18 @@ class StreamKeyGeneratorWindow(QWidget):
         self.realtime_stats_timer = QTimer(self)
         self.realtime_stats_timer.setInterval(5000)
         self.realtime_stats_timer.timeout.connect(self.refresh_realtime_stats)
+        self.ffmpeg_proxy_process = None
+        self.ffmpeg_proxy_log_file = None
+        self.ffmpeg_proxy_log_path = ""
+        self.local_proxy_port = LOCAL_PROXY_DEFAULT_PORT
+        self.local_proxy_server_url = ""
+        self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
+        self.local_proxy_active = False
+        self.show_real_stream_credentials = False
+        self.real_stream_url = ""
+        self.real_base_stream_url = ""
+        self.real_stream_key = ""
+        self.real_share_url = ""
 
         self._build_ui()
         self.update_checked.connect(self.handle_update_check)
@@ -1743,6 +1861,22 @@ class StreamKeyGeneratorWindow(QWidget):
         add_output_row("Stream Key:", self.key_output, "Copy")
         add_output_row("Share URL:", self.share_url_output, "Copy")
 
+        proxy_row = QHBoxLayout()
+        proxy_row.setSpacing(5)
+        proxy_label = QLabel("Proxy Status:")
+        proxy_label.setStyleSheet("font-weight: bold;")
+        proxy_row.addWidget(proxy_label)
+        self.proxy_status_output = QLineEdit()
+        self.proxy_status_output.setReadOnly(True)
+        self.proxy_status_output.setFixedHeight(28)
+        proxy_row.addWidget(self.proxy_status_output)
+        self.toggle_stream_credentials_button = QPushButton("Show Real TikTok URL")
+        self.toggle_stream_credentials_button.setEnabled(False)
+        self.toggle_stream_credentials_button.setFixedHeight(28)
+        self.toggle_stream_credentials_button.clicked.connect(self.toggle_stream_credentials_display)
+        proxy_row.addWidget(self.toggle_stream_credentials_button)
+        output_layout.addLayout(proxy_row)
+
         stats_group = QGroupBox("Realtime Stats")
         stats_layout = QGridLayout(stats_group)
         stats_layout.setHorizontalSpacing(8)
@@ -1759,35 +1893,40 @@ class StreamKeyGeneratorWindow(QWidget):
         self.live_status_stats_output.setFixedHeight(28)
         add_stats_field(0, 0, "Live", self.live_status_stats_output)
 
+        self.live_viewer_count_output = QLineEdit()
+        self.live_viewer_count_output.setReadOnly(True)
+        self.live_viewer_count_output.setFixedHeight(28)
+        add_stats_field(0, 2, "Live Viewers", self.live_viewer_count_output)
+
         self.viewer_count_output = QLineEdit()
         self.viewer_count_output.setReadOnly(True)
         self.viewer_count_output.setFixedHeight(28)
-        add_stats_field(0, 2, "Viewers", self.viewer_count_output)
+        add_stats_field(1, 0, "Views", self.viewer_count_output)
 
         self.like_count_output = QLineEdit()
         self.like_count_output.setReadOnly(True)
         self.like_count_output.setFixedHeight(28)
-        add_stats_field(1, 0, "Likes", self.like_count_output)
+        add_stats_field(1, 2, "Likes", self.like_count_output)
 
         self.comment_count_output = QLineEdit()
         self.comment_count_output.setReadOnly(True)
         self.comment_count_output.setFixedHeight(28)
-        add_stats_field(1, 2, "Comments", self.comment_count_output)
+        add_stats_field(2, 0, "Comments", self.comment_count_output)
 
         self.share_count_output = QLineEdit()
         self.share_count_output.setReadOnly(True)
         self.share_count_output.setFixedHeight(28)
-        add_stats_field(2, 0, "Shares", self.share_count_output)
+        add_stats_field(2, 2, "Shares", self.share_count_output)
 
         self.new_fans_count_output = QLineEdit()
         self.new_fans_count_output.setReadOnly(True)
         self.new_fans_count_output.setFixedHeight(28)
-        add_stats_field(2, 2, "New Fans", self.new_fans_count_output)
+        add_stats_field(3, 0, "New Fans", self.new_fans_count_output)
 
         self.refresh_stats_button = QPushButton("Refresh Stats")
         self.refresh_stats_button.clicked.connect(lambda: self.refresh_realtime_stats(force=True))
         self.refresh_stats_button.setFixedHeight(28)
-        stats_layout.addWidget(self.refresh_stats_button, 3, 0, 1, 4)
+        stats_layout.addWidget(self.refresh_stats_button, 4, 0, 1, 4)
 
         stats_layout.setColumnStretch(1, 1)
         stats_layout.setColumnStretch(3, 1)
@@ -1863,9 +2002,21 @@ class StreamKeyGeneratorWindow(QWidget):
         self.key_output.clear()
         self.share_url_output.clear()
         self.clear_realtime_stats_fields()
+        self.real_stream_url = ""
+        self.real_base_stream_url = ""
+        self.real_stream_key = ""
+        self.real_share_url = ""
+        self.local_proxy_server_url = ""
+        self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
+        self.show_real_stream_credentials = False
+        self.toggle_stream_credentials_button.setText("Show Real TikTok URL")
+        self.toggle_stream_credentials_button.setEnabled(False)
+        if hasattr(self, "proxy_status_output") and not self.local_proxy_active:
+            self.proxy_status_output.clear()
 
     def clear_realtime_stats_fields(self):
         self.live_status_stats_output.clear()
+        self.live_viewer_count_output.clear()
         self.viewer_count_output.clear()
         self.like_count_output.clear()
         self.comment_count_output.clear()
@@ -1917,6 +2068,19 @@ class StreamKeyGeneratorWindow(QWidget):
                         priority_region=priority_region,
                         room_id=room_id,
                     )
+                    try:
+                        trends = stream.getTrendsStats(
+                            device_id=self.device_id,
+                            install_id=self.install_id,
+                            priority_region=priority_region,
+                            room_id=room_id,
+                        )
+                        stats["live_viewer_count"] = trends.get("current_viewers")
+                        stats["live_viewer_followed_count"] = trends.get("current_viewers_followed")
+                        stats["current_viewers_trends"] = trends.get("current_viewers_trends")
+                        stats["total_viewers_trends"] = trends.get("total_viewers_trends")
+                    except Exception as trends_exc:
+                        stats["trends_error"] = str(trends_exc)
                 self.realtime_stats_loaded.emit(stats)
             except Exception as exc:
                 self.realtime_stats_failed.emit(str(exc))
@@ -1935,6 +2099,7 @@ class StreamKeyGeneratorWindow(QWidget):
             self.live_status_stats_output.setText("No")
         else:
             self.live_status_stats_output.setText("")
+        self.live_viewer_count_output.setText(self.format_stat_value(stats.get("live_viewer_count")))
         self.viewer_count_output.setText(self.format_stat_value(stats.get("watch_count")))
         self.like_count_output.setText(self.format_stat_value(stats.get("like_count")))
         self.comment_count_output.setText(self.format_stat_value(stats.get("comment_count")))
@@ -1998,6 +2163,128 @@ class StreamKeyGeneratorWindow(QWidget):
         self.login_button.setEnabled(True)
         self.update_stream_controls(has_cookies=has_cookies)
 
+    def set_proxy_status(self, message):
+        if hasattr(self, "proxy_status_output"):
+            self.proxy_status_output.setText(str(message or ""))
+
+    def toggle_stream_credentials_display(self):
+        if not self.real_stream_url:
+            return
+        self.show_real_stream_credentials = not self.show_real_stream_credentials
+        self.refresh_stream_credentials_display()
+
+    def refresh_stream_credentials_display(self):
+        self.share_url_output.setText(self.real_share_url)
+        has_real_credentials = bool(self.real_base_stream_url and self.real_stream_key)
+        has_local_credentials = bool(self.local_proxy_active and self.local_proxy_server_url)
+        self.toggle_stream_credentials_button.setEnabled(has_real_credentials and has_local_credentials)
+
+        if self.show_real_stream_credentials or not has_local_credentials:
+            self.url_output.setText(self.real_base_stream_url)
+            self.key_output.setText(self.real_stream_key)
+            self.toggle_stream_credentials_button.setText("Show Local OBS URL")
+            return
+
+        self.url_output.setText(self.local_proxy_server_url)
+        self.key_output.setText(self.local_proxy_stream_key)
+        self.toggle_stream_credentials_button.setText("Show Real TikTok URL")
+
+    def ffmpeg_proxy_is_running(self):
+        return self.ffmpeg_proxy_process is not None and self.ffmpeg_proxy_process.poll() is None
+
+    def build_ffmpeg_proxy_command(self, ffmpeg_path, local_input_url, tiktok_output_url):
+        return [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-rtmp_listen",
+            "1",
+            "-timeout",
+            str(LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS),
+            "-i",
+            local_input_url,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-f",
+            "flv",
+            tiktok_output_url,
+        ]
+
+    def start_ffmpeg_proxy(self, tiktok_output_url):
+        self.stop_ffmpeg_proxy(clear_status=False)
+        if not tiktok_output_url:
+            raise RuntimeError("Missing TikTok RTMP URL for local FFmpeg proxy.")
+
+        ffmpeg_path = _bundled_ffmpeg_path()
+        self.local_proxy_port = _pick_local_proxy_port(LOCAL_PROXY_DEFAULT_PORT)
+        self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
+        self.local_proxy_server_url = f"rtmp://127.0.0.1:{self.local_proxy_port}/{LOCAL_PROXY_APP_NAME}"
+        local_input_url = f"{self.local_proxy_server_url}/{self.local_proxy_stream_key}"
+        self.ffmpeg_proxy_log_path = os.path.join(_runtime_logs_dir(), LOCAL_PROXY_LOG_NAME)
+        self.ffmpeg_proxy_log_file = open(self.ffmpeg_proxy_log_path, "w", encoding="utf-8", errors="replace")
+
+        command = self.build_ffmpeg_proxy_command(ffmpeg_path, local_input_url, tiktok_output_url)
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        self.ffmpeg_proxy_process = subprocess.Popen(
+            command,
+            cwd=_runtime_base_dir(),
+            stdin=subprocess.DEVNULL,
+            stdout=self.ffmpeg_proxy_log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
+
+        time.sleep(0.35)
+        return_code = self.ffmpeg_proxy_process.poll()
+        if return_code is not None:
+            tail = _safe_log_tail(self.ffmpeg_proxy_log_path)
+            self.stop_ffmpeg_proxy(clear_status=False)
+            details = f"\n\nFFmpeg log tail:\n{tail}" if tail else ""
+            raise RuntimeError(f"FFmpeg proxy exited early with code {return_code}.{details}")
+
+        self.local_proxy_active = True
+        self.show_real_stream_credentials = False
+        self.set_proxy_status("Proxy ready. Start streaming in OBS.")
+        self.refresh_stream_credentials_display()
+        return True
+
+    def stop_ffmpeg_proxy(self, clear_status=True):
+        process = self.ffmpeg_proxy_process
+        self.ffmpeg_proxy_process = None
+        self.local_proxy_active = False
+
+        if process is not None and process.poll() is None:
+            try:
+                if os.name == "nt":
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+
+        if self.ffmpeg_proxy_log_file is not None:
+            try:
+                self.ffmpeg_proxy_log_file.close()
+            except Exception:
+                pass
+            self.ffmpeg_proxy_log_file = None
+
+        if clear_status:
+            self.set_proxy_status("")
+        self.refresh_stream_credentials_display()
+
     def update_stream_controls(self, has_cookies=None):
         if has_cookies is None:
             has_cookies = os.path.exists("cookies.json")
@@ -2009,16 +2296,38 @@ class StreamKeyGeneratorWindow(QWidget):
         self.resume_live_button.setEnabled(has_cookies and self.is_live and self.is_paused)
         self.end_live_button.setEnabled(has_cookies and self.is_live)
         self.refresh_stats_button.setEnabled(has_cookies and bool(self.current_room_id))
+        if hasattr(self, "toggle_stream_credentials_button"):
+            self.toggle_stream_credentials_button.setEnabled(
+                bool(self.real_stream_url and self.local_proxy_active and self.local_proxy_server_url)
+            )
 
-    def apply_stream_outputs(self, stream, priority_region=""):
+    def apply_stream_outputs(self, stream, priority_region="", start_proxy=True):
         self.clear_output_fields()
-        self.url_output.setText(getattr(stream, "baseStreamUrl", ""))
-        self.key_output.setText(getattr(stream, "streamKey", ""))
-        self.share_url_output.setText(getattr(stream, "streamShareUrl", ""))
+        self.real_stream_url = getattr(stream, "streamUrl", "")
+        self.real_base_stream_url = getattr(stream, "baseStreamUrl", "")
+        self.real_stream_key = getattr(stream, "streamKey", "")
+        self.real_share_url = getattr(stream, "streamShareUrl", "")
         self.current_room_id = getattr(stream, "roomId", "")
         self.current_stream_id = getattr(stream, "streamId", "")
         if priority_region:
             self.stream_priority_region = str(priority_region).strip().lower()
+
+        self.share_url_output.setText(self.real_share_url)
+        self.refresh_stream_credentials_display()
+
+        if start_proxy and self.real_stream_url:
+            try:
+                self.start_ffmpeg_proxy(self.real_stream_url)
+            except Exception as exc:
+                self.local_proxy_active = False
+                self.show_real_stream_credentials = True
+                self.set_proxy_status("Proxy failed. Showing real TikTok URL.")
+                self.refresh_stream_credentials_display()
+                self.show_error(
+                    "The local FFmpeg proxy could not start, so the real TikTok URL/key is shown instead.\n\n"
+                    f"{exc}"
+                )
+
         self.sync_realtime_stats_timer()
 
     def sync_anchor_heartbeat_timer(self):
@@ -2046,6 +2355,7 @@ class StreamKeyGeneratorWindow(QWidget):
             self.current_stream_id = ""
             self.stream_priority_region = ""
             self.anchor_ping_status = ANCHOR_STATUS_DEFAULT
+            self.stop_ffmpeg_proxy(clear_status=True)
         elif self.is_paused:
             self.anchor_ping_status = ANCHOR_STATUS_PAUSE
         elif self.anchor_ping_status in (ANCHOR_STATUS_DEFAULT, ANCHOR_STATUS_FINISH, ANCHOR_STATUS_PAUSE):
@@ -2477,7 +2787,7 @@ class StreamKeyGeneratorWindow(QWidget):
                         self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                         self.set_stream_state(is_live=True, is_paused=False)
                         self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
-                        self.show_info("Existing stream resumed successfully.")
+                        self.show_info(f"Existing stream resumed successfully. OBS should stream to {self.local_proxy_server_url} with key {self.local_proxy_stream_key}.")
                         return
 
                     if end_button is not None and clicked == end_button:
@@ -2536,7 +2846,7 @@ class StreamKeyGeneratorWindow(QWidget):
                     self.set_stream_state(is_live=True, is_paused=False)
                     self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
                     self.refresh_realtime_stats(force=True)
-                    self.show_info("Stream created successfully.")
+                    self.show_info(f"Stream created successfully. OBS should stream to {self.local_proxy_server_url} with key {self.local_proxy_stream_key}.")
         except FileNotFoundError:
             self.show_error("cookies.json not found. Please login first.")
         except RuntimeError as exc:
@@ -2687,6 +2997,11 @@ class StreamKeyGeneratorWindow(QWidget):
             if not stream_ended:
                 self.sync_anchor_heartbeat_timer()
                 self.update_stream_controls()
+
+    def closeEvent(self, event):
+        self.stop_ffmpeg_proxy(clear_status=True)
+        super().closeEvent(event)
+
 
 
 class LoginDialog(QDialog):
