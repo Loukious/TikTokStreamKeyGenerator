@@ -228,7 +228,7 @@ def _canonicalize_tiktok_host(host):
     return value
 
 
-def _webcast_suffix_for_idc(idc_segment, target_idc="", store_country=""):
+def _suffix_for_idc(idc_segment, target_idc="", store_country=""):
     segment = str(idc_segment or "").lower()
     target_idc = str(target_idc or "").lower()
     store_country = str(store_country or "").lower()
@@ -254,43 +254,31 @@ def _webcast_suffix_for_idc(idc_segment, target_idc="", store_country=""):
     return "tiktokv.com"
 
 
-def _authenticated_webcast_host(session):
-    store_idc = _session_cookie_value(session, "store-idc")
-    if not store_idc:
-        return None
+def _authenticated_idc_segment(session):
+    return _canonical_idc_segment(_session_cookie_value(session, "store-idc"))
 
-    idc_segment = _canonical_idc_segment(store_idc)
+
+def _authenticated_webcast_host(session):
+    idc_segment = _authenticated_idc_segment(session)
     if not idc_segment:
         return None
 
     target_idc = _session_cookie_value(session, "tt-target-idc") or ""
     store_country = _session_cookie_value(session, "store-country-code") or ""
-    suffix = _webcast_suffix_for_idc(idc_segment, target_idc, store_country)
-
+    suffix = _suffix_for_idc(idc_segment, target_idc, store_country)
     return _canonicalize_tiktok_host(f"webcast16-normal-{idc_segment}.{suffix}")
 
 
-
-
 def _authenticated_api_host(session):
-    store_idc = _session_cookie_value(session, "store-idc")
-    if not store_idc:
-        return None
-
-    idc_segment = _canonical_idc_segment(store_idc)
+    idc_segment = _authenticated_idc_segment(session)
     if not idc_segment:
         return None
 
-    if idc_segment == "c-alisg":
-        return "api16-normal-c-alisg.tiktokv.com"
+    target_idc = _session_cookie_value(session, "tt-target-idc") or ""
+    store_country = _session_cookie_value(session, "store-country-code") or ""
+    suffix = _suffix_for_idc(idc_segment, target_idc, store_country)
+    return _canonicalize_tiktok_host(f"api16-normal-{idc_segment}.{suffix}")
 
-    if idc_segment.startswith("useast"):
-        return f"api16-normal-{idc_segment}.tiktokv.us"
-
-    if idc_segment.startswith("no"):
-        return f"api16-normal-{idc_segment}.tiktokv.eu"
-
-    return _canonicalize_tiktok_host(f"api16-normal-{idc_segment}.tiktokv.com")
 
 def resolve_host(seed_host, session=None, timeout=12, max_hops=8):
     seed_host = _canonicalize_tiktok_host(seed_host)
@@ -321,13 +309,23 @@ def resolve_host(seed_host, session=None, timeout=12, max_hops=8):
 
             if not next_host or next_host == current_host:
                 break
-
             current_host = next_host
 
         return _canonicalize_tiktok_host(current_host)
     finally:
         if close_session:
             client.close()
+
+
+def _dedupe_hosts(hosts):
+    seen = set()
+    out = []
+    for host in hosts:
+        host = _canonicalize_tiktok_host(host)
+        if host and host not in seen:
+            seen.add(host)
+            out.append(host)
+    return out
 
 
 def build_endpoint(seed_host, path, session=None, timeout=12):
@@ -352,7 +350,9 @@ def resolve_api_base_url(session=None, timeout=12):
 
 
 def resolve_api_host_candidates(session=None, timeout=12):
-    candidates = []
+    candidates = [
+        _authenticated_api_host(session),
+    ]
 
     seed_candidates = [
         "api.tiktokv.com",
@@ -364,12 +364,30 @@ def resolve_api_host_candidates(session=None, timeout=12):
 
     for seed_host in seed_candidates:
         try:
-            host = resolve_host(seed_host, session=session, timeout=timeout)
+            candidates.append(resolve_host(seed_host, session=session, timeout=timeout))
         except Exception:
-            host = seed_host
+            candidates.append(seed_host)
 
-        host = _canonicalize_tiktok_host(host)
-        if host and host not in candidates:
-            candidates.append(host)
+    return _dedupe_hosts(candidates)
 
-    return candidates
+
+def resolve_webcast_host_candidates(session=None, timeout=12):
+    candidates = [
+        _authenticated_webcast_host(session),
+    ]
+
+    seed_candidates = [
+        "webcast-normal.tiktokv.com",
+        "webcast16-normal-c-alisg.tiktokv.com",
+        "webcast16-normal-no1a.tiktokv.eu",
+        "webcast16-normal-useast8.tiktokv.us",
+        "webcast16-normal-useast5.tiktokv.us",
+    ]
+
+    for seed_host in seed_candidates:
+        try:
+            candidates.append(resolve_host(seed_host, session=session, timeout=timeout))
+        except Exception:
+            candidates.append(seed_host)
+
+    return _dedupe_hosts(candidates)

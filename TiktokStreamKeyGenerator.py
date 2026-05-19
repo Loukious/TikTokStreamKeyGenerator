@@ -54,6 +54,7 @@ from Libs.domain_routing import (
     get_synced_unix_seconds,
     resolve_api_host_candidates,
     resolve_webcast_base_url,
+    resolve_webcast_host_candidates,
     update_ntp_from_response,
 )
 from Libs.device_gen import (
@@ -490,6 +491,60 @@ class Stream:
             "live_mode": "6",
         }
 
+    def _webcast_candidate_urls(self, url):
+        split = urllib.parse.urlsplit(url)
+        current_host = split.netloc
+        if not current_host or "webcast" not in current_host:
+            return [url]
+
+        hosts = [current_host]
+        try:
+            hosts.extend(resolve_webcast_host_candidates(self.s))
+        except Exception:
+            pass
+
+        # Keep these as last-resort fallbacks because different Passport/Webcast
+        # sessions can land on different IDCs. Some endpoints reject the wrong IDC
+        # with a raw HTTP 403 instead of a JSON payload.
+        hosts.extend(
+            [
+                "webcast16-normal-c-alisg.tiktokv.com",
+                "webcast16-normal-no1a.tiktokv.eu",
+                "webcast16-normal-useast8.tiktokv.us",
+                "webcast16-normal-useast5.tiktokv.us",
+            ]
+        )
+
+        urls = []
+        seen_hosts = set()
+        for host in hosts:
+            host = str(host or "").strip()
+            if not host or host in seen_hosts:
+                continue
+            seen_hosts.add(host)
+            urls.append(
+                urllib.parse.urlunsplit(
+                    (
+                        split.scheme or "https",
+                        host,
+                        split.path,
+                        split.query,
+                        split.fragment,
+                    )
+                )
+            )
+        return urls or [url]
+
+    def _is_retryable_request_error(self, exc):
+        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+            return True
+        if isinstance(exc, WebcastError):
+            if exc.status_code in (403, 404, 421, 429, 500, 502, 503, 504):
+                return True
+            # Invalid/empty non-JSON responses usually come from the wrong IDC.
+            return exc.status_code is None
+        return False
+
     def _signed_get_json(self, url, *, params, priority_region=""):
         self._apply_live_studio_headers()
         timestamp = get_synced_unix_seconds()
@@ -506,7 +561,7 @@ class Stream:
         region = params.get("priority_region") or self._effective_priority_region(priority_region)
         if region:
             headers["x-tt-store-region"] = region
-        return self._request_json("GET", url, params=params, headers=headers)
+        return self._request_json_with_webcast_fallback("GET", url, params=params, headers=headers)
 
     def _request_json(
         self,
@@ -538,7 +593,47 @@ class Stream:
             self.save_cookies()
         except Exception:
             pass
-        return response.json()
+
+        if not (200 <= response.status_code < 300):
+            text = (response.text or "").strip()
+            if len(text) > 500:
+                text = text[:500] + "..."
+            raise WebcastError(
+                f"HTTP {response.status_code} from {urllib.parse.urlsplit(url).netloc}: {text or response.reason}",
+                status_code=response.status_code,
+                payload=None,
+                action=f"{method} {url}",
+            )
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            text = (response.text or "").strip()
+            if len(text) > 500:
+                text = text[:500] + "..."
+            raise WebcastError(
+                f"Invalid JSON from {urllib.parse.urlsplit(url).netloc}: {text or exc}",
+                status_code=response.status_code,
+                payload=None,
+                action=f"{method} {url}",
+            ) from exc
+
+    def _request_json_with_webcast_fallback(self, method, url, **kwargs):
+        candidate_urls = self._webcast_candidate_urls(url)
+        last_error = None
+
+        for index, candidate_url in enumerate(candidate_urls):
+            try:
+                return self._request_json(method, candidate_url, **kwargs)
+            except Exception as exc:
+                last_error = exc
+                if index >= len(candidate_urls) - 1 or not self._is_retryable_request_error(exc):
+                    raise
+                continue
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"No candidate URL was available for {url}")
 
     def createStream(
         self,
@@ -781,7 +876,7 @@ class Stream:
                 request_headers["x-tt-store-region"] = region
 
             try:
-                streamInfo = self._request_json(
+                streamInfo = self._request_json_with_webcast_fallback(
                     "POST",
                     base_url + "webcast/room/ping/anchor/",
                     params=params,
@@ -790,7 +885,7 @@ class Stream:
                     timeout=PING_ANCHOR_TIMEOUT_SECONDS,
                 )
             except requests.Timeout:
-                streamInfo = self._request_json(
+                streamInfo = self._request_json_with_webcast_fallback(
                     "POST",
                     base_url + "webcast/room/ping/anchor/",
                     params=params,
@@ -800,7 +895,7 @@ class Stream:
                 )
 
             if _is_update_in_lock_payload(streamInfo):
-                streamInfo = self._request_json(
+                streamInfo = self._request_json_with_webcast_fallback(
                     "POST",
                     base_url + "webcast/room/ping/anchor/",
                     params=params,
@@ -905,11 +1000,18 @@ class Stream:
             install_id=install_id,
             priority_region=priority_region,
         )
-        self._signed_get_json(
-            base_url + "webcast/room/anchor_pre_finish/",
-            params={**params, "room_id": room_id},
-            priority_region=priority_region,
-        )
+        # This pre-finish endpoint is advisory. Some IDCs/accounts return a raw
+        # 403 for it even when the finish ping works, so do not block End Live
+        # on this call.
+        try:
+            self._signed_get_json(
+                base_url + "webcast/room/anchor_pre_finish/",
+                params={**params, "room_id": room_id},
+                priority_region=priority_region,
+            )
+        except Exception:
+            pass
+
         streamInfo = self._pingAnchorStatus(
             ANCHOR_STATUS_FINISH,
             device_id=device_id,
@@ -1295,7 +1397,7 @@ class Stream:
             "aid": "8311",
             "violation_list_type": str(violation_list_type),
         }
-        url = build_endpoint("webcast16-normal-no1a.tiktokv.eu", "webcast/eco/violation_list/", self.s)
+        url = self.getServerUrl() + "webcast/eco/violation_list/"
         payload = self._signed_get_json(
             url,
             params=params,
@@ -3440,6 +3542,10 @@ class StreamKeyGeneratorWindow(QWidget):
         perception_countdown = safety.get("perception_summary") or "None"
         if perception_countdown not in ("None", "Unavailable", ""):
             self._add_safety_detail_row("Countdown", "Active", perception_countdown)
+
+        # Optional endpoint failures are intentionally not shown here.
+        # They are noisy and can happen when an IDC rejects a non-critical check.
+
         if self.violation_details_output.rowCount() == 0:
             self._add_safety_detail_row("Status", "OK", "No safety details available yet")
         self.violation_details_output.resizeRowsToContents()
