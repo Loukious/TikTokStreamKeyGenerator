@@ -2402,7 +2402,7 @@ class StreamKeyGeneratorWindow(QWidget):
         account_layout.addStretch(1)
         root_layout.addWidget(account_group, 1, 0)
 
-        output_group = QGroupBox("Stream Output & Monitoring")
+        output_group = QGroupBox("Stream Output and Monitoring")
         output_group.setMinimumWidth(0)
         output_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         output_layout = QVBoxLayout(output_group)
@@ -2577,7 +2577,7 @@ class StreamKeyGeneratorWindow(QWidget):
         stats_layout.setColumnStretch(3, 1)
         output_layout.addWidget(stats_group)
 
-        monitoring_group = QGroupBox("Audience & Safety")
+        monitoring_group = QGroupBox("Audience and Safety")
         monitoring_group.setMinimumWidth(0)
         monitoring_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         monitoring_layout = QVBoxLayout(monitoring_group)
