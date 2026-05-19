@@ -92,12 +92,6 @@ def make_ladon(x_khronos: int, local_id: int, aid: str = "8311", prefix16=None) 
         "aid": str(aid),
     }
 
-    if prefix16 is not None:
-        try:
-            payload["prefix16"] = int(prefix16)
-        except Exception:
-            return ""
-
     try:
         response = requests.post(
             f"{RAPIDAPI_SIGNER_BASE_URL}/xladon",
