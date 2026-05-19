@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import urllib.parse
+
 
 RAPIDAPI_SIGNER_BASE_URL = "https://tiktok-live-studio-api-signer.p.rapidapi.com"
 RAPIDAPI_SIGNER_HOST = "tiktok-live-studio-api-signer.p.rapidapi.com"
@@ -73,6 +75,36 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _normalize_params_for_api(params: Any) -> str:
+    """
+    Return the exact query-string form that the remote signer should hash.
+
+    Important:
+    - If params is already a URL or query string, preserve its existing encoding/order.
+    - If params is a dict/list/tuple, encode it using urllib.parse.urlencode default
+      behavior, matching the old local XArgus normalizer and requests-style query encoding.
+    """
+    if params is None:
+        return ""
+
+    if isinstance(params, bytes):
+        params = params.decode("utf-8", errors="strict")
+
+    if isinstance(params, str):
+        value = params.strip()
+        split = urllib.parse.urlsplit(value)
+
+        if split.query:
+            return split.query
+
+        return value[1:] if value.startswith("?") else value
+
+    if isinstance(params, (dict, list, tuple)):
+        return urllib.parse.urlencode(params, doseq=True)
+
+    return str(params)
+
+
 def _extract_signature(response: requests.Response) -> str:
     if not (200 <= response.status_code < 300):
         return ""
@@ -102,7 +134,7 @@ def make_x_argus(params=None, stub=None, **kwargs) -> str:
         return ""
 
     payload = {
-        "params": _jsonable(params),
+        "params": _normalize_params_for_api(params),
     }
 
     if stub is not None:
