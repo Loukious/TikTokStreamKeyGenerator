@@ -143,7 +143,6 @@ def _application_dir():
 
 DEFAULT_COOKIES_PATH = os.path.join(_application_dir(), "cookies.json")
 CONFIG_PATH = os.path.join(_application_dir(), "config.json")
-RAPIDAPI_SIGNER_DOCS_URL = "https://rapidapi.com/07wael/api/tiktok-live-studio-api-signer"
 
 
 def _normalize_configured_path(path, default=DEFAULT_COOKIES_PATH):
@@ -167,11 +166,6 @@ def _load_config_file():
 def _configured_cookies_path(default=DEFAULT_COOKIES_PATH):
     data = _load_config_file()
     return _normalize_configured_path(data.get("cookies_path", default), default=default)
-
-
-def _configured_rapidapi_key():
-    data = _load_config_file()
-    return str(data.get("rapidapi_key", "") or "").strip()
 
 
 class WebcastError(RuntimeError):
@@ -1302,11 +1296,9 @@ class Stream:
         return item
 
     def getEcoViolationList(self, device_id="", install_id="", priority_region="", violation_list_type=1):
-        # Captured Live Studio-compatible request uses aid=8311 for this endpoint.
-        # The response may return records even when active_count/history_count are 0,
-        # so do not rely on those counters for GUI history/recent display.
+        # This endpoint uses the eco/live-center app id from the official request, not aid 8311.
         params = {
-            "aid": "8311",
+            "aid": "304449",
             "violation_list_type": str(violation_list_type),
         }
         url = build_endpoint("webcast16-normal-no1a.tiktokv.eu", "webcast/eco/violation_list/", self.s)
@@ -1320,39 +1312,16 @@ class Stream:
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         if not isinstance(data, dict):
             data = {}
-
-        records = data.get("records") or []
-        if not isinstance(records, list):
-            records = []
-
         active_records = self._active_eco_violation_records(payload)
-        active_ids = [
-            self._eco_violation_id(record)
-            for record in active_records
-            if self._eco_violation_id(record)
-        ]
-        recent_ids = [
-            self._eco_violation_id(record)
-            for record in records
-            if isinstance(record, dict) and self._eco_violation_id(record)
-        ]
-
         return {
-            "server_active_count": data.get("active_count"),
-            "active_count": len(active_records),
-            "server_history_count": data.get("history_count"),
+            "active_count": data.get("active_count", len(active_records)),
             "history_count": data.get("history_count"),
-            "record_count": len(records),
-            "recent_count": len(records),
             "is_eea": data.get("is_eea"),
             "has_more": data.get("has_more"),
-            "records": records,
-            "recent_records": records,
+            "records": data.get("records") or [],
             "active_records": active_records,
-            "active_ids": active_ids,
-            "recent_ids": recent_ids,
+            "active_ids": [self._eco_violation_id(record) for record in active_records if self._eco_violation_id(record)],
             "active_summaries": [self._format_eco_violation_record(record) for record in active_records],
-            "recent_summaries": [self._format_eco_violation_record(record) for record in records if isinstance(record, dict)],
             "raw": payload,
         }
 
@@ -1410,17 +1379,7 @@ class Stream:
         if not perception_countdown.get("ok") and perception_countdown.get("error"):
             errors.append(f"perception_countdown: {perception_countdown['error']}")
 
-        eco_violation_list = {
-            "active_records": [],
-            "active_ids": [],
-            "active_summaries": [],
-            "active_count": 0,
-            "history_count": None,
-            "record_count": 0,
-            "recent_count": 0,
-            "recent_records": [],
-            "recent_summaries": [],
-        }
+        eco_violation_list = {"active_records": [], "active_ids": [], "active_summaries": [], "active_count": 0, "history_count": None}
         try:
             eco_violation_list = self.getEcoViolationList(
                 device_id=device_id,
@@ -1478,8 +1437,6 @@ class Stream:
             "active_violation_ids": sorted(active_violation_ids),
             "active_violation_summaries": active_eco_summaries + [item.get("summary", "") for item in active_perception_statuses],
             "history_violation_count": eco_violation_list.get("history_count"),
-            "recent_violation_count": eco_violation_list.get("record_count", 0),
-            "recent_violation_summaries": eco_violation_list.get("recent_summaries", []),
             "errors": errors,
             "raw": {
                 "create_info": create_data,
@@ -1525,8 +1482,12 @@ class Stream:
             "sign": PASSPORT_QR_SIGN,
             "qs": PASSPORT_QR_QS,
         }
+        # Official Account SDK starts from api.tiktokv.com and lets the
+        # routing layer pick the account's passport IDC. Using no1a directly
+        # breaks alisg accounts with "session expired" even when the session
+        # cookies are valid.
         account_payload = self._signed_get_json(
-            build_endpoint("api16-normal-no1a.tiktokv.eu", "passport/account/info/v2/", self.s),
+            build_endpoint("api.tiktokv.com", "passport/account/info/v2/", self.s),
             params=account_params,
             priority_region=priority_region,
         )
@@ -1683,6 +1644,8 @@ class LiveStudioBrowserLoginClient:
         self.device_id = str(device_id).strip() if device_id else "0"
         self.install_id = str(install_id).strip() if install_id else "0"
 
+        self._passport_domain = ""
+
         self.base_headers = {
             "user-agent": self.user_agent,
             "accept": "application/json, text/plain, */*",
@@ -1771,7 +1734,11 @@ class LiveStudioBrowserLoginClient:
             raise RuntimeError("Login request did not return JSON.") from exc
 
     def get_qrcode(self):
-        url = build_endpoint("api16-normal-c-alisg.tiktokv.com", "passport/web/get_qrcode/", self.session)
+        # Official Account SDK uses api.tiktokv.com as its base URL and lets
+        # the passport/domain layer route it. In captures this commonly lands
+        # on no1a for QR creation. We use api.tiktokv.com here so
+        # domain_routing.py can pick the authenticated/dispatch host when it can.
+        url = build_endpoint("api.tiktokv.com", "passport/web/get_qrcode/", self.session)
         verify_fp = f"verify_{self.device_id}"
         params = {
             "next": "https://www.tiktok.com",
@@ -1798,7 +1765,10 @@ class LiveStudioBrowserLoginClient:
         return data_payload
 
     def check_qrconnect(self, token):
-        url = build_endpoint("api16-normal-no1a.tiktokv.eu", "passport/web/check_qrconnect/", self.session)
+        # Official JS does not trust a single passport host. It checks the
+        # login-assurance domains in parallel and uses the domain that returns
+        # the scanned/confirmed QR state. This matters for accounts routed to
+        # alisg, where no1a can keep returning status=new and empty secret.
         verify_fp = f"verify_{self.device_id}"
         params = {
             "next": "https://www.tiktok.com",
@@ -1812,17 +1782,64 @@ class LiveStudioBrowserLoginClient:
             "sign": PASSPORT_QR_CHECK_SIGN,
             "qs": PASSPORT_QR_CHECK_QS,
         }
-        payload = self._signed_request_json(
-            "GET",
-            url,
-            params=params,
-            include_x_ss_stub=False,
-            headers={"content-type": "application/x-www-form-urlencoded"},
-        )
-        return payload
+
+        best_payload = None
+        best_rank = -1
+        last_error = None
+
+        for host in _dedupe_hosts(PASSPORT_LOGIN_ASSURANCE_DOMAINS):
+            url = f"https://{host}/passport/web/check_qrconnect/"
+            try:
+                payload = self._signed_request_json(
+                    "GET",
+                    url,
+                    params=params,
+                    include_x_ss_stub=False,
+                    headers={"content-type": "application/x-www-form-urlencoded"},
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            if not isinstance(data, dict):
+                data = {}
+            status = data.get("status") or data.get("qr_status") or data.get("state")
+            client_secret = data.get("client_secret") or ""
+            data["domain"] = host
+            payload["data"] = data
+
+            if status == "confirmed":
+                self._passport_domain = host
+                return payload
+
+            if status == "scanned" and client_secret:
+                rank = 3
+            elif status == "scanned":
+                rank = 2
+            elif status == "new":
+                rank = 1
+            else:
+                rank = 0
+
+            if rank > best_rank:
+                best_rank = rank
+                best_payload = payload
+                if status == "scanned":
+                    self._passport_domain = host
+
+        if best_payload is not None:
+            return best_payload
+        if last_error:
+            raise last_error
+        return {"data": {"status": "new"}, "message": "No QR status response"}
 
     def account_info(self):
-        url = build_endpoint("api16-normal-no1a.tiktokv.eu", "passport/account/info/v2/", self.session)
+        # After QR confirmation, the working official request uses the same
+        # passport domain that returned confirmed, for example c-alisg. Calling
+        # no1a with alisg session cookies returns "session expired".
+        host = self._passport_domain or "api.tiktokv.com"
+        url = build_endpoint(host, "passport/account/info/v2/", self.session)
         verify_fp = f"verify_{self.device_id}"
         params = {
             "device_id": self.device_id,
@@ -2170,7 +2187,6 @@ class StreamKeyGeneratorWindow(QWidget):
         self.real_share_url = ""
         self.active_violation_ids = set()
         self.cookie_file_path = _configured_cookies_path()
-        self.rapidapi_key = _configured_rapidapi_key()
 
         self._build_ui()
         self.update_checked.connect(self.handle_update_check)
@@ -2369,31 +2385,6 @@ class StreamKeyGeneratorWindow(QWidget):
         cookies_row.addWidget(self.browse_cookies_button)
         account_layout.addLayout(cookies_row)
 
-        rapidapi_label = QLabel("RapidAPI Key")
-        rapidapi_label.setStyleSheet("font-weight: bold;")
-        allow_label_shrink(rapidapi_label)
-        account_layout.addWidget(rapidapi_label)
-
-        rapidapi_row = QHBoxLayout()
-        rapidapi_row.setSpacing(6)
-
-        self.rapidapi_key_edit = QLineEdit()
-        self.rapidapi_key_edit.setFixedHeight(28)
-        self.rapidapi_key_edit.setEchoMode(QLineEdit.Password)
-        self.rapidapi_key_edit.setPlaceholderText("Paste your RapidAPI key")
-        self.rapidapi_key_edit.editingFinished.connect(self.apply_rapidapi_key_from_input)
-        allow_horizontal_shrink(self.rapidapi_key_edit)
-        rapidapi_row.addWidget(self.rapidapi_key_edit, 1)
-
-        self.rapidapi_help_button = QPushButton("?")
-        self.rapidapi_help_button.setFixedHeight(28)
-        self.rapidapi_help_button.setToolTip("Open RapidAPI signer page")
-        keep_button_visible(self.rapidapi_help_button, minimum_width=32)
-        self.rapidapi_help_button.clicked.connect(self.open_rapidapi_signer_page)
-        rapidapi_row.addWidget(self.rapidapi_help_button)
-
-        account_layout.addLayout(rapidapi_row)
-
         self.account_username = QLineEdit()
         self.account_username.setReadOnly(True)
         self.account_username.setFixedHeight(28)
@@ -2439,7 +2430,7 @@ class StreamKeyGeneratorWindow(QWidget):
         account_layout.addStretch(1)
         root_layout.addWidget(account_group, 1, 0)
 
-        output_group = QGroupBox("Stream Output and Monitoring")
+        output_group = QGroupBox("Stream Output & Monitoring")
         output_group.setMinimumWidth(0)
         output_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         output_layout = QVBoxLayout(output_group)
@@ -2614,7 +2605,7 @@ class StreamKeyGeneratorWindow(QWidget):
         stats_layout.setColumnStretch(3, 1)
         output_layout.addWidget(stats_group)
 
-        monitoring_group = QGroupBox("Audience and Safety")
+        monitoring_group = QGroupBox("Audience & Safety")
         monitoring_group.setMinimumWidth(0)
         monitoring_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         monitoring_layout = QVBoxLayout(monitoring_group)
@@ -3196,26 +3187,16 @@ class StreamKeyGeneratorWindow(QWidget):
 
         active_count = safety.get("active_violation_count", 0) or 0
         history_count = safety.get("history_violation_count")
-        recent_count = safety.get("recent_violation_count", 0) or 0
-        recent_summaries = safety.get("recent_violation_summaries") or []
         self.violation_details_output.setRowCount(0)
         self._add_safety_detail_row("Active", self.format_stat_value(active_count), "No active violations" if not active_count else "Active moderation item detected")
-        self._add_safety_detail_row("Recent", self.format_stat_value(recent_count), "Records returned by violation_list" if recent_count else "No recent violation records")
-        if history_count not in (None, "") and str(history_count) != str(recent_count):
-            self._add_safety_detail_row("API history_count", self.format_stat_value(history_count), "Server counter, not used as the recent-record count")
+        if history_count not in (None, ""):
+            self._add_safety_detail_row("History", self.format_stat_value(history_count), "Past records hidden from active status")
 
         if active_summaries:
             for line in active_summaries[:8]:
                 self._add_safety_detail_row("Violation", "Active", line)
             if len(active_summaries) > 8:
                 self._add_safety_detail_row("Violation", "More", f"{len(active_summaries) - 8} more active items")
-
-        expired_recent = [line for line in recent_summaries if line not in active_summaries]
-        if expired_recent:
-            for line in expired_recent[:8]:
-                self._add_safety_detail_row("Violation", "Recent", line)
-            if len(expired_recent) > 8:
-                self._add_safety_detail_row("Violation", "More", f"{len(expired_recent) - 8} more recent items")
 
         perception_statuses = safety.get("perception_violation_statuses") or []
         for item in perception_statuses[:8]:
@@ -3433,26 +3414,6 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.set_cookies_path(file_path, save=True, refresh=True)
         self.refresh_account_info(show_errors=False)
-
-    def get_rapidapi_key(self):
-        if hasattr(self, "rapidapi_key_edit"):
-            return self.rapidapi_key_edit.text().strip()
-        return str(getattr(self, "rapidapi_key", "") or "").strip()
-
-    def set_rapidapi_key(self, key, *, save=True):
-        self.rapidapi_key = str(key or "").strip()
-        if hasattr(self, "rapidapi_key_edit"):
-            self.rapidapi_key_edit.blockSignals(True)
-            self.rapidapi_key_edit.setText(self.rapidapi_key)
-            self.rapidapi_key_edit.blockSignals(False)
-        if save:
-            self.save_config(show_message=False)
-
-    def apply_rapidapi_key_from_input(self):
-        self.set_rapidapi_key(self.get_rapidapi_key(), save=True)
-
-    def open_rapidapi_signer_page(self):
-        QDesktopServices.openUrl(QUrl(RAPIDAPI_SIGNER_DOCS_URL))
 
     def check_cookies(self):
         has_cookies, status_text = self.get_cookie_file_status()
@@ -3811,7 +3772,6 @@ class StreamKeyGeneratorWindow(QWidget):
             "device_id": self.device_id,
             "install_id": self.install_id,
             "cookies_path": self.get_cookies_path() if hasattr(self, "get_cookies_path") else _configured_cookies_path(),
-            "rapidapi_key": self.get_rapidapi_key() if hasattr(self, "get_rapidapi_key") else _configured_rapidapi_key(),
             "suppress_donation_reminder": self.suppress_donation_reminder,
         }
 
@@ -3829,15 +3789,10 @@ class StreamKeyGeneratorWindow(QWidget):
             self.device_id = ""
             self.install_id = ""
             self.cookie_file_path = _normalize_configured_path(DEFAULT_COOKIES_PATH)
-            self.rapidapi_key = ""
             if hasattr(self, "cookies_path_edit"):
                 self.cookies_path_edit.blockSignals(True)
                 self.cookies_path_edit.setText(self.cookie_file_path)
                 self.cookies_path_edit.blockSignals(False)
-            if hasattr(self, "rapidapi_key_edit"):
-                self.rapidapi_key_edit.blockSignals(True)
-                self.rapidapi_key_edit.setText(self.rapidapi_key)
-                self.rapidapi_key_edit.blockSignals(False)
             self.refresh_device_identifier_fields()
             return
 
@@ -3846,15 +3801,10 @@ class StreamKeyGeneratorWindow(QWidget):
         self.device_id = str(loaded_device_id).strip() if loaded_device_id is not None else ""
         self.install_id = str(loaded_install_id).strip() if loaded_install_id is not None else ""
         self.cookie_file_path = _normalize_configured_path(data.get("cookies_path", self.cookie_file_path or DEFAULT_COOKIES_PATH))
-        self.rapidapi_key = str(data.get("rapidapi_key", "") or "").strip()
         if hasattr(self, "cookies_path_edit"):
             self.cookies_path_edit.blockSignals(True)
             self.cookies_path_edit.setText(self.cookie_file_path)
             self.cookies_path_edit.blockSignals(False)
-        if hasattr(self, "rapidapi_key_edit"):
-            self.rapidapi_key_edit.blockSignals(True)
-            self.rapidapi_key_edit.setText(self.rapidapi_key)
-            self.rapidapi_key_edit.blockSignals(False)
         self.suppress_donation_reminder = data.get("suppress_donation_reminder", False)
 
         if self.device_id == "0":
