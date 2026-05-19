@@ -35,6 +35,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QHeaderView,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
@@ -123,11 +127,45 @@ ANCHOR_STATUS_FINISH = 4
 PING_ANCHOR_TIMEOUT_SECONDS = 2.5
 ROOM_HAS_FINISHED_CODES = {"30003", "30003001"}
 ROOM_IS_LIVING_CODE = "4003150"
+PERCEPTION_VIOLATION_SCENES = (7, 10, 16)
 LOCAL_PROXY_DEFAULT_PORT = 1935
 LOCAL_PROXY_APP_NAME = "live"
 LOCAL_PROXY_STREAM_KEY = "obs"
 LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS = 120
 LOCAL_PROXY_LOG_NAME = "ffmpeg_proxy.log"
+
+
+def _application_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DEFAULT_COOKIES_PATH = os.path.join(_application_dir(), "cookies.json")
+CONFIG_PATH = os.path.join(_application_dir(), "config.json")
+
+
+def _normalize_configured_path(path, default=DEFAULT_COOKIES_PATH):
+    value = str(path or "").strip()
+    if not value:
+        value = default
+    return os.path.abspath(os.path.expanduser(value))
+
+
+def _load_config_file():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _configured_cookies_path(default=DEFAULT_COOKIES_PATH):
+    data = _load_config_file()
+    return _normalize_configured_path(data.get("cookies_path", default), default=default)
 
 
 class WebcastError(RuntimeError):
@@ -299,13 +337,14 @@ def _encode_multipart_form_data(fields, files, boundary=None):
 
 
 class Stream:
-    def __init__(self):
+    def __init__(self, cookies_path=None):
         self.s = requests.session()
         self.s.headers.update(build_common_headers(self.s))
         self.roomId = ""
         self.streamId = ""
         self._cached_live_studio_version = None
-        with open("cookies.json", "r", encoding="utf-8") as file:
+        self.cookies_path = _normalize_configured_path(cookies_path or _configured_cookies_path())
+        with open(self.cookies_path, "r", encoding="utf-8") as file:
             cookies_file = json.load(file)
 
         cookies = {}
@@ -356,11 +395,19 @@ class Stream:
         )
         self.streamShareUrl = room.get("share_url", "")
         self.roomStatus = room.get("status")
+        owner = room.get("owner") or {}
+        self.ownerUserId = (
+            room.get("owner_user_id_str")
+            or str(room.get("owner_user_id") or "")
+            or owner.get("id_str")
+            or str(owner.get("id") or "")
+        )
         has_ids = bool(self.roomId and self.streamId)
         has_push_url = bool(self.streamUrl)
         return has_ids and (has_push_url or not require_stream_url)
 
-    def save_cookies(self, path="cookies.json"):
+    def save_cookies(self, path=None):
+        path = _normalize_configured_path(path or getattr(self, "cookies_path", "") or _configured_cookies_path())
         cookies = _export_cookie_jar(self.s.cookies)
         if cookies:
             with open(path, "w", encoding="utf-8") as file:
@@ -956,6 +1003,450 @@ class Stream:
             "raw": payload,
         }
 
+    def _payload_data(self, payload):
+        if not isinstance(payload, dict):
+            return {}
+        data = payload.get("data", {})
+        return data if isinstance(data, dict) else {}
+
+    def _summarize_payload(self, payload):
+        if not isinstance(payload, dict):
+            return "No response"
+
+        data = payload.get("data")
+        candidates = []
+        if isinstance(data, dict):
+            candidates.append(data)
+            for key in ("record", "latest_record", "ban_record", "violation", "perception_info", "count_down", "countdown"):
+                value = data.get(key)
+                if isinstance(value, dict):
+                    candidates.append(value)
+                elif isinstance(value, list) and value:
+                    candidates.append(value[0])
+            for key in ("records", "record_list", "violations", "ban_records", "list"):
+                value = data.get(key)
+                if isinstance(value, list) and value:
+                    candidates.append(value[0])
+        elif isinstance(data, list) and data:
+            candidates.append(data[0])
+
+        message_keys = (
+            "prompts",
+            "message",
+            "msg",
+            "title",
+            "reason",
+            "violation_reason",
+            "ban_reason",
+            "punish_reason",
+            "content",
+            "text",
+            "description",
+            "toast",
+        )
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for key in message_keys:
+                value = candidate.get(key)
+                if value not in (None, "", []):
+                    return str(value)[:220]
+
+        status_code = payload.get("status_code")
+        if status_code in (0, "0", None):
+            return "None"
+        return f"status_code={status_code}"
+
+    def _safe_signed_get(self, endpoint, *, params, priority_region="", action="Request"):
+        try:
+            payload = self._signed_get_json(
+                self.getServerUrl() + endpoint,
+                params=params,
+                priority_region=priority_region,
+            )
+            _raise_for_webcast_error(payload, action)
+            return {"ok": True, "payload": payload, "summary": self._summarize_payload(payload), "error": ""}
+        except Exception as exc:
+            return {"ok": False, "payload": None, "summary": "Unavailable", "error": str(exc)}
+
+    def getRoomInfo(self, device_id="", install_id="", priority_region="", room_id=""):
+        base_url = self.getServerUrl()
+        room_id = str(room_id or self.roomId or "").strip()
+        if not room_id:
+            raise RuntimeError("Missing room_id. Create or resume a stream before loading room info.")
+
+        params = self._studio_params(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        params["room_id"] = room_id
+
+        payload = self._signed_get_json(
+            base_url + "webcast/room/info/",
+            params=params,
+            priority_region=params.get("priority_region", ""),
+        )
+        _raise_for_webcast_error(payload, "Room info")
+
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        room = data.get("room") if isinstance(data, dict) else None
+        if not isinstance(room, dict):
+            room = data if isinstance(data, dict) else {}
+
+        return {
+            "room_id": room_id,
+            "room": room,
+            "perception_info": room.get("perception_info") or {},
+            "room_auth": room.get("room_auth") or {},
+            "raw": payload,
+        }
+
+    def getOnlineAudience(self, device_id="", install_id="", priority_region="", room_id="", anchor_id=""):
+        base_url = self.getServerUrl()
+        room_id = str(room_id or self.roomId or "").strip()
+        anchor_id = str(anchor_id or getattr(self, "ownerUserId", "") or "").strip()
+        if not room_id:
+            raise RuntimeError("Missing room_id. Create or resume a stream before loading online audience.")
+
+        params = self._studio_params(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        params.update(
+            {
+                "room_id": room_id,
+                "source": "0",
+            }
+        )
+        if anchor_id:
+            params["anchor_id"] = anchor_id
+
+        payload = self._signed_get_json(
+            base_url + "webcast/ranklist/online_audience/",
+            params=params,
+            priority_region=params.get("priority_region", ""),
+        )
+        _raise_for_webcast_error(payload, "Online audience")
+
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+
+        return {
+            "total": data.get("total"),
+            "preview_count": data.get("preview_count"),
+            "bottom_notice": data.get("bottom_notice", ""),
+            "currency": data.get("currency", ""),
+            "ranks": data.get("ranks") or [],
+            "display_config": data.get("display_config") or {},
+            "raw": payload,
+        }
+
+    def _active_eco_violation_records(self, payload):
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        records = data.get("records") or []
+        now_ms = (payload.get("extra") or {}).get("now") if isinstance(payload, dict) else None
+        try:
+            now_seconds = int(now_ms) / 1000 if now_ms else time.time()
+        except (TypeError, ValueError):
+            now_seconds = time.time()
+
+        active_records = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            punish = record.get("punish_info") or {}
+            if not isinstance(punish, dict):
+                punish = {}
+
+            if punish.get("is_permanent_punish"):
+                active_records.append(record)
+                continue
+
+            start_time = punish.get("punish_start_time") or 0
+            try:
+                start_time = int(start_time or 0)
+            except (TypeError, ValueError):
+                start_time = 0
+
+            end_candidates = [
+                punish.get("punish_end_time"),
+                punish.get("punish_expected_end_time"),
+                punish.get("punish_real_end_time"),
+            ]
+            end_times = []
+            for end_time in end_candidates:
+                try:
+                    end_time = int(end_time or 0)
+                except (TypeError, ValueError):
+                    end_time = 0
+                if end_time > 0:
+                    end_times.append(end_time)
+
+            # The endpoint returns history records too. Only keep punishments that are active now.
+            if not end_times:
+                if start_time and start_time <= now_seconds:
+                    active_records.append(record)
+                continue
+
+            latest_end = max(end_times)
+            if (not start_time or start_time <= now_seconds) and latest_end > now_seconds:
+                active_records.append(record)
+
+        return active_records
+
+    def _eco_violation_id(self, record):
+        punish = record.get("punish_info") or {}
+        return str(
+            record.get("violation_id_str")
+            or record.get("violation_id")
+            or punish.get("punish_record_id_str")
+            or punish.get("punish_record_id")
+            or punish.get("punish_id")
+            or ""
+        )
+
+    def _format_epoch_seconds(self, value):
+        try:
+            value = int(value or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if not value:
+            return ""
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
+        except Exception:
+            return str(value)
+
+    def _format_eco_violation_record(self, record):
+        punish = record.get("punish_info") or {}
+        live_info = record.get("live_info") or {}
+        title = punish.get("punish_title") or "Violation"
+        reason = punish.get("punish_reason") or punish.get("perception_code") or "Unknown reason"
+        room_title = live_info.get("title") or ""
+        end_time = self._format_epoch_seconds(
+            punish.get("punish_end_time")
+            or punish.get("punish_expected_end_time")
+            or punish.get("punish_real_end_time")
+        )
+        parts = [str(title), str(reason)]
+        if room_title:
+            parts.append(f"Room: {room_title}")
+        if end_time:
+            parts.append(f"Until: {end_time}")
+        return " | ".join(parts)
+
+    def _is_active_perception_status(self, item):
+        status = item.get("status")
+        punish = item.get("punish_event") or {}
+        if status not in (0, "0", None, ""):
+            return True
+        for key in ("punish_id", "punish_reason", "punish_type", "show_reason"):
+            if punish.get(key):
+                return True
+        end_time = punish.get("end_time")
+        try:
+            return bool(end_time and int(end_time) > int(time.time()))
+        except (TypeError, ValueError):
+            return False
+
+    def _format_perception_violation_status(self, item):
+        scene = item.get("scene")
+        if item.get("active"):
+            punish = item.get("punish_event") or {}
+            reason = punish.get("show_reason") or punish.get("punish_reason") or punish.get("punish_type") or "Active"
+            end_time = self._format_epoch_seconds(punish.get("end_time"))
+            if end_time:
+                return f"Scene {scene}: {reason} until {end_time}"
+            return f"Scene {scene}: {reason}"
+        return f"Scene {scene}: OK"
+
+    def getPerceptionViolationStatus(self, device_id="", install_id="", priority_region="", scene=10):
+        params = self._studio_params(
+            device_id=device_id,
+            install_id=install_id,
+            priority_region=priority_region,
+        )
+        params["scene"] = str(scene)
+
+        payload = self._signed_get_json(
+            self.getServerUrl() + "webcast/perception/violation/status/",
+            params=params,
+            priority_region=params.get("priority_region", ""),
+        )
+        _raise_for_webcast_error(payload, f"Perception violation status scene {scene}")
+
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        punish = data.get("punish_event") or {}
+        item = {
+            "scene": scene,
+            "status": data.get("status"),
+            "punish_event": punish,
+            "active": False,
+            "raw": payload,
+        }
+        item["active"] = self._is_active_perception_status(item)
+        item["summary"] = self._format_perception_violation_status(item)
+        return item
+
+    def getEcoViolationList(self, device_id="", install_id="", priority_region="", violation_list_type=1):
+        # This endpoint uses the eco/live-center app id from the official request, not aid 8311.
+        params = {
+            "aid": "304449",
+            "violation_list_type": str(violation_list_type),
+        }
+        url = build_endpoint("webcast16-normal-no1a.tiktokv.eu", "webcast/eco/violation_list/", self.s)
+        payload = self._signed_get_json(
+            url,
+            params=params,
+            priority_region=self._effective_priority_region(priority_region),
+        )
+        _raise_for_webcast_error(payload, "Eco violation list")
+
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        active_records = self._active_eco_violation_records(payload)
+        return {
+            "active_count": data.get("active_count", len(active_records)),
+            "history_count": data.get("history_count"),
+            "is_eea": data.get("is_eea"),
+            "has_more": data.get("has_more"),
+            "records": data.get("records") or [],
+            "active_records": active_records,
+            "active_ids": [self._eco_violation_id(record) for record in active_records if self._eco_violation_id(record)],
+            "active_summaries": [self._format_eco_violation_record(record) for record in active_records],
+            "raw": payload,
+        }
+
+    def getViolationStatus(self, device_id="", install_id="", priority_region="", room_id="", last_time_hashtag_id="5"):
+        room_id = str(room_id or self.roomId or "").strip()
+        errors = []
+        create_data = {}
+        try:
+            create_info = self.getCreateRoomInfo(
+                device_id=device_id,
+                install_id=install_id,
+                priority_region=priority_region,
+                last_time_hashtag_id=last_time_hashtag_id,
+            )
+            create_data = self._payload_data(create_info)
+        except Exception as exc:
+            errors.append(f"create_info: {exc}")
+
+        room_info = {"room": {}, "perception_info": {}, "room_auth": {}}
+        if room_id:
+            try:
+                room_info = self.getRoomInfo(
+                    device_id=device_id,
+                    install_id=install_id,
+                    priority_region=priority_region,
+                    room_id=room_id,
+                )
+            except Exception as exc:
+                errors.append(f"room_info: {exc}")
+
+        perception_statuses = []
+        for scene in PERCEPTION_VIOLATION_SCENES:
+            try:
+                perception_statuses.append(
+                    self.getPerceptionViolationStatus(
+                        device_id=device_id,
+                        install_id=install_id,
+                        priority_region=priority_region,
+                        scene=scene,
+                    )
+                )
+            except Exception as exc:
+                errors.append(f"perception_scene_{scene}: {exc}")
+
+        perception_countdown = self._safe_signed_get(
+            "webcast/perception/count_down/",
+            params=self._studio_params(
+                device_id=device_id,
+                install_id=install_id,
+                priority_region=priority_region,
+            ),
+            priority_region=priority_region,
+            action="Perception countdown",
+        )
+        if not perception_countdown.get("ok") and perception_countdown.get("error"):
+            errors.append(f"perception_countdown: {perception_countdown['error']}")
+
+        eco_violation_list = {"active_records": [], "active_ids": [], "active_summaries": [], "active_count": 0, "history_count": None}
+        try:
+            eco_violation_list = self.getEcoViolationList(
+                device_id=device_id,
+                install_id=install_id,
+                priority_region=priority_region,
+                violation_list_type=1,
+            )
+        except Exception as exc:
+            errors.append(f"eco_violation_list: {exc}")
+
+        ban_status = create_data.get("ban_status") or {}
+        advanced_ban_status = create_data.get("advanced_live_ban_status") or {}
+        block_status = create_data.get("block_status", 0)
+        locale_restricted = bool(create_data.get("golive_locale_restricted", False))
+        ban_active = bool(ban_status.get("is_ban") or advanced_ban_status.get("is_ban"))
+        blocked = block_status not in (0, "0", None, "")
+
+        room_auth = room_info.get("room_auth") or {}
+        perception_info = room_info.get("perception_info") or {}
+        community_flagged = bool(room_auth.get("CommunityFlagged"))
+        community_review = bool(room_auth.get("CommunityFlaggedReview"))
+        violations_entrance = bool(perception_info.get("show_violations_entrance"))
+        violations_entrance_end_time = perception_info.get("violations_entrance_end_time")
+
+        active_perception_statuses = [item for item in perception_statuses if item.get("active")]
+        active_eco_records = eco_violation_list.get("active_records") or []
+        active_eco_summaries = eco_violation_list.get("active_summaries") or []
+        active_violation_ids = set(eco_violation_list.get("active_ids") or [])
+        for item in active_perception_statuses:
+            active_violation_ids.add(f"perception_scene_{item.get('scene')}")
+
+        status = "OK"
+        if active_eco_records or active_perception_statuses or ban_active or blocked or locale_restricted:
+            status = "Restricted"
+        elif community_flagged or community_review or violations_entrance:
+            status = "Warning"
+
+        return {
+            "status": status,
+            "ban_active": ban_active,
+            "ban_summary": self._summarize_payload({"data": ban_status}) if ban_status else "None",
+            "advanced_ban_active": bool(advanced_ban_status.get("is_ban")),
+            "advanced_ban_summary": self._summarize_payload({"data": advanced_ban_status}) if advanced_ban_status else "None",
+            "block_status": block_status,
+            "locale_restricted": locale_restricted,
+            "community_flagged": community_flagged,
+            "community_review": community_review,
+            "violations_entrance": violations_entrance,
+            "violations_entrance_end_time": violations_entrance_end_time,
+            "perception_summary": perception_countdown.get("summary", "Unavailable"),
+            "perception_violation_statuses": perception_statuses,
+            "active_perception_statuses": active_perception_statuses,
+            "eco_violation_list": eco_violation_list,
+            "active_violation_count": len(active_eco_records) + len(active_perception_statuses),
+            "active_violation_ids": sorted(active_violation_ids),
+            "active_violation_summaries": active_eco_summaries + [item.get("summary", "") for item in active_perception_statuses],
+            "history_violation_count": eco_violation_list.get("history_count"),
+            "errors": errors,
+            "raw": {
+                "create_info": create_data,
+                "room_info": room_info,
+                "perception_countdown": perception_countdown,
+                "perception_violation_statuses": perception_statuses,
+                "eco_violation_list": eco_violation_list,
+            },
+        }
+
     def getServerUrl(self):
         return resolve_webcast_base_url(self.s)
 
@@ -1371,7 +1862,8 @@ class LiveStudioBrowserLoginClient:
             raise RuntimeError(f"Login failed: {message}{f' ({details})' if details else ''}")
         return payload
 
-    def save_cookies(self, path="cookies.json"):
+    def save_cookies(self, path=None):
+        path = _normalize_configured_path(path or _configured_cookies_path())
         cookies = _export_cookie_jar(self.session.cookies)
         session_names = {"sessionid", "sessionid_ss", "sid_tt", "sid_guard", "multi_sids"}
         if not any(cookie.get("name") in session_names for cookie in cookies):
@@ -1587,7 +2079,10 @@ class StreamKeyGeneratorWindow(QWidget):
     account_info_failed = Signal(str)
     realtime_stats_loaded = Signal(object)
     realtime_stats_failed = Signal(str)
+    audience_safety_loaded = Signal(object)
+    audience_safety_failed = Signal(str)
     stream_ended_remotely = Signal(str)
+    new_violation_detected = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -1613,6 +2108,11 @@ class StreamKeyGeneratorWindow(QWidget):
         self.realtime_stats_timer = QTimer(self)
         self.realtime_stats_timer.setInterval(5000)
         self.realtime_stats_timer.timeout.connect(self.refresh_realtime_stats)
+        self.audience_safety_in_flight = False
+        self.audience_safety_timer = QTimer(self)
+        self.audience_safety_timer.setInterval(15000)
+        self.audience_safety_timer.timeout.connect(self.refresh_audience_safety)
+        self.current_anchor_id = ""
         self.ffmpeg_proxy_process = None
         self.ffmpeg_proxy_log_file = None
         self.ffmpeg_proxy_log_path = ""
@@ -1625,6 +2125,8 @@ class StreamKeyGeneratorWindow(QWidget):
         self.real_base_stream_url = ""
         self.real_stream_key = ""
         self.real_share_url = ""
+        self.active_violation_ids = set()
+        self.cookie_file_path = _configured_cookies_path()
 
         self._build_ui()
         self.update_checked.connect(self.handle_update_check)
@@ -1632,11 +2134,15 @@ class StreamKeyGeneratorWindow(QWidget):
         self.account_info_failed.connect(self.handle_account_info_error)
         self.realtime_stats_loaded.connect(self.apply_realtime_stats)
         self.realtime_stats_failed.connect(self.handle_realtime_stats_error)
+        self.audience_safety_loaded.connect(self.apply_audience_safety)
+        self.audience_safety_failed.connect(self.handle_audience_safety_error)
         self.stream_ended_remotely.connect(self.handle_stream_ended_remotely)
-        self.check_cookies()
+        self.new_violation_detected.connect(self.handle_new_violation_detected)
         self.load_config()
+        self.check_cookies()
         self.ensure_device_identifiers(show_popup=True)
-        if os.path.exists("cookies.json"):
+        has_startup_cookies, _ = self.get_cookie_file_status()
+        if has_startup_cookies:
             QTimer.singleShot(900, lambda: self.refresh_account_info(show_errors=False))
         QTimer.singleShot(3000, self.show_donation_reminder)
         QTimer.singleShot(6000, self.check_updates_on_startup)
@@ -1646,40 +2152,68 @@ class StreamKeyGeneratorWindow(QWidget):
         root_layout = QGridLayout(self)
         root_layout.setSpacing(8)
         root_layout.setContentsMargins(10, 8, 10, 8)
+        root_layout.setColumnMinimumWidth(0, 0)
+        root_layout.setColumnMinimumWidth(1, 0)
+        root_layout.setColumnMinimumWidth(2, 0)
 
-        input_group = QGroupBox("Input")
+        def allow_horizontal_shrink(widget, vertical_policy=QSizePolicy.Fixed):
+            widget.setMinimumWidth(0)
+            widget.setMinimumSize(0, widget.minimumHeight())
+            widget.setSizePolicy(QSizePolicy.Ignored, vertical_policy)
+
+        def allow_label_shrink(label):
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+        def allow_button_shrink(button):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+        def keep_button_visible(button, minimum_width=72):
+            button.setMinimumWidth(minimum_width)
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+
+        input_group = QGroupBox("Stream Setup")
+        input_group.setMinimumWidth(0)
+        input_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         input_layout = QVBoxLayout(input_group)
         input_layout.setSpacing(5)
 
         # Title
         title_label = QLabel("Title:")
         title_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(title_label)
         input_layout.addWidget(title_label)
 
         self.title_edit = QLineEdit()
         self.title_edit.setFixedHeight(28)
+        allow_horizontal_shrink(self.title_edit)
         input_layout.addWidget(self.title_edit)
 
         # Topic
         topic_label = QLabel("Topic:")
         topic_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(topic_label)
         input_layout.addWidget(topic_label)
 
         self.topic_combo = QComboBox()
         self.topic_combo.addItems([""] + list(TOPICS.values()))
         self.topic_combo.currentTextChanged.connect(self.on_topic_changed)
         self.topic_combo.setFixedHeight(28)
+        allow_horizontal_shrink(self.topic_combo)
         input_layout.addWidget(self.topic_combo)
 
         # Game
         self.game_label = QLabel("Game:")
         self.game_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(self.game_label)
         input_layout.addWidget(self.game_label)
 
         self.game_combo = QComboBox()
         self.game_combo.setEditable(True)
         self.game_combo.addItems([""] + list(self.games.values()))
         self.game_combo.setFixedHeight(28)
+        allow_horizontal_shrink(self.game_combo)
 
         game_completer = QCompleter(list(self.games.values()), self)
         game_completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -1691,36 +2225,48 @@ class StreamKeyGeneratorWindow(QWidget):
         # Region
         region_label = QLabel("Region:")
         region_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(region_label)
         input_layout.addWidget(region_label)
 
         self.region_combo = QComboBox()
         self.region_combo.setEditable(True)
         self.region_combo.addItems(REGIONS)
         self.region_combo.setFixedHeight(28)
+        allow_horizontal_shrink(self.region_combo)
         input_layout.addWidget(self.region_combo)
 
         # Options
         options_label = QLabel("Options:")
         options_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(options_label)
         input_layout.addWidget(options_label)
 
-        options_row = QHBoxLayout()
-        options_row.setSpacing(12)
+        options_grid = QGridLayout()
+        options_grid.setHorizontalSpacing(8)
+        options_grid.setVerticalSpacing(4)
         self.replay_checkbox = QCheckBox("Generate Replay")
         self.replay_checkbox.setChecked(True)
-        options_row.addWidget(self.replay_checkbox)
-
-        self.close_room_checkbox = QCheckBox("Close Room When Close Stream")
-        options_row.addWidget(self.close_room_checkbox)
+        self.replay_checkbox.setMinimumWidth(0)
+        self.replay_checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        options_grid.addWidget(self.replay_checkbox, 0, 0)
 
         self.age_restricted_checkbox = QCheckBox("Age Restricted")
-        options_row.addWidget(self.age_restricted_checkbox)
-        options_row.addStretch()
-        input_layout.addLayout(options_row)
+        self.age_restricted_checkbox.setMinimumWidth(0)
+        self.age_restricted_checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        options_grid.addWidget(self.age_restricted_checkbox, 0, 1)
+
+        self.close_room_checkbox = QCheckBox("Close Room When Close Stream")
+        self.close_room_checkbox.setMinimumWidth(0)
+        self.close_room_checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        options_grid.addWidget(self.close_room_checkbox, 1, 0, 1, 2)
+        options_grid.setColumnStretch(0, 1)
+        options_grid.setColumnStretch(1, 1)
+        input_layout.addLayout(options_grid)
 
         # Thumbnail
         thumbnail_label = QLabel("Selected Thumbnail:")
         thumbnail_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(thumbnail_label)
         input_layout.addWidget(thumbnail_label)
 
         thumbnail_row = QHBoxLayout()
@@ -1729,10 +2275,12 @@ class StreamKeyGeneratorWindow(QWidget):
         self.thumbnail_edit = QLineEdit()
         self.thumbnail_edit.setReadOnly(True)
         self.thumbnail_edit.setFixedHeight(28)
+        allow_horizontal_shrink(self.thumbnail_edit)
         thumbnail_row.addWidget(self.thumbnail_edit)
 
         browse_button = QPushButton("Browse")
         browse_button.setFixedHeight(28)
+        keep_button_visible(browse_button)
         browse_button.clicked.connect(self.browse_image)
         thumbnail_row.addWidget(browse_button)
 
@@ -1741,108 +2289,155 @@ class StreamKeyGeneratorWindow(QWidget):
         root_layout.addWidget(input_group, 0, 0)
 
         account_group = QGroupBox("Account")
-        account_layout = QGridLayout(account_group)
-        account_layout.setHorizontalSpacing(8)
-        account_layout.setVerticalSpacing(5)
+        account_group.setMinimumWidth(0)
+        account_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        account_layout = QVBoxLayout(account_group)
+        account_layout.setContentsMargins(12, 16, 12, 12)
+        account_layout.setSpacing(6)
+        account_layout.setAlignment(Qt.AlignTop)
 
-        def add_account_field(row, column, label_text, widget):
+        def add_account_field(label_text, widget):
             label = QLabel(label_text)
-            label.setMinimumWidth(70)
-            account_layout.addWidget(label, row, column)
-            account_layout.addWidget(widget, row, column + 1)
+            label.setStyleSheet("font-weight: bold;")
+            allow_label_shrink(label)
+            account_layout.addWidget(label)
+            account_layout.addWidget(widget)
 
-        self.cookies_status_label = QLabel("Checking cookies...")
-        account_layout.addWidget(QLabel("Cookies:"), 0, 0)
-        account_layout.addWidget(self.cookies_status_label, 0, 1, 1, 3)
+        session_label = QLabel("Cookies JSON")
+        session_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(session_label)
+        account_layout.addWidget(session_label)
+
+        cookies_row = QHBoxLayout()
+        cookies_row.setSpacing(6)
+
+        self.cookies_path_edit = QLineEdit()
+        self.cookies_path_edit.setFixedHeight(28)
+        self.cookies_path_edit.setPlaceholderText("cookies.json")
+        self.cookies_path_edit.editingFinished.connect(self.apply_cookies_path_from_input)
+        allow_horizontal_shrink(self.cookies_path_edit)
+        cookies_row.addWidget(self.cookies_path_edit, 1)
+
+        self.browse_cookies_button = QPushButton("Browse")
+        self.browse_cookies_button.setFixedHeight(28)
+        keep_button_visible(self.browse_cookies_button)
+        self.browse_cookies_button.clicked.connect(self.browse_cookies_file)
+        cookies_row.addWidget(self.browse_cookies_button)
+        account_layout.addLayout(cookies_row)
 
         self.account_username = QLineEdit()
         self.account_username.setReadOnly(True)
         self.account_username.setFixedHeight(28)
-        add_account_field(1, 0, "Username", self.account_username)
-
-        self.can_go_live_output = QLineEdit()
-        self.can_go_live_output.setReadOnly(True)
-        self.can_go_live_output.setFixedHeight(28)
-        add_account_field(1, 2, "Can Go Live", self.can_go_live_output)
+        allow_horizontal_shrink(self.account_username)
+        add_account_field("Username", self.account_username)
 
         self.account_user_id = QLineEdit()
         self.account_user_id.setReadOnly(True)
         self.account_user_id.setFixedHeight(28)
-        add_account_field(2, 0, "User ID", self.account_user_id)
+        allow_horizontal_shrink(self.account_user_id)
+        add_account_field("User ID", self.account_user_id)
+
+        self.can_go_live_output = QLineEdit()
+        self.can_go_live_output.setReadOnly(True)
+        self.can_go_live_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.can_go_live_output)
+        add_account_field("Can Go Live", self.can_go_live_output)
 
         self.account_status = QLineEdit()
         self.account_status.setReadOnly(True)
         self.account_status.setFixedHeight(28)
-        add_account_field(2, 2, "Status", self.account_status)
+        allow_horizontal_shrink(self.account_status)
+        add_account_field("Status", self.account_status)
 
         self.device_id_display = QLineEdit()
         self.device_id_display.setReadOnly(True)
         self.device_id_display.setFixedHeight(28)
-        add_account_field(3, 0, "Device ID", self.device_id_display)
+        allow_horizontal_shrink(self.device_id_display)
+        add_account_field("Device ID", self.device_id_display)
 
         self.install_id_display = QLineEdit()
         self.install_id_display.setReadOnly(True)
         self.install_id_display.setFixedHeight(28)
-        add_account_field(4, 0, "Install ID", self.install_id_display)
+        allow_horizontal_shrink(self.install_id_display)
+        add_account_field("Install ID", self.install_id_display)
 
         self.refresh_account_button = QPushButton("Refresh Account Info")
         self.refresh_account_button.clicked.connect(lambda: self.refresh_account_info())
         self.refresh_account_button.setFixedHeight(30)
-        account_layout.addWidget(self.refresh_account_button, 3, 2, 2, 2)
+        allow_button_shrink(self.refresh_account_button)
+        account_layout.addWidget(self.refresh_account_button)
 
-        account_layout.setColumnStretch(1, 1)
-        account_layout.setColumnStretch(3, 1)
+        account_layout.addStretch(1)
         root_layout.addWidget(account_group, 1, 0)
 
-        output_group = QGroupBox("Outputs")
+        output_group = QGroupBox("Stream Output & Monitoring")
+        output_group.setMinimumWidth(0)
+        output_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         output_layout = QVBoxLayout(output_group)
         output_layout.setSpacing(5)
 
-        # Buttons row
-        button_row = QHBoxLayout()
-        button_row.setSpacing(5)
+        controls_label = QLabel("Stream Controls")
+        controls_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(controls_label)
+        output_layout.addWidget(controls_label)
+
+        primary_controls_row = QHBoxLayout()
+        primary_controls_row.setSpacing(5)
 
         self.login_button = QPushButton("Login")
         self.login_button.clicked.connect(self.start_login)
         self.login_button.setFixedHeight(32)
-        button_row.addWidget(self.login_button)
+        allow_button_shrink(self.login_button)
+        primary_controls_row.addWidget(self.login_button)
 
         self.go_live_button = QPushButton("Go Live")
         self.go_live_button.clicked.connect(self.generate_stream)
         self.go_live_button.setFixedHeight(32)
-        button_row.addWidget(self.go_live_button)
+        allow_button_shrink(self.go_live_button)
+        primary_controls_row.addWidget(self.go_live_button)
+
+        output_layout.addLayout(primary_controls_row)
+
+        live_controls_row = QHBoxLayout()
+        live_controls_row.setSpacing(5)
 
         self.pause_live_button = QPushButton("Pause")
         self.pause_live_button.setEnabled(False)
         self.pause_live_button.clicked.connect(self.pause_stream)
         self.pause_live_button.setFixedHeight(32)
-        button_row.addWidget(self.pause_live_button)
+        allow_button_shrink(self.pause_live_button)
+        live_controls_row.addWidget(self.pause_live_button)
 
         self.resume_live_button = QPushButton("Resume")
         self.resume_live_button.setEnabled(False)
         self.resume_live_button.clicked.connect(self.resume_stream)
         self.resume_live_button.setFixedHeight(32)
-        button_row.addWidget(self.resume_live_button)
+        allow_button_shrink(self.resume_live_button)
+        live_controls_row.addWidget(self.resume_live_button)
 
         self.end_live_button = QPushButton("End Live")
         self.end_live_button.setEnabled(False)
         self.end_live_button.clicked.connect(self.end_stream)
         self.end_live_button.setFixedHeight(32)
-        button_row.addWidget(self.end_live_button)
+        allow_button_shrink(self.end_live_button)
+        live_controls_row.addWidget(self.end_live_button)
 
-        output_layout.addLayout(button_row)
+        output_layout.addLayout(live_controls_row)
 
         self.url_output = QLineEdit()
         self.url_output.setReadOnly(True)
         self.url_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.url_output)
 
         self.key_output = QLineEdit()
         self.key_output.setReadOnly(True)
         self.key_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.key_output)
 
         self.share_url_output = QLineEdit()
         self.share_url_output.setReadOnly(True)
         self.share_url_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.share_url_output)
 
         def add_output_row(label_text, output_widget, copy_label):
             label = QLabel(label_text)
@@ -1853,7 +2448,14 @@ class StreamKeyGeneratorWindow(QWidget):
             row.addWidget(output_widget)
             copy_button = QPushButton(copy_label)
             copy_button.setFixedHeight(28)
-            copy_button.clicked.connect(lambda: self.copy_to_clipboard(output_widget.text()))
+            copy_button.setProperty("copy_default_text", copy_label)
+            allow_button_shrink(copy_button)
+            copy_button.clicked.connect(
+                lambda checked=False, widget=output_widget, button=copy_button: self.copy_to_clipboard(
+                    widget.text(),
+                    button,
+                )
+            )
             row.addWidget(copy_button)
             output_layout.addLayout(row)
 
@@ -1865,14 +2467,17 @@ class StreamKeyGeneratorWindow(QWidget):
         proxy_row.setSpacing(5)
         proxy_label = QLabel("Proxy Status:")
         proxy_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(proxy_label)
         proxy_row.addWidget(proxy_label)
         self.proxy_status_output = QLineEdit()
         self.proxy_status_output.setReadOnly(True)
         self.proxy_status_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.proxy_status_output)
         proxy_row.addWidget(self.proxy_status_output)
         self.toggle_stream_credentials_button = QPushButton("Show Real TikTok URL")
         self.toggle_stream_credentials_button.setEnabled(False)
         self.toggle_stream_credentials_button.setFixedHeight(28)
+        allow_button_shrink(self.toggle_stream_credentials_button)
         self.toggle_stream_credentials_button.clicked.connect(self.toggle_stream_credentials_display)
         proxy_row.addWidget(self.toggle_stream_credentials_button)
         output_layout.addLayout(proxy_row)
@@ -1891,46 +2496,165 @@ class StreamKeyGeneratorWindow(QWidget):
         self.live_status_stats_output = QLineEdit()
         self.live_status_stats_output.setReadOnly(True)
         self.live_status_stats_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.live_status_stats_output)
         add_stats_field(0, 0, "Live", self.live_status_stats_output)
 
         self.live_viewer_count_output = QLineEdit()
         self.live_viewer_count_output.setReadOnly(True)
         self.live_viewer_count_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.live_viewer_count_output)
         add_stats_field(0, 2, "Live Viewers", self.live_viewer_count_output)
 
         self.viewer_count_output = QLineEdit()
         self.viewer_count_output.setReadOnly(True)
         self.viewer_count_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.viewer_count_output)
         add_stats_field(1, 0, "Views", self.viewer_count_output)
 
         self.like_count_output = QLineEdit()
         self.like_count_output.setReadOnly(True)
         self.like_count_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.like_count_output)
         add_stats_field(1, 2, "Likes", self.like_count_output)
 
         self.comment_count_output = QLineEdit()
         self.comment_count_output.setReadOnly(True)
         self.comment_count_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.comment_count_output)
         add_stats_field(2, 0, "Comments", self.comment_count_output)
 
         self.share_count_output = QLineEdit()
         self.share_count_output.setReadOnly(True)
         self.share_count_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.share_count_output)
         add_stats_field(2, 2, "Shares", self.share_count_output)
 
         self.new_fans_count_output = QLineEdit()
         self.new_fans_count_output.setReadOnly(True)
         self.new_fans_count_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.new_fans_count_output)
         add_stats_field(3, 0, "New Fans", self.new_fans_count_output)
 
         self.refresh_stats_button = QPushButton("Refresh Stats")
         self.refresh_stats_button.clicked.connect(lambda: self.refresh_realtime_stats(force=True))
         self.refresh_stats_button.setFixedHeight(28)
+        allow_button_shrink(self.refresh_stats_button)
         stats_layout.addWidget(self.refresh_stats_button, 4, 0, 1, 4)
 
         stats_layout.setColumnStretch(1, 1)
         stats_layout.setColumnStretch(3, 1)
         output_layout.addWidget(stats_group)
+
+        monitoring_group = QGroupBox("Audience & Safety")
+        monitoring_group.setMinimumWidth(0)
+        monitoring_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        monitoring_layout = QVBoxLayout(monitoring_group)
+        monitoring_layout.setSpacing(8)
+
+        audience_summary_group = QGroupBox("Online Audience")
+        audience_summary_layout = QGridLayout(audience_summary_group)
+        audience_summary_layout.setHorizontalSpacing(8)
+        audience_summary_layout.setVerticalSpacing(5)
+
+        def add_audience_field(row, column, label_text, widget):
+            label = QLabel(label_text)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            audience_summary_layout.addWidget(label, row, column)
+            audience_summary_layout.addWidget(widget, row, column + 1)
+
+        self.online_audience_total_output = QLineEdit()
+        self.online_audience_total_output.setReadOnly(True)
+        self.online_audience_total_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.online_audience_total_output)
+        add_audience_field(0, 0, "Total", self.online_audience_total_output)
+
+        self.online_audience_preview_output = QLineEdit()
+        self.online_audience_preview_output.setReadOnly(True)
+        self.online_audience_preview_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.online_audience_preview_output)
+        add_audience_field(0, 2, "Preview", self.online_audience_preview_output)
+
+        self.online_audience_table_output = QTableWidget(0, 5)
+        self.online_audience_table_output.setHorizontalHeaderLabels(["#", "Display ID", "Nickname", "Score", "Badges"])
+        self.online_audience_table_output.setAlternatingRowColors(True)
+        self.online_audience_table_output.setMinimumHeight(150)
+        self.online_audience_table_output.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.online_audience_table_output.verticalHeader().setVisible(False)
+        self.online_audience_table_output.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.online_audience_table_output.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.online_audience_table_output.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.online_audience_table_output.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.online_audience_table_output.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.online_audience_table_output.setWordWrap(False)
+        self.online_audience_table_output.setTextElideMode(Qt.ElideRight)
+        audience_summary_layout.addWidget(QLabel("Visible Audience"), 1, 0, 1, 4)
+        audience_summary_layout.addWidget(self.online_audience_table_output, 2, 0, 1, 4)
+        audience_summary_layout.setColumnStretch(1, 1)
+        audience_summary_layout.setColumnStretch(3, 1)
+        monitoring_layout.addWidget(audience_summary_group)
+
+        safety_group = QGroupBox("Safety")
+        safety_layout = QGridLayout(safety_group)
+        safety_layout.setHorizontalSpacing(8)
+        safety_layout.setVerticalSpacing(5)
+
+        def add_safety_field(row, column, label_text, widget):
+            label = QLabel(label_text)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            safety_layout.addWidget(label, row, column)
+            safety_layout.addWidget(widget, row, column + 1)
+
+        self.violation_status_output = QLineEdit()
+        self.violation_status_output.setReadOnly(True)
+        self.violation_status_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.violation_status_output)
+        add_safety_field(0, 0, "Status", self.violation_status_output)
+
+        self.community_status_output = QLineEdit()
+        self.community_status_output.setReadOnly(True)
+        self.community_status_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.community_status_output)
+        add_safety_field(0, 2, "Community", self.community_status_output)
+
+        self.ban_status_output = QLineEdit()
+        self.ban_status_output.setReadOnly(True)
+        self.ban_status_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.ban_status_output)
+        add_safety_field(1, 0, "Ban", self.ban_status_output)
+
+        self.perception_status_output = QLineEdit()
+        self.perception_status_output.setReadOnly(True)
+        self.perception_status_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.perception_status_output)
+        add_safety_field(1, 2, "Perception", self.perception_status_output)
+
+        self.violation_details_output = QTableWidget(0, 3)
+        self.violation_details_output.setHorizontalHeaderLabels(["Type", "Status", "Details"])
+        self.violation_details_output.setAlternatingRowColors(True)
+        self.violation_details_output.setMinimumHeight(170)
+        self.violation_details_output.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.violation_details_output.verticalHeader().setVisible(False)
+        self.violation_details_output.horizontalHeader().setStretchLastSection(True)
+        self.violation_details_output.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.violation_details_output.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.violation_details_output.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.violation_details_output.setWordWrap(True)
+        self.violation_details_output.setTextElideMode(Qt.ElideRight)
+        safety_layout.addWidget(QLabel("Details"), 2, 0, 1, 4)
+        safety_layout.addWidget(self.violation_details_output, 3, 0, 1, 4)
+
+        self.refresh_audience_safety_button = QPushButton("Refresh Audience / Safety")
+        self.refresh_audience_safety_button.clicked.connect(lambda: self.refresh_audience_safety(force=True))
+        self.refresh_audience_safety_button.setFixedHeight(28)
+        allow_button_shrink(self.refresh_audience_safety_button)
+        safety_layout.addWidget(self.refresh_audience_safety_button, 4, 0, 1, 4)
+        safety_layout.setColumnStretch(1, 1)
+        safety_layout.setColumnStretch(3, 1)
+        monitoring_layout.addWidget(safety_group)
+        monitoring_layout.addStretch()
+
 
         output_layout.addStretch()
 
@@ -1941,20 +2665,24 @@ class StreamKeyGeneratorWindow(QWidget):
         self.save_config_button = QPushButton("Save Config")
         self.save_config_button.clicked.connect(lambda: self.save_config())
         self.save_config_button.setFixedHeight(32)
+        allow_button_shrink(self.save_config_button)
         bottom_buttons.addWidget(self.save_config_button)
 
         self.donate_button = QPushButton("Donate")
         self.donate_button.setToolTip("Support development")
         self.donate_button.clicked.connect(self.open_donation_url)
         self.donate_button.setFixedHeight(32)
+        allow_button_shrink(self.donate_button)
         bottom_buttons.addWidget(self.donate_button)
 
         output_layout.addLayout(bottom_buttons)
 
         root_layout.addWidget(output_group, 0, 1, 2, 1)
+        root_layout.addWidget(monitoring_group, 0, 2, 2, 1)
 
         root_layout.setColumnStretch(0, 1)
         root_layout.setColumnStretch(1, 1)
+        root_layout.setColumnStretch(2, 1)
 
         self.on_topic_changed(self.topic_combo.currentText())
 
@@ -1993,19 +2721,35 @@ class StreamKeyGeneratorWindow(QWidget):
         if file_path:
             self.thumbnail_edit.setText(file_path)
 
-    def copy_to_clipboard(self, content):
+    def copy_to_clipboard(self, content, button=None):
         QGuiApplication.clipboard().setText(content)
-        self.show_info("Content copied to clipboard.")
+        if button is None:
+            return
+
+        original_text = button.property("copy_default_text") or button.text()
+        button.setProperty("copy_default_text", original_text)
+        button.setText("Copied!")
+        button.setEnabled(False)
+        QTimer.singleShot(1000, lambda: self.restore_copy_button(button, original_text))
+
+    def restore_copy_button(self, button, original_text):
+        try:
+            button.setText(original_text)
+            button.setEnabled(True)
+        except RuntimeError:
+            pass
 
     def clear_output_fields(self):
         self.url_output.clear()
         self.key_output.clear()
         self.share_url_output.clear()
         self.clear_realtime_stats_fields()
+        self.clear_audience_safety_fields()
         self.real_stream_url = ""
         self.real_base_stream_url = ""
         self.real_stream_key = ""
         self.real_share_url = ""
+        self.active_violation_ids = set()
         self.local_proxy_server_url = ""
         self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
         self.show_real_stream_credentials = False
@@ -2022,6 +2766,18 @@ class StreamKeyGeneratorWindow(QWidget):
         self.comment_count_output.clear()
         self.share_count_output.clear()
         self.new_fans_count_output.clear()
+
+    def clear_audience_safety_fields(self):
+        if not hasattr(self, "online_audience_total_output"):
+            return
+        self.online_audience_total_output.clear()
+        self.online_audience_preview_output.clear()
+        self.online_audience_table_output.setRowCount(0)
+        self.violation_status_output.clear()
+        self.community_status_output.clear()
+        self.ban_status_output.clear()
+        self.perception_status_output.clear()
+        self.violation_details_output.setRowCount(0)
 
     def format_stat_value(self, value):
         if value in (None, ""):
@@ -2048,7 +2804,7 @@ class StreamKeyGeneratorWindow(QWidget):
         if not self.is_live and not force:
             self.sync_realtime_stats_timer()
             return
-        if not os.path.exists("cookies.json"):
+        if not self.get_cookie_file_status()[0]:
             return
 
         self.realtime_stats_in_flight = True
@@ -2112,6 +2868,344 @@ class StreamKeyGeneratorWindow(QWidget):
         if message:
             print(f"Realtime stats refresh failed: {message}")
 
+    def sync_audience_safety_timer(self):
+        should_run = bool(self.is_live and self.current_room_id)
+        if should_run:
+            if not self.audience_safety_timer.isActive():
+                self.audience_safety_timer.start()
+        else:
+            self.audience_safety_timer.stop()
+
+    def _audience_entry_user(self, entry):
+        if not isinstance(entry, dict):
+            return {}
+        user = (
+            entry.get("user")
+            or entry.get("user_info")
+            or entry.get("owner")
+            or entry.get("account")
+            or entry.get("user_data")
+            or {}
+        )
+        return user if isinstance(user, dict) else {}
+
+    def _audience_badge_text(self, entry, user):
+        badge_values = []
+
+        def add_badge(value):
+            value = str(value or "").strip()
+            if value and value not in badge_values:
+                badge_values.append(value)
+
+        for source in (entry, user):
+            if not isinstance(source, dict):
+                continue
+
+            pay_grade = source.get("pay_grade") or {}
+            if isinstance(pay_grade, dict):
+                level = pay_grade.get("level") or pay_grade.get("grade")
+                if level not in (None, "", 0, "0"):
+                    add_badge(f"Lv {level}")
+
+            fans_club = source.get("fans_club_info") or source.get("fansclub_info") or {}
+            if isinstance(fans_club, dict):
+                level = fans_club.get("fans_level") or fans_club.get("level")
+                name = fans_club.get("fans_club_name") or fans_club.get("club_name")
+                if name and level not in (None, "", 0, "0"):
+                    add_badge(f"{name} Lv {level}")
+                elif name:
+                    add_badge(name)
+                elif level not in (None, "", 0, "0"):
+                    add_badge(f"Fans Lv {level}")
+
+            for badge in source.get("badge_list") or source.get("badges") or []:
+                if not isinstance(badge, dict):
+                    continue
+                combine = badge.get("combine") or {}
+                if isinstance(combine, dict):
+                    add_badge(combine.get("str") or combine.get("text"))
+                add_badge(
+                    badge.get("name")
+                    or badge.get("title")
+                    or badge.get("text")
+                    or badge.get("display_text")
+                    or badge.get("level")
+                )
+
+        return ", ".join(badge_values[:4])
+
+    def _audience_entry_fields(self, entry, index):
+        if not isinstance(entry, dict):
+            return {
+                "rank": index,
+                "display_id": str(entry),
+                "nickname": "",
+                "score": "",
+                "badges": "",
+            }
+
+        user = self._audience_entry_user(entry)
+        display_id = (
+            user.get("display_id")
+            or user.get("unique_id")
+            or user.get("username")
+            or entry.get("display_id")
+            or entry.get("unique_id")
+            or entry.get("username")
+            or user.get("id_str")
+            or entry.get("id_str")
+            or "Unknown"
+        )
+        nickname = (
+            user.get("nickname")
+            or user.get("nick_name")
+            or entry.get("nickname")
+            or entry.get("nick_name")
+            or ""
+        )
+        score = (
+            entry.get("score")
+            or entry.get("rank_score")
+            or entry.get("coin_count")
+            or entry.get("contribution")
+            or entry.get("value")
+            or entry.get("room_score")
+            or ""
+        )
+        rank = entry.get("rank") or entry.get("rank_index") or entry.get("rank_num") or index
+        return {
+            "rank": rank,
+            "display_id": display_id,
+            "nickname": nickname,
+            "score": score,
+            "badges": self._audience_badge_text(entry, user),
+        }
+
+    def _format_community_status(self, safety):
+        parts = []
+        if safety.get("community_flagged"):
+            parts.append("Flagged")
+        if safety.get("community_review"):
+            parts.append("Review")
+        return " / ".join(parts) if parts else "OK"
+
+    def _format_ban_status(self, safety):
+        parts = []
+        if safety.get("ban_active"):
+            parts.append("Banned")
+        if safety.get("advanced_ban_active"):
+            parts.append("Advanced ban")
+        block_status = safety.get("block_status")
+        if block_status not in (0, "0", None, ""):
+            parts.append(f"Blocked {block_status}")
+        if safety.get("locale_restricted"):
+            parts.append("Locale restricted")
+        return " / ".join(parts) if parts else "None"
+
+    def _format_perception_status(self, safety):
+        active = safety.get("active_perception_statuses") or []
+        if active:
+            return f"Active ({len(active)})"
+        if safety.get("violations_entrance"):
+            end_time = safety.get("violations_entrance_end_time")
+            return f"Warning until {end_time}" if end_time else "Warning"
+        summary = safety.get("perception_summary")
+        if summary and summary not in ("None", "Unavailable"):
+            return summary[:120]
+        return "OK"
+
+    def _set_table_item(self, table, row, column, text):
+        item = QTableWidgetItem(str(text or ""))
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        table.setItem(row, column, item)
+
+    def _add_safety_detail_row(self, detail_type, status, details):
+        row = self.violation_details_output.rowCount()
+        self.violation_details_output.insertRow(row)
+        self._set_table_item(self.violation_details_output, row, 0, detail_type)
+        self._set_table_item(self.violation_details_output, row, 1, status)
+        self._set_table_item(self.violation_details_output, row, 2, details)
+
+    def _populate_audience_list(self, ranks, notice):
+        self.online_audience_table_output.setRowCount(0)
+        self.online_audience_table_output.clearSpans()
+
+        if ranks:
+            for index, entry in enumerate(ranks[:50]):
+                fields = self._audience_entry_fields(entry, index + 1)
+                row = self.online_audience_table_output.rowCount()
+                self.online_audience_table_output.insertRow(row)
+                self._set_table_item(self.online_audience_table_output, row, 0, fields.get("rank"))
+                self._set_table_item(self.online_audience_table_output, row, 1, fields.get("display_id"))
+                self._set_table_item(self.online_audience_table_output, row, 2, fields.get("nickname"))
+                self._set_table_item(self.online_audience_table_output, row, 3, fields.get("score"))
+                self._set_table_item(self.online_audience_table_output, row, 4, fields.get("badges"))
+
+            if len(ranks) > 50:
+                row = self.online_audience_table_output.rowCount()
+                self.online_audience_table_output.insertRow(row)
+                self.online_audience_table_output.setSpan(row, 0, 1, 5)
+                self._set_table_item(self.online_audience_table_output, row, 0, f"... {len(ranks) - 50} more entries")
+            return
+
+        row = self.online_audience_table_output.rowCount()
+        self.online_audience_table_output.insertRow(row)
+        self.online_audience_table_output.setSpan(row, 0, 1, 5)
+        self._set_table_item(self.online_audience_table_output, row, 0, notice or "No visible audience entries.")
+
+    def refresh_audience_safety(self, force=False):
+        if self.audience_safety_in_flight:
+            return
+        if not self.current_room_id:
+            self.sync_audience_safety_timer()
+            return
+        if not self.is_live and not force:
+            self.sync_audience_safety_timer()
+            return
+        if not self.get_cookie_file_status()[0]:
+            return
+
+        self.audience_safety_in_flight = True
+        if force:
+            self.refresh_audience_safety_button.setEnabled(False)
+            self.refresh_audience_safety_button.setText("Refreshing...")
+
+        room_id = self.current_room_id
+        anchor_id = self.current_anchor_id or self.account_user_id.text().strip()
+        priority_region = self.stream_priority_region or self.region_combo.currentText()
+        topic_id = self.get_selected_topic_id() or "5"
+
+        def worker():
+            try:
+                with Stream() as stream:
+                    audience = stream.getOnlineAudience(
+                        device_id=self.device_id,
+                        install_id=self.install_id,
+                        priority_region=priority_region,
+                        room_id=room_id,
+                        anchor_id=anchor_id,
+                    )
+                    safety = stream.getViolationStatus(
+                        device_id=self.device_id,
+                        install_id=self.install_id,
+                        priority_region=priority_region,
+                        room_id=room_id,
+                        last_time_hashtag_id=topic_id,
+                    )
+                self.audience_safety_loaded.emit({"audience": audience, "safety": safety})
+            except Exception as exc:
+                self.audience_safety_failed.emit(str(exc))
+            finally:
+                self.audience_safety_in_flight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_audience_safety(self, result):
+        self.refresh_audience_safety_button.setEnabled(True)
+        self.refresh_audience_safety_button.setText("Refresh Audience / Safety")
+
+        audience = result.get("audience") or {}
+        safety = result.get("safety") or {}
+
+        self.online_audience_total_output.setText(self.format_stat_value(audience.get("total")))
+        self.online_audience_preview_output.setText(self.format_stat_value(audience.get("preview_count")))
+        ranks = audience.get("ranks") or []
+        self._populate_audience_list(ranks, audience.get("bottom_notice"))
+
+        self.violation_status_output.setText(str(safety.get("status") or "Unknown"))
+        self.community_status_output.setText(self._format_community_status(safety))
+        self.ban_status_output.setText(self._format_ban_status(safety))
+        self.perception_status_output.setText(self._format_perception_status(safety))
+
+        active_summaries = safety.get("active_violation_summaries") or []
+        active_ids = set(safety.get("active_violation_ids") or [])
+        new_ids = active_ids - self.active_violation_ids
+        if new_ids:
+            first_summary = active_summaries[0] if active_summaries else "A new LIVE violation was detected."
+            self.new_violation_detected.emit(first_summary)
+        self.active_violation_ids = active_ids
+
+        active_count = safety.get("active_violation_count", 0) or 0
+        history_count = safety.get("history_violation_count")
+        self.violation_details_output.setRowCount(0)
+        self._add_safety_detail_row("Active", self.format_stat_value(active_count), "No active violations" if not active_count else "Active moderation item detected")
+        if history_count not in (None, ""):
+            self._add_safety_detail_row("History", self.format_stat_value(history_count), "Past records hidden from active status")
+
+        if active_summaries:
+            for line in active_summaries[:8]:
+                self._add_safety_detail_row("Violation", "Active", line)
+            if len(active_summaries) > 8:
+                self._add_safety_detail_row("Violation", "More", f"{len(active_summaries) - 8} more active items")
+
+        perception_statuses = safety.get("perception_violation_statuses") or []
+        for item in perception_statuses[:8]:
+            scene = item.get("scene", "")
+            status = item.get("status", "")
+            summary = item.get("summary", "")
+            self._add_safety_detail_row(f"Scene {scene}", status if status not in (None, "") else "OK", summary)
+
+        perception_countdown = safety.get("perception_summary") or "None"
+        if perception_countdown not in ("None", "Unavailable", ""):
+            self._add_safety_detail_row("Countdown", "Active", perception_countdown)
+
+        errors = safety.get("errors") or []
+        for error in errors[:4]:
+            self._add_safety_detail_row("Optional", "Unavailable", error)
+        if len(errors) > 4:
+            self._add_safety_detail_row("Optional", "More", f"{len(errors) - 4} more optional checks unavailable")
+
+        if self.violation_details_output.rowCount() == 0:
+            self._add_safety_detail_row("Status", "OK", "No safety details available yet")
+        self.violation_details_output.resizeRowsToContents()
+
+    def handle_audience_safety_error(self, message):
+        self.refresh_audience_safety_button.setEnabled(True)
+        self.refresh_audience_safety_button.setText("Refresh Audience / Safety")
+        if message:
+            print(f"Audience/safety refresh failed: {message}")
+
+    def flash_taskbar(self):
+        try:
+            QApplication.alert(self, 0)
+        except Exception:
+            pass
+
+        if sys.platform != "win32":
+            return
+
+        try:
+            import ctypes
+
+            hwnd = int(self.winId())
+            FLASHW_TRAY = 0x00000002
+            FLASHW_TIMERNOFG = 0x0000000C
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint),
+                    ("hwnd", ctypes.c_void_p),
+                    ("dwFlags", ctypes.c_uint),
+                    ("uCount", ctypes.c_uint),
+                    ("dwTimeout", ctypes.c_uint),
+                ]
+
+            info = FLASHWINFO(
+                ctypes.sizeof(FLASHWINFO),
+                ctypes.c_void_p(hwnd),
+                FLASHW_TRAY | FLASHW_TIMERNOFG,
+                5,
+                0,
+            )
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception as exc:
+            print(f"Failed to flash taskbar: {exc}")
+
+    def handle_new_violation_detected(self, summary):
+        self.flash_taskbar()
+        if summary:
+            print(f"New active LIVE violation detected: {summary}")
+
     def refresh_device_identifier_fields(self):
         self.device_id_display.setText(self.device_id)
         self.install_id_display.setText(self.install_id)
@@ -2152,12 +3246,121 @@ class StreamKeyGeneratorWindow(QWidget):
             if progress is not None:
                 progress.close()
 
-    def check_cookies(self):
-        has_cookies = os.path.exists("cookies.json")
+    def normalize_cookie_payload(self, payload):
+        if isinstance(payload, dict):
+            if isinstance(payload.get("cookies"), list):
+                payload = payload["cookies"]
+            elif isinstance(payload.get("Cookie"), list):
+                payload = payload["Cookie"]
+            elif "name" in payload and "value" in payload:
+                payload = [payload]
+            else:
+                raise RuntimeError("JSON file does not look like a cookies export.")
+
+        if not isinstance(payload, list):
+            raise RuntimeError("Cookies JSON must be a list of cookie objects.")
+
+        cookies = []
+        for index, cookie in enumerate(payload, 1):
+            if not isinstance(cookie, dict):
+                raise RuntimeError(f"Cookie entry #{index} is not an object.")
+
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if name in (None, "") or value is None:
+                continue
+
+            entry = dict(cookie)
+            entry["name"] = str(name)
+            entry["value"] = str(value)
+
+            if "expires" not in entry:
+                for key in ("expirationDate", "expiry", "expiration_date"):
+                    if key in entry:
+                        try:
+                            entry["expires"] = int(float(entry[key]))
+                        except (TypeError, ValueError):
+                            pass
+                        break
+
+            if "httpOnly" not in entry and "http_only" in entry:
+                entry["httpOnly"] = bool(entry.get("http_only"))
+            if "sameSite" not in entry and "same_site" in entry:
+                entry["sameSite"] = entry.get("same_site")
+
+            cookies.append(entry)
+
+        if not cookies:
+            raise RuntimeError("No usable cookies with name/value fields were found.")
+
+        return cookies
+
+    def load_cookie_entries_from_file(self, path):
+        with open(path, "r", encoding="utf-8-sig") as file:
+            payload = json.load(file)
+        return self.normalize_cookie_payload(payload)
+
+    def get_cookies_path(self):
+        return _normalize_configured_path(getattr(self, "cookie_file_path", "") or DEFAULT_COOKIES_PATH)
+
+    def set_cookies_path(self, path, *, save=True, refresh=True):
+        self.cookie_file_path = _normalize_configured_path(path or DEFAULT_COOKIES_PATH)
+        if hasattr(self, "cookies_path_edit"):
+            self.cookies_path_edit.blockSignals(True)
+            self.cookies_path_edit.setText(self.cookie_file_path)
+            self.cookies_path_edit.blockSignals(False)
+        if save:
+            self.save_config(show_message=False)
+        if refresh:
+            self.check_cookies()
+
+    def get_cookie_file_status(self):
+        cookie_path = self.get_cookies_path()
+        if not os.path.exists(cookie_path):
+            return False, f"Cookies file not found: {cookie_path}"
+
+        try:
+            cookies = self.load_cookie_entries_from_file(cookie_path)
+        except Exception as exc:
+            return False, f"Invalid cookies file: {exc}"
+
+        return True, f"Using {os.path.basename(cookie_path)} ({len(cookies)} cookies)"
+
+    def apply_cookies_path_from_input(self):
+        typed_path = self.cookies_path_edit.text().strip() if hasattr(self, "cookies_path_edit") else ""
+        self.set_cookies_path(typed_path or DEFAULT_COOKIES_PATH, save=True, refresh=True)
+        has_cookies, _ = self.get_cookie_file_status()
         if has_cookies:
-            self.cookies_status_label.setText("Cookies are loaded")
-        else:
-            self.cookies_status_label.setText("No cookies found")
+            self.refresh_account_info(show_errors=False)
+
+    def browse_cookies_file(self):
+        start_dir = os.path.dirname(self.get_cookies_path())
+        if not os.path.isdir(start_dir):
+            start_dir = ""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Cookies JSON",
+            start_dir,
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            self.load_cookie_entries_from_file(file_path)
+        except Exception as exc:
+            self.show_error(f"Invalid cookies JSON: {exc}")
+            return
+
+        self.set_cookies_path(file_path, save=True, refresh=True)
+        self.refresh_account_info(show_errors=False)
+
+    def check_cookies(self):
+        has_cookies, status_text = self.get_cookie_file_status()
+        if hasattr(self, "cookies_path_edit"):
+            self.cookies_path_edit.setToolTip(status_text)
+            self.cookies_path_edit.setStyleSheet("" if has_cookies else "border: 1px solid #c0392b;")
+        if not has_cookies:
             self.account_can_go_live = None
 
         self.login_button.setEnabled(True)
@@ -2287,7 +3490,7 @@ class StreamKeyGeneratorWindow(QWidget):
 
     def update_stream_controls(self, has_cookies=None):
         if has_cookies is None:
-            has_cookies = os.path.exists("cookies.json")
+            has_cookies = self.get_cookie_file_status()[0]
 
         can_start = has_cookies and not self.is_live
 
@@ -2296,6 +3499,8 @@ class StreamKeyGeneratorWindow(QWidget):
         self.resume_live_button.setEnabled(has_cookies and self.is_live and self.is_paused)
         self.end_live_button.setEnabled(has_cookies and self.is_live)
         self.refresh_stats_button.setEnabled(has_cookies and bool(self.current_room_id))
+        if hasattr(self, "refresh_audience_safety_button"):
+            self.refresh_audience_safety_button.setEnabled(has_cookies and bool(self.current_room_id))
         if hasattr(self, "toggle_stream_credentials_button"):
             self.toggle_stream_credentials_button.setEnabled(
                 bool(self.real_stream_url and self.local_proxy_active and self.local_proxy_server_url)
@@ -2309,6 +3514,8 @@ class StreamKeyGeneratorWindow(QWidget):
         self.real_share_url = getattr(stream, "streamShareUrl", "")
         self.current_room_id = getattr(stream, "roomId", "")
         self.current_stream_id = getattr(stream, "streamId", "")
+        self.current_anchor_id = getattr(stream, "ownerUserId", "")
+        self.active_violation_ids = set()
         if priority_region:
             self.stream_priority_region = str(priority_region).strip().lower()
 
@@ -2329,6 +3536,7 @@ class StreamKeyGeneratorWindow(QWidget):
                 )
 
         self.sync_realtime_stats_timer()
+        self.sync_audience_safety_timer()
 
     def sync_anchor_heartbeat_timer(self):
         should_run = bool(
@@ -2353,6 +3561,8 @@ class StreamKeyGeneratorWindow(QWidget):
         if not self.is_live:
             self.current_room_id = ""
             self.current_stream_id = ""
+            self.current_anchor_id = ""
+            self.active_violation_ids = set()
             self.stream_priority_region = ""
             self.anchor_ping_status = ANCHOR_STATUS_DEFAULT
             self.stop_ffmpeg_proxy(clear_status=True)
@@ -2362,6 +3572,7 @@ class StreamKeyGeneratorWindow(QWidget):
             self.anchor_ping_status = ANCHOR_STATUS_PREPARE
         self.sync_anchor_heartbeat_timer()
         self.sync_realtime_stats_timer()
+        self.sync_audience_safety_timer()
         self.update_stream_controls()
 
     def start_anchor_ping_loop(self, status=ANCHOR_STATUS_PREPARE, send_immediately=True):
@@ -2432,9 +3643,9 @@ class StreamKeyGeneratorWindow(QWidget):
             self.show_info(message)
 
     def refresh_account_info(self, show_errors=True):
-        if not os.path.exists("cookies.json"):
+        if not self.get_cookie_file_status()[0]:
             if show_errors:
-                self.show_error("cookies.json not found. Please login first.")
+                self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
             return
 
         if not self.ensure_device_identifiers(show_popup=show_errors):
@@ -2500,6 +3711,7 @@ class StreamKeyGeneratorWindow(QWidget):
             "age_restricted": self.age_restricted_checkbox.isChecked(),
             "device_id": self.device_id,
             "install_id": self.install_id,
+            "cookies_path": self.get_cookies_path() if hasattr(self, "get_cookies_path") else _configured_cookies_path(),
             "suppress_donation_reminder": self.suppress_donation_reminder,
         }
 
@@ -2516,6 +3728,11 @@ class StreamKeyGeneratorWindow(QWidget):
         except FileNotFoundError:
             self.device_id = ""
             self.install_id = ""
+            self.cookie_file_path = _normalize_configured_path(DEFAULT_COOKIES_PATH)
+            if hasattr(self, "cookies_path_edit"):
+                self.cookies_path_edit.blockSignals(True)
+                self.cookies_path_edit.setText(self.cookie_file_path)
+                self.cookies_path_edit.blockSignals(False)
             self.refresh_device_identifier_fields()
             return
 
@@ -2523,6 +3740,11 @@ class StreamKeyGeneratorWindow(QWidget):
         loaded_install_id = data.get("install_id", data.get("iid", ""))
         self.device_id = str(loaded_device_id).strip() if loaded_device_id is not None else ""
         self.install_id = str(loaded_install_id).strip() if loaded_install_id is not None else ""
+        self.cookie_file_path = _normalize_configured_path(data.get("cookies_path", self.cookie_file_path or DEFAULT_COOKIES_PATH))
+        if hasattr(self, "cookies_path_edit"):
+            self.cookies_path_edit.blockSignals(True)
+            self.cookies_path_edit.setText(self.cookie_file_path)
+            self.cookies_path_edit.blockSignals(False)
         self.suppress_donation_reminder = data.get("suppress_donation_reminder", False)
 
         if self.device_id == "0":
@@ -2674,7 +3896,7 @@ class StreamKeyGeneratorWindow(QWidget):
                 raise RuntimeError(f"Invalid callback URL: missing id_token or state. URL={result['url']}")
 
             client.exchange_login(id_token, state_from_callback, ticket)
-            client.save_cookies()
+            client.save_cookies(self.get_cookies_path())
             self.show_info("Login successful! Cookies have been saved.")
             self.check_cookies()
             self.refresh_account_info()
@@ -2787,7 +4009,8 @@ class StreamKeyGeneratorWindow(QWidget):
                         self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                         self.set_stream_state(is_live=True, is_paused=False)
                         self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
-                        self.show_info(f"Existing stream resumed successfully. OBS should stream to {self.local_proxy_server_url} with key {self.local_proxy_stream_key}.")
+                        self.refresh_audience_safety(force=True)
+                        self.show_info("Existing stream resumed successfully. Use the local OBS credentials shown in the output fields.")
                         return
 
                     if end_button is not None and clicked == end_button:
@@ -2846,9 +4069,10 @@ class StreamKeyGeneratorWindow(QWidget):
                     self.set_stream_state(is_live=True, is_paused=False)
                     self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
                     self.refresh_realtime_stats(force=True)
-                    self.show_info(f"Stream created successfully. OBS should stream to {self.local_proxy_server_url} with key {self.local_proxy_stream_key}.")
+                    self.refresh_audience_safety(force=True)
+                    self.show_info("Stream created successfully. Use the local OBS credentials shown in the output fields.")
         except FileNotFoundError:
-            self.show_error("cookies.json not found. Please login first.")
+            self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
         except RuntimeError as exc:
             self.show_error(str(exc))
         except Exception as exc:
@@ -2886,9 +4110,10 @@ class StreamKeyGeneratorWindow(QWidget):
                 self.anchor_ping_status = ANCHOR_STATUS_PAUSE
                 self.set_stream_state(is_live=True, is_paused=True)
                 self.refresh_realtime_stats(force=True)
+                self.refresh_audience_safety(force=True)
                 self.show_info("Stream paused successfully.")
         except FileNotFoundError:
-            self.show_error("cookies.json not found. Please login first.")
+            self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
         except RuntimeError as exc:
             self.show_error(str(exc))
         except Exception as exc:
@@ -2940,9 +4165,10 @@ class StreamKeyGeneratorWindow(QWidget):
                 self.anchor_ping_status = ANCHOR_STATUS_LIVING
                 self.set_stream_state(is_live=True, is_paused=False)
                 self.refresh_realtime_stats(force=True)
+                self.refresh_audience_safety(force=True)
                 self.show_info("Stream resumed successfully.")
         except FileNotFoundError:
-            self.show_error("cookies.json not found. Please login first.")
+            self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
         except RuntimeError as exc:
             if _is_already_ended_error(exc):
                 self.set_stream_state(is_live=False)
@@ -2982,7 +4208,7 @@ class StreamKeyGeneratorWindow(QWidget):
                     self.show_info("Stream ended successfully.")
                     self.clear_output_fields()
         except FileNotFoundError:
-            self.show_error("cookies.json not found. Please login first.")
+            self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
         except RuntimeError as exc:
             if _is_already_ended_error(exc):
                 stream_ended = True
