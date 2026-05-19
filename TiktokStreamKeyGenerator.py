@@ -52,6 +52,7 @@ from Libs.domain_routing import (
     build_common_headers,
     build_endpoint,
     get_synced_unix_seconds,
+    resolve_api_host_candidates,
     resolve_webcast_base_url,
     update_ntp_from_response,
 )
@@ -93,22 +94,7 @@ LIVE_STUDIO_CLIENT_ID = "abad793d-e940-42cb-bc89-e6939b1b3b4d"
 LIVE_STUDIO_REDIRECT_URI = "live-studio-app://login/continue"
 DEFAULT_OS_VERSION = "10.0.26200"
 PASSPORT_WEB_SDK_VERSION = "2.1.9"
-PASSPORT_LOGIN_QS = (
-    "6466666a706b715a76616e5a766a7077666029646c61296160736c66605a6c6129"
-    "63752969646b627064626029687069716c5a696a626c6b2976616e5a736077766c"
-    "6a6b297360776c637c4375"
-)
-PASSPORT_LOGIN_SIGN = "80ff2d507e22c30e2e75e91b2d27d09df5ca4a4e219938c4b2317b52cdf108a1"
-PASSPORT_QR_QS = (
-    "6466666a706b715a76616e5a766a7077666029646c61296160736c66605a6c6129"
-    "76616e5a736077766c6a6b297360776c637c4375"
-)
-PASSPORT_QR_SIGN = "d4042aa32cda6b69425407aac537ff76e4a10b3bdb4e1c70d8ddf78c1cd7fcc6"
-PASSPORT_QR_CHECK_QS = (
-    "6466666a706b715a76616e5a766a7077666029646c61296160736c66605a6c6129"
-    "687069716c5a696a626c6b2976616e5a736077766c6a6b29716a6e606b297360776c637c4375"
-)
-PASSPORT_QR_CHECK_SIGN = "faf449d94af239a5b4ed8f2e7d72bf6a6e92b0368c18153d879006b4d11dc274"
+PASSPORT_APP_KEY = "884c28a44b61b78f9d837fc8b0967178"
 
 TT_TICKET_GUARD_PUBLIC_KEY = (
     "BHTyDu4GfY+Se8QoOlL22ARkOv4aLE5LBCk8eSiJ6K5N5m8Wg3cPeVYWVYNDrJ3hs"
@@ -143,6 +129,7 @@ def _application_dir():
 
 DEFAULT_COOKIES_PATH = os.path.join(_application_dir(), "cookies.json")
 CONFIG_PATH = os.path.join(_application_dir(), "config.json")
+RAPIDAPI_SIGNER_DOCS_URL = "https://rapidapi.com/07wael/api/tiktok-live-studio-api-signer"
 
 
 def _normalize_configured_path(path, default=DEFAULT_COOKIES_PATH):
@@ -166,6 +153,11 @@ def _load_config_file():
 def _configured_cookies_path(default=DEFAULT_COOKIES_PATH):
     data = _load_config_file()
     return _normalize_configured_path(data.get("cookies_path", default), default=default)
+
+
+def _configured_rapidapi_key():
+    data = _load_config_file()
+    return str(data.get("rapidapi_key", "") or "").strip()
 
 
 class WebcastError(RuntimeError):
@@ -1296,9 +1288,11 @@ class Stream:
         return item
 
     def getEcoViolationList(self, device_id="", install_id="", priority_region="", violation_list_type=1):
-        # This endpoint uses the eco/live-center app id from the official request, not aid 8311.
+        # Captured Live Studio-compatible request uses aid=8311 for this endpoint.
+        # The response may return records even when active_count/history_count are 0,
+        # so do not rely on those counters for GUI history/recent display.
         params = {
-            "aid": "304449",
+            "aid": "8311",
             "violation_list_type": str(violation_list_type),
         }
         url = build_endpoint("webcast16-normal-no1a.tiktokv.eu", "webcast/eco/violation_list/", self.s)
@@ -1312,16 +1306,39 @@ class Stream:
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         if not isinstance(data, dict):
             data = {}
+
+        records = data.get("records") or []
+        if not isinstance(records, list):
+            records = []
+
         active_records = self._active_eco_violation_records(payload)
+        active_ids = [
+            self._eco_violation_id(record)
+            for record in active_records
+            if self._eco_violation_id(record)
+        ]
+        recent_ids = [
+            self._eco_violation_id(record)
+            for record in records
+            if isinstance(record, dict) and self._eco_violation_id(record)
+        ]
+
         return {
-            "active_count": data.get("active_count", len(active_records)),
+            "server_active_count": data.get("active_count"),
+            "active_count": len(active_records),
+            "server_history_count": data.get("history_count"),
             "history_count": data.get("history_count"),
+            "record_count": len(records),
+            "recent_count": len(records),
             "is_eea": data.get("is_eea"),
             "has_more": data.get("has_more"),
-            "records": data.get("records") or [],
+            "records": records,
+            "recent_records": records,
             "active_records": active_records,
-            "active_ids": [self._eco_violation_id(record) for record in active_records if self._eco_violation_id(record)],
+            "active_ids": active_ids,
+            "recent_ids": recent_ids,
             "active_summaries": [self._format_eco_violation_record(record) for record in active_records],
+            "recent_summaries": [self._format_eco_violation_record(record) for record in records if isinstance(record, dict)],
             "raw": payload,
         }
 
@@ -1379,7 +1396,17 @@ class Stream:
         if not perception_countdown.get("ok") and perception_countdown.get("error"):
             errors.append(f"perception_countdown: {perception_countdown['error']}")
 
-        eco_violation_list = {"active_records": [], "active_ids": [], "active_summaries": [], "active_count": 0, "history_count": None}
+        eco_violation_list = {
+            "active_records": [],
+            "active_ids": [],
+            "active_summaries": [],
+            "active_count": 0,
+            "history_count": None,
+            "record_count": 0,
+            "recent_count": 0,
+            "recent_records": [],
+            "recent_summaries": [],
+        }
         try:
             eco_violation_list = self.getEcoViolationList(
                 device_id=device_id,
@@ -1437,6 +1464,8 @@ class Stream:
             "active_violation_ids": sorted(active_violation_ids),
             "active_violation_summaries": active_eco_summaries + [item.get("summary", "") for item in active_perception_statuses],
             "history_violation_count": eco_violation_list.get("history_count"),
+            "recent_violation_count": eco_violation_list.get("record_count", 0),
+            "recent_violation_summaries": eco_violation_list.get("recent_summaries", []),
             "errors": errors,
             "raw": {
                 "create_info": create_data,
@@ -1473,19 +1502,15 @@ class Stream:
         )
 
         verify_fp = f"verify_{device_id}" if device_id else "verify_0"
-        account_params = {
-            "device_id": str(device_id) if device_id else "0",
-            "aid": "8311",
-            "account_sdk_source": "web",
-            "sdk_version": PASSPORT_WEB_SDK_VERSION,
-            "verifyFp": verify_fp,
-            "sign": PASSPORT_QR_SIGN,
-            "qs": PASSPORT_QR_QS,
-        }
-        # Official Account SDK starts from api.tiktokv.com and lets the
-        # routing layer pick the account's passport IDC. Using no1a directly
-        # breaks alisg accounts with "session expired" even when the session
-        # cookies are valid.
+        account_params = _apply_passport_sdk_signature(
+            {
+                "device_id": str(device_id) if device_id else "0",
+                "aid": "8311",
+                "account_sdk_source": "web",
+                "sdk_version": PASSPORT_WEB_SDK_VERSION,
+                "verifyFp": verify_fp,
+            }
+        )
         account_payload = self._signed_get_json(
             build_endpoint("api.tiktokv.com", "passport/account/info/v2/", self.s),
             params=account_params,
@@ -1603,6 +1628,118 @@ def _build_ticket_guard_headers():
     }
 
 
+def _passport_xor5_qs(keys):
+    raw = ",".join(keys).encode("utf-8")
+    return "".join(f"{byte ^ 5:02x}" for byte in raw)
+
+
+def _passport_stringify_value(value):
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return str(value)
+
+
+def _passport_sorted_string(values, limit=-1):
+    """
+    Python port of the Account SDK signing helper from the bundled JS.
+
+    The SDK sorts request keys, keeps the first 10 param keys, builds
+    key=value pairs without URL encoding, then signs:
+
+        param_string + "&" + body_string + "&app_key=" + appKey
+
+    In Live Studio's wrappers, navigation-only fields such as next/baseURL
+    are passed to SDK methods but are not part of the signed Passport params.
+    """
+    if not isinstance(values, dict):
+        return "", []
+
+    ignored = {"sign", "qs", "isResend", "next", "baseURL", "extra_params"}
+    keys = sorted(
+        str(key)
+        for key, value in values.items()
+        if value is not None and str(key) not in ignored
+    )
+    if limit >= 0:
+        keys = keys[:limit]
+
+    parts = []
+    for key in keys:
+        parts.append(f"{key}={_passport_stringify_value(values.get(key))}")
+    return "&".join(parts), keys
+
+
+def _passport_sdk_signature(params, data=None, app_key=PASSPORT_APP_KEY):
+    if not app_key:
+        return {}
+
+    param_string, signed_keys = _passport_sorted_string(params or {}, limit=10)
+    body_string, _ = _passport_sorted_string(data or {}, limit=-1)
+    base = f"{param_string}&{body_string}&app_key={app_key}"
+    return {
+        "sign": hashlib.md5(base.encode("utf-8")).hexdigest(),
+        "qs": _passport_xor5_qs(signed_keys),
+    }
+
+
+def _apply_passport_sdk_signature(params, data=None):
+    signed = dict(params or {})
+    signed.pop("sign", None)
+    signed.pop("qs", None)
+    signed.update(_passport_sdk_signature(signed, data=data))
+    return signed
+
+
+def _random_qr_client_secret(length=8):
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _inject_qr_client_secret(qrcode_index_url, client_secret):
+    if not qrcode_index_url or not client_secret:
+        return qrcode_index_url
+
+    decoded = urllib.parse.unquote(str(qrcode_index_url))
+    base, separator, query = decoded.partition("?")
+    if not separator:
+        return qrcode_index_url
+
+    values = urllib.parse.parse_qs(query, keep_blank_values=True)
+    next_url = (values.get("next_url") or [""])[0]
+    if not next_url:
+        return qrcode_index_url
+
+    joiner = "&" if "?" in next_url else "?"
+    values["next_url"] = [f"{next_url}{joiner}client_secret={urllib.parse.quote(client_secret)}"]
+    return base + "?" + urllib.parse.urlencode(values, doseq=True)
+
+
+def _qrcode_png_base64(value):
+    if not value:
+        return ""
+    try:
+        import io
+        import qrcode
+
+        image = qrcode.make(value)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+    except Exception:
+        return ""
+
+
+def _dedupe_hosts(hosts):
+    seen = set()
+    out = []
+    for host in hosts:
+        host = str(host or "").strip()
+        if host and host not in seen:
+            seen.add(host)
+            out.append(host)
+    return out
+
+
 def _build_onetap_auth_url(state, nonce, ticket):
     params = {
         "state": state,
@@ -1643,7 +1780,8 @@ class LiveStudioBrowserLoginClient:
         self.user_agent = f"Mozilla/{self.browser_version}"
         self.device_id = str(device_id).strip() if device_id else "0"
         self.install_id = str(install_id).strip() if install_id else "0"
-
+        self.qr_client_secret = ""
+        self.qr_domain = ""
         self._passport_domain = ""
 
         self.base_headers = {
@@ -1734,60 +1872,103 @@ class LiveStudioBrowserLoginClient:
             raise RuntimeError("Login request did not return JSON.") from exc
 
     def get_qrcode(self):
-        # Official Account SDK uses api.tiktokv.com as its base URL and lets
-        # the passport/domain layer route it. In captures this commonly lands
-        # on no1a for QR creation. We use api.tiktokv.com here so
-        # domain_routing.py can pick the authenticated/dispatch host when it can.
-        url = build_endpoint("api.tiktokv.com", "passport/web/get_qrcode/", self.session)
         verify_fp = f"verify_{self.device_id}"
-        params = {
-            "next": "https://www.tiktok.com",
-            "device_id": self.device_id,
-            "aid": "8311",
-            "account_sdk_source": "web",
-            "sdk_version": PASSPORT_WEB_SDK_VERSION,
-            "verifyFp": verify_fp,
-            "sign": PASSPORT_QR_SIGN,
-            "qs": PASSPORT_QR_QS,
-        }
-        payload = self._signed_request_json(
-            "GET",
-            url,
-            params=params,
-            include_x_ss_stub=False,
-            headers={"content-type": "application/x-www-form-urlencoded"},
+        params = _apply_passport_sdk_signature(
+            {
+                "next": "https://www.tiktok.com",
+                "device_id": self.device_id,
+                "aid": "8311",
+                "account_sdk_source": "web",
+                "sdk_version": PASSPORT_WEB_SDK_VERSION,
+                "verifyFp": verify_fp,
+            }
         )
-        data_payload = payload.get("data", {})
-        token = data_payload.get("token")
-        qrcode = data_payload.get("qrcode")
-        if not token or not qrcode:
-            raise RuntimeError(f"QR login setup failed: {payload}")
-        return data_payload
+
+        preferred_hosts = [
+            "api16-normal-no1a.tiktokv.eu",
+            "api16-normal-c-alisg.tiktokv.com",
+        ]
+        candidate_hosts = _dedupe_hosts(preferred_hosts + resolve_api_host_candidates(self.session))
+        last_payload = None
+        last_error = None
+
+        for host in candidate_hosts:
+            url = f"https://{host}/passport/web/get_qrcode/"
+            try:
+                payload = self._signed_request_json(
+                    "GET",
+                    url,
+                    params=params,
+                    include_x_ss_stub=False,
+                    headers={
+                        "accept": "application/json, text/javascript",
+                        "content-type": "application/x-www-form-urlencoded",
+                        "referer": "https://www.tiktok.com/ucenter_web/live_studio/login",
+                    },
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+
+            last_payload = payload
+            data_payload = payload.get("data", {}) if isinstance(payload, dict) else {}
+            token = data_payload.get("token")
+            qrcode_index_url = data_payload.get("qrcode_index_url") or ""
+            qrcode_b64 = data_payload.get("qrcode") or ""
+            if not token or not (qrcode_index_url or qrcode_b64):
+                continue
+
+            client_secret = _random_qr_client_secret()
+            patched_qrcode_index_url = _inject_qr_client_secret(qrcode_index_url, client_secret)
+            patched_qrcode_b64 = _qrcode_png_base64(patched_qrcode_index_url)
+
+            self.qr_client_secret = client_secret if patched_qrcode_b64 else ""
+            self.qr_domain = ""
+            self._passport_domain = host
+
+            data_payload = dict(data_payload)
+            data_payload["qrcode_index_url_original"] = qrcode_index_url
+            data_payload["qrcode_index_url"] = patched_qrcode_index_url or qrcode_index_url
+            data_payload["clientSecret"] = self.qr_client_secret
+            data_payload["domain"] = host
+            if patched_qrcode_b64:
+                data_payload["qrcode"] = patched_qrcode_b64
+            return data_payload
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"QR login setup failed: {last_payload}")
 
     def check_qrconnect(self, token):
-        # Official JS does not trust a single passport host. It checks the
-        # login-assurance domains in parallel and uses the domain that returns
-        # the scanned/confirmed QR state. This matters for accounts routed to
-        # alisg, where no1a can keep returning status=new and empty secret.
         verify_fp = f"verify_{self.device_id}"
-        params = {
-            "next": "https://www.tiktok.com",
-            "token": token,
-            "multi_login": "1",
-            "device_id": self.device_id,
-            "aid": "8311",
-            "account_sdk_source": "web",
-            "sdk_version": PASSPORT_WEB_SDK_VERSION,
-            "verifyFp": verify_fp,
-            "sign": PASSPORT_QR_CHECK_SIGN,
-            "qs": PASSPORT_QR_CHECK_QS,
-        }
+        params = _apply_passport_sdk_signature(
+            {
+                "next": "https://www.tiktok.com",
+                "token": token,
+                "multi_login": "1",
+                "device_id": self.device_id,
+                "aid": "8311",
+                "account_sdk_source": "web",
+                "sdk_version": PASSPORT_WEB_SDK_VERSION,
+                "verifyFp": verify_fp,
+            }
+        )
 
+        preferred_hosts = [
+            self.qr_domain,
+            self._passport_domain,
+            "api16-normal-c-alisg.tiktokv.com",
+            "api16-normal-useast8.tiktokv.us",
+            "api16-normal-useast5.tiktokv.us",
+            "api16-normal-no1a.tiktokv.eu",
+        ]
+        candidate_hosts = _dedupe_hosts(preferred_hosts + resolve_api_host_candidates(self.session))
+        expected_secret = str(self.qr_client_secret or "")
         best_payload = None
         best_rank = -1
         last_error = None
 
-        for host in _dedupe_hosts(PASSPORT_LOGIN_ASSURANCE_DOMAINS):
+        for host in candidate_hosts:
             url = f"https://{host}/passport/web/check_qrconnect/"
             try:
                 payload = self._signed_request_json(
@@ -1795,28 +1976,42 @@ class LiveStudioBrowserLoginClient:
                     url,
                     params=params,
                     include_x_ss_stub=False,
-                    headers={"content-type": "application/x-www-form-urlencoded"},
+                    headers={
+                        "accept": "application/json, text/javascript",
+                        "content-type": "application/x-www-form-urlencoded",
+                        "referer": "https://www.tiktok.com/ucenter_web/live_studio/login",
+                    },
                 )
             except Exception as exc:
                 last_error = exc
                 continue
 
-            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            data = payload.get("data", {})
             if not isinstance(data, dict):
                 data = {}
+
             status = data.get("status") or data.get("qr_status") or data.get("state")
-            client_secret = data.get("client_secret") or ""
+            client_secret = str(data.get("client_secret") or "")
+            secret_matches = bool(expected_secret and client_secret == expected_secret)
+            data["client_secret_match"] = secret_matches
             data["domain"] = host
             payload["data"] = data
 
-            if status == "confirmed":
+            if status == "confirmed" and (secret_matches or not expected_secret):
+                self.qr_domain = host
                 self._passport_domain = host
                 return payload
 
-            if status == "scanned" and client_secret:
-                rank = 3
+            if status == "scanned" and secret_matches:
+                rank = 4
             elif status == "scanned":
-                rank = 2
+                rank = 3
+            elif status == "confirmed":
+                # A confirmed response with the wrong/empty client_secret can happen on
+                # another IDC. Keep polling for the domain that saw our QR secret.
+                rank = 2 if expected_secret else 5
             elif status == "new":
                 rank = 1
             else:
@@ -1825,8 +2020,6 @@ class LiveStudioBrowserLoginClient:
             if rank > best_rank:
                 best_rank = rank
                 best_payload = payload
-                if status == "scanned":
-                    self._passport_domain = host
 
         if best_payload is not None:
             return best_payload
@@ -1835,27 +2028,28 @@ class LiveStudioBrowserLoginClient:
         return {"data": {"status": "new"}, "message": "No QR status response"}
 
     def account_info(self):
-        # After QR confirmation, the working official request uses the same
-        # passport domain that returned confirmed, for example c-alisg. Calling
-        # no1a with alisg session cookies returns "session expired".
-        host = self._passport_domain or "api.tiktokv.com"
-        url = build_endpoint(host, "passport/account/info/v2/", self.session)
+        host = self.qr_domain or self._passport_domain or "api16-normal-c-alisg.tiktokv.com"
+        url = f"https://{host}/passport/account/info/v2/"
         verify_fp = f"verify_{self.device_id}"
-        params = {
-            "device_id": self.device_id,
-            "aid": "8311",
-            "account_sdk_source": "web",
-            "sdk_version": PASSPORT_WEB_SDK_VERSION,
-            "verifyFp": verify_fp,
-            "sign": PASSPORT_QR_SIGN,
-            "qs": PASSPORT_QR_QS,
-        }
+        params = _apply_passport_sdk_signature(
+            {
+                "device_id": self.device_id,
+                "aid": "8311",
+                "account_sdk_source": "web",
+                "sdk_version": PASSPORT_WEB_SDK_VERSION,
+                "verifyFp": verify_fp,
+            }
+        )
         return self._signed_request_json(
             "GET",
             url,
             params=params,
             include_x_ss_stub=False,
-            headers={"content-type": "application/x-www-form-urlencoded"},
+            headers={
+                "accept": "application/json, text/javascript",
+                "content-type": "application/x-www-form-urlencoded",
+                "referer": "https://www.tiktok.com/ucenter_web/live_studio/login",
+            },
         )
 
     def prepare_login(self):
@@ -1879,25 +2073,27 @@ class LiveStudioBrowserLoginClient:
         return state, nonce, ticket
 
     def exchange_login(self, id_token, state, ticket):
-        url = build_endpoint("api16-normal-no1a.tiktokv.eu", "passport/oidc/login/", self.session)
+        host = self._passport_domain or "api16-normal-c-alisg.tiktokv.com"
+        url = f"https://{host}/passport/oidc/login/"
         verify_fp = f"verify_{self.device_id}"
-        params = {
-            "device_id": self.device_id,
-            "aid": "8311",
-            "account_sdk_source": "web",
-            "sdk_version": PASSPORT_WEB_SDK_VERSION,
-            "verifyFp": verify_fp,
-            "fp": verify_fp,
-            "language": "en",
-            "multi_login": "1",
-            "sign": PASSPORT_LOGIN_SIGN,
-            "qs": PASSPORT_LOGIN_QS,
-        }
         data = {
             "id_token": id_token,
             "ticket": ticket,
             "state": state,
         }
+        params = _apply_passport_sdk_signature(
+            {
+                "device_id": self.device_id,
+                "aid": "8311",
+                "account_sdk_source": "web",
+                "sdk_version": PASSPORT_WEB_SDK_VERSION,
+                "verifyFp": verify_fp,
+                "fp": verify_fp,
+                "language": "en",
+                "multi_login": "1",
+            },
+            data=data,
+        )
 
         payload = self._signed_request_json(
             "POST",
@@ -2187,6 +2383,7 @@ class StreamKeyGeneratorWindow(QWidget):
         self.real_share_url = ""
         self.active_violation_ids = set()
         self.cookie_file_path = _configured_cookies_path()
+        self.rapidapi_key = _configured_rapidapi_key()
 
         self._build_ui()
         self.update_checked.connect(self.handle_update_check)
@@ -2385,6 +2582,31 @@ class StreamKeyGeneratorWindow(QWidget):
         cookies_row.addWidget(self.browse_cookies_button)
         account_layout.addLayout(cookies_row)
 
+        rapidapi_label = QLabel("RapidAPI Key")
+        rapidapi_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(rapidapi_label)
+        account_layout.addWidget(rapidapi_label)
+
+        rapidapi_row = QHBoxLayout()
+        rapidapi_row.setSpacing(6)
+
+        self.rapidapi_key_edit = QLineEdit()
+        self.rapidapi_key_edit.setFixedHeight(28)
+        self.rapidapi_key_edit.setEchoMode(QLineEdit.Password)
+        self.rapidapi_key_edit.setPlaceholderText("Paste your RapidAPI key")
+        self.rapidapi_key_edit.editingFinished.connect(self.apply_rapidapi_key_from_input)
+        allow_horizontal_shrink(self.rapidapi_key_edit)
+        rapidapi_row.addWidget(self.rapidapi_key_edit, 1)
+
+        self.rapidapi_help_button = QPushButton("?")
+        self.rapidapi_help_button.setFixedHeight(28)
+        self.rapidapi_help_button.setToolTip("Open RapidAPI signer page")
+        keep_button_visible(self.rapidapi_help_button, minimum_width=32)
+        self.rapidapi_help_button.clicked.connect(self.open_rapidapi_signer_page)
+        rapidapi_row.addWidget(self.rapidapi_help_button)
+
+        account_layout.addLayout(rapidapi_row)
+
         self.account_username = QLineEdit()
         self.account_username.setReadOnly(True)
         self.account_username.setFixedHeight(28)
@@ -2430,7 +2652,7 @@ class StreamKeyGeneratorWindow(QWidget):
         account_layout.addStretch(1)
         root_layout.addWidget(account_group, 1, 0)
 
-        output_group = QGroupBox("Stream Output & Monitoring")
+        output_group = QGroupBox("Stream Output and Monitoring")
         output_group.setMinimumWidth(0)
         output_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         output_layout = QVBoxLayout(output_group)
@@ -2605,7 +2827,7 @@ class StreamKeyGeneratorWindow(QWidget):
         stats_layout.setColumnStretch(3, 1)
         output_layout.addWidget(stats_group)
 
-        monitoring_group = QGroupBox("Audience & Safety")
+        monitoring_group = QGroupBox("Audience and Safety")
         monitoring_group.setMinimumWidth(0)
         monitoring_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         monitoring_layout = QVBoxLayout(monitoring_group)
@@ -3187,16 +3409,26 @@ class StreamKeyGeneratorWindow(QWidget):
 
         active_count = safety.get("active_violation_count", 0) or 0
         history_count = safety.get("history_violation_count")
+        recent_count = safety.get("recent_violation_count", 0) or 0
+        recent_summaries = safety.get("recent_violation_summaries") or []
         self.violation_details_output.setRowCount(0)
         self._add_safety_detail_row("Active", self.format_stat_value(active_count), "No active violations" if not active_count else "Active moderation item detected")
-        if history_count not in (None, ""):
-            self._add_safety_detail_row("History", self.format_stat_value(history_count), "Past records hidden from active status")
+        self._add_safety_detail_row("Recent", self.format_stat_value(recent_count), "Records returned by violation_list" if recent_count else "No recent violation records")
+        if history_count not in (None, "") and str(history_count) != str(recent_count):
+            self._add_safety_detail_row("API history_count", self.format_stat_value(history_count), "Server counter, not used as the recent-record count")
 
         if active_summaries:
             for line in active_summaries[:8]:
                 self._add_safety_detail_row("Violation", "Active", line)
             if len(active_summaries) > 8:
                 self._add_safety_detail_row("Violation", "More", f"{len(active_summaries) - 8} more active items")
+
+        expired_recent = [line for line in recent_summaries if line not in active_summaries]
+        if expired_recent:
+            for line in expired_recent[:8]:
+                self._add_safety_detail_row("Violation", "Recent", line)
+            if len(expired_recent) > 8:
+                self._add_safety_detail_row("Violation", "More", f"{len(expired_recent) - 8} more recent items")
 
         perception_statuses = safety.get("perception_violation_statuses") or []
         for item in perception_statuses[:8]:
@@ -3414,6 +3646,26 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.set_cookies_path(file_path, save=True, refresh=True)
         self.refresh_account_info(show_errors=False)
+
+    def get_rapidapi_key(self):
+        if hasattr(self, "rapidapi_key_edit"):
+            return self.rapidapi_key_edit.text().strip()
+        return str(getattr(self, "rapidapi_key", "") or "").strip()
+
+    def set_rapidapi_key(self, key, *, save=True):
+        self.rapidapi_key = str(key or "").strip()
+        if hasattr(self, "rapidapi_key_edit"):
+            self.rapidapi_key_edit.blockSignals(True)
+            self.rapidapi_key_edit.setText(self.rapidapi_key)
+            self.rapidapi_key_edit.blockSignals(False)
+        if save:
+            self.save_config(show_message=False)
+
+    def apply_rapidapi_key_from_input(self):
+        self.set_rapidapi_key(self.get_rapidapi_key(), save=True)
+
+    def open_rapidapi_signer_page(self):
+        QDesktopServices.openUrl(QUrl(RAPIDAPI_SIGNER_DOCS_URL))
 
     def check_cookies(self):
         has_cookies, status_text = self.get_cookie_file_status()
@@ -3772,6 +4024,7 @@ class StreamKeyGeneratorWindow(QWidget):
             "device_id": self.device_id,
             "install_id": self.install_id,
             "cookies_path": self.get_cookies_path() if hasattr(self, "get_cookies_path") else _configured_cookies_path(),
+            "rapidapi_key": self.get_rapidapi_key() if hasattr(self, "get_rapidapi_key") else _configured_rapidapi_key(),
             "suppress_donation_reminder": self.suppress_donation_reminder,
         }
 
@@ -3789,10 +4042,15 @@ class StreamKeyGeneratorWindow(QWidget):
             self.device_id = ""
             self.install_id = ""
             self.cookie_file_path = _normalize_configured_path(DEFAULT_COOKIES_PATH)
+            self.rapidapi_key = ""
             if hasattr(self, "cookies_path_edit"):
                 self.cookies_path_edit.blockSignals(True)
                 self.cookies_path_edit.setText(self.cookie_file_path)
                 self.cookies_path_edit.blockSignals(False)
+            if hasattr(self, "rapidapi_key_edit"):
+                self.rapidapi_key_edit.blockSignals(True)
+                self.rapidapi_key_edit.setText(self.rapidapi_key)
+                self.rapidapi_key_edit.blockSignals(False)
             self.refresh_device_identifier_fields()
             return
 
@@ -3801,10 +4059,15 @@ class StreamKeyGeneratorWindow(QWidget):
         self.device_id = str(loaded_device_id).strip() if loaded_device_id is not None else ""
         self.install_id = str(loaded_install_id).strip() if loaded_install_id is not None else ""
         self.cookie_file_path = _normalize_configured_path(data.get("cookies_path", self.cookie_file_path or DEFAULT_COOKIES_PATH))
+        self.rapidapi_key = str(data.get("rapidapi_key", "") or "").strip()
         if hasattr(self, "cookies_path_edit"):
             self.cookies_path_edit.blockSignals(True)
             self.cookies_path_edit.setText(self.cookie_file_path)
             self.cookies_path_edit.blockSignals(False)
+        if hasattr(self, "rapidapi_key_edit"):
+            self.rapidapi_key_edit.blockSignals(True)
+            self.rapidapi_key_edit.setText(self.rapidapi_key)
+            self.rapidapi_key_edit.blockSignals(False)
         self.suppress_donation_reminder = data.get("suppress_donation_reminder", False)
 
         if self.device_id == "0":
@@ -4383,6 +4646,11 @@ class LoginDialog(QDialog):
             elif status == "scanned":
                 self.status_label.setText("Confirm login on your phone.")
             elif status == "confirmed":
+                expected_secret = getattr(self.client, "qr_client_secret", "")
+                returned_secret = str(data.get("client_secret") or "")
+                if expected_secret and returned_secret != expected_secret and not data.get("client_secret_match"):
+                    self.status_label.setText("Waiting for the matching login confirmation...")
+                    return
                 self.client.save_cookies()
                 self.parent_window.check_cookies()
                 self.parent_window.refresh_account_info()
