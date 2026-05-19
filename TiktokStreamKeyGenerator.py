@@ -143,6 +143,7 @@ def _application_dir():
 
 DEFAULT_COOKIES_PATH = os.path.join(_application_dir(), "cookies.json")
 CONFIG_PATH = os.path.join(_application_dir(), "config.json")
+RAPIDAPI_SIGNER_DOCS_URL = "https://rapidapi.com/07wael/api/tiktok-live-studio-api-signer"
 
 
 def _normalize_configured_path(path, default=DEFAULT_COOKIES_PATH):
@@ -166,6 +167,11 @@ def _load_config_file():
 def _configured_cookies_path(default=DEFAULT_COOKIES_PATH):
     data = _load_config_file()
     return _normalize_configured_path(data.get("cookies_path", default), default=default)
+
+
+def _configured_rapidapi_key():
+    data = _load_config_file()
+    return str(data.get("rapidapi_key", "") or "").strip()
 
 
 class WebcastError(RuntimeError):
@@ -2127,6 +2133,7 @@ class StreamKeyGeneratorWindow(QWidget):
         self.real_share_url = ""
         self.active_violation_ids = set()
         self.cookie_file_path = _configured_cookies_path()
+        self.rapidapi_key = _configured_rapidapi_key()
 
         self._build_ui()
         self.update_checked.connect(self.handle_update_check)
@@ -2324,6 +2331,31 @@ class StreamKeyGeneratorWindow(QWidget):
         self.browse_cookies_button.clicked.connect(self.browse_cookies_file)
         cookies_row.addWidget(self.browse_cookies_button)
         account_layout.addLayout(cookies_row)
+
+        rapidapi_label = QLabel("RapidAPI Key")
+        rapidapi_label.setStyleSheet("font-weight: bold;")
+        allow_label_shrink(rapidapi_label)
+        account_layout.addWidget(rapidapi_label)
+
+        rapidapi_row = QHBoxLayout()
+        rapidapi_row.setSpacing(6)
+
+        self.rapidapi_key_edit = QLineEdit()
+        self.rapidapi_key_edit.setFixedHeight(28)
+        self.rapidapi_key_edit.setEchoMode(QLineEdit.Password)
+        self.rapidapi_key_edit.setPlaceholderText("Paste your RapidAPI key")
+        self.rapidapi_key_edit.editingFinished.connect(self.apply_rapidapi_key_from_input)
+        allow_horizontal_shrink(self.rapidapi_key_edit)
+        rapidapi_row.addWidget(self.rapidapi_key_edit, 1)
+
+        self.rapidapi_help_button = QPushButton("?")
+        self.rapidapi_help_button.setFixedHeight(28)
+        self.rapidapi_help_button.setToolTip("Open RapidAPI signer page")
+        keep_button_visible(self.rapidapi_help_button, minimum_width=32)
+        self.rapidapi_help_button.clicked.connect(self.open_rapidapi_signer_page)
+        rapidapi_row.addWidget(self.rapidapi_help_button)
+
+        account_layout.addLayout(rapidapi_row)
 
         self.account_username = QLineEdit()
         self.account_username.setReadOnly(True)
@@ -3355,6 +3387,26 @@ class StreamKeyGeneratorWindow(QWidget):
         self.set_cookies_path(file_path, save=True, refresh=True)
         self.refresh_account_info(show_errors=False)
 
+    def get_rapidapi_key(self):
+        if hasattr(self, "rapidapi_key_edit"):
+            return self.rapidapi_key_edit.text().strip()
+        return str(getattr(self, "rapidapi_key", "") or "").strip()
+
+    def set_rapidapi_key(self, key, *, save=True):
+        self.rapidapi_key = str(key or "").strip()
+        if hasattr(self, "rapidapi_key_edit"):
+            self.rapidapi_key_edit.blockSignals(True)
+            self.rapidapi_key_edit.setText(self.rapidapi_key)
+            self.rapidapi_key_edit.blockSignals(False)
+        if save:
+            self.save_config(show_message=False)
+
+    def apply_rapidapi_key_from_input(self):
+        self.set_rapidapi_key(self.get_rapidapi_key(), save=True)
+
+    def open_rapidapi_signer_page(self):
+        QDesktopServices.openUrl(QUrl(RAPIDAPI_SIGNER_DOCS_URL))
+
     def check_cookies(self):
         has_cookies, status_text = self.get_cookie_file_status()
         if hasattr(self, "cookies_path_edit"):
@@ -3712,6 +3764,7 @@ class StreamKeyGeneratorWindow(QWidget):
             "device_id": self.device_id,
             "install_id": self.install_id,
             "cookies_path": self.get_cookies_path() if hasattr(self, "get_cookies_path") else _configured_cookies_path(),
+            "rapidapi_key": self.get_rapidapi_key() if hasattr(self, "get_rapidapi_key") else _configured_rapidapi_key(),
             "suppress_donation_reminder": self.suppress_donation_reminder,
         }
 
@@ -3729,10 +3782,15 @@ class StreamKeyGeneratorWindow(QWidget):
             self.device_id = ""
             self.install_id = ""
             self.cookie_file_path = _normalize_configured_path(DEFAULT_COOKIES_PATH)
+            self.rapidapi_key = ""
             if hasattr(self, "cookies_path_edit"):
                 self.cookies_path_edit.blockSignals(True)
                 self.cookies_path_edit.setText(self.cookie_file_path)
                 self.cookies_path_edit.blockSignals(False)
+            if hasattr(self, "rapidapi_key_edit"):
+                self.rapidapi_key_edit.blockSignals(True)
+                self.rapidapi_key_edit.setText(self.rapidapi_key)
+                self.rapidapi_key_edit.blockSignals(False)
             self.refresh_device_identifier_fields()
             return
 
@@ -3741,10 +3799,15 @@ class StreamKeyGeneratorWindow(QWidget):
         self.device_id = str(loaded_device_id).strip() if loaded_device_id is not None else ""
         self.install_id = str(loaded_install_id).strip() if loaded_install_id is not None else ""
         self.cookie_file_path = _normalize_configured_path(data.get("cookies_path", self.cookie_file_path or DEFAULT_COOKIES_PATH))
+        self.rapidapi_key = str(data.get("rapidapi_key", "") or "").strip()
         if hasattr(self, "cookies_path_edit"):
             self.cookies_path_edit.blockSignals(True)
             self.cookies_path_edit.setText(self.cookie_file_path)
             self.cookies_path_edit.blockSignals(False)
+        if hasattr(self, "rapidapi_key_edit"):
+            self.rapidapi_key_edit.blockSignals(True)
+            self.rapidapi_key_edit.setText(self.rapidapi_key)
+            self.rapidapi_key_edit.blockSignals(False)
         self.suppress_donation_reminder = data.get("suppress_donation_reminder", False)
 
         if self.device_id == "0":
