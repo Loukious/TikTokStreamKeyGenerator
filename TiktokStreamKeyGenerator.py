@@ -1891,22 +1891,42 @@ def _build_onetap_auth_url(state, nonce, ticket):
 
 def _export_cookie_jar(cookie_jar):
     cookies = []
-    for cookie in cookie_jar:
-        rest = cookie._rest or {}
+    iterable = getattr(cookie_jar, "jar", cookie_jar)
+
+    for cookie in iterable:
+        if isinstance(cookie, str):
+            value = cookie_jar.get(cookie) if hasattr(cookie_jar, "get") else ""
+            if value is None:
+                continue
+            cookies.append(
+                {
+                    "name": cookie,
+                    "value": value,
+                    "domain": "",
+                    "path": "/",
+                    "expires": -1,
+                    "httpOnly": False,
+                    "secure": False,
+                }
+            )
+            continue
+
+        rest = getattr(cookie, "_rest", None) or {}
         http_only = bool(rest.get("HttpOnly") or rest.get("httponly"))
         entry = {
-            "name": cookie.name,
-            "value": cookie.value,
-            "domain": cookie.domain or "",
-            "path": cookie.path or "/",
-            "expires": cookie.expires if cookie.expires is not None else -1,
+            "name": getattr(cookie, "name", ""),
+            "value": getattr(cookie, "value", ""),
+            "domain": getattr(cookie, "domain", "") or "",
+            "path": getattr(cookie, "path", "") or "/",
+            "expires": getattr(cookie, "expires", None) if getattr(cookie, "expires", None) is not None else -1,
             "httpOnly": http_only,
-            "secure": bool(cookie.secure),
+            "secure": bool(getattr(cookie, "secure", False)),
         }
         same_site = rest.get("SameSite") or rest.get("samesite")
         if same_site:
             entry["sameSite"] = same_site
-        cookies.append(entry)
+        if entry["name"]:
+            cookies.append(entry)
     return cookies
 
 
