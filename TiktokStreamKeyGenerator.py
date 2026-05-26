@@ -18,9 +18,15 @@ import subprocess
 from urllib.parse import urlencode
 
 import requests
+try:
+    from curl_cffi import requests as curl_requests
+    from curl_cffi.requests import exceptions as curl_exceptions
+except Exception:
+    curl_requests = None
+    curl_exceptions = None
 from packaging import version
 from PySide6.QtCore import Qt, QTimer, Signal, QUrl
-from PySide6.QtGui import QDesktopServices, QGuiApplication, QPixmap
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -62,9 +68,37 @@ from Libs.device_gen import (
     fetch_live_studio_latest_version,
     register_desktop_device_identifiers,
 )
-from Libs.XLadon import make_ladon
-from Libs.XArgus import make_x_argus
+from Libs.signers import TikTokSigners
 from Updater import VersionChecker
+
+
+CURL_CFFI_IMPERSONATE = "chrome"
+
+
+def _new_http_session():
+    if curl_requests is not None:
+        return curl_requests.Session(impersonate=CURL_CFFI_IMPERSONATE)
+    return requests.Session()
+
+
+def _http_get(url, **kwargs):
+    if curl_requests is not None:
+        return curl_requests.get(url, impersonate=CURL_CFFI_IMPERSONATE, **kwargs)
+    return requests.get(url, **kwargs)
+
+
+def _is_http_timeout(exc):
+    timeout_types = [requests.Timeout]
+    if curl_exceptions is not None:
+        timeout_types.append(curl_exceptions.Timeout)
+    return isinstance(exc, tuple(timeout_types))
+
+
+def _is_http_connection_error(exc):
+    connection_types = [requests.ConnectionError, requests.Timeout]
+    if curl_exceptions is not None:
+        connection_types.extend([curl_exceptions.ConnectionError, curl_exceptions.Timeout])
+    return isinstance(exc, tuple(connection_types))
 
 
 TOPICS = {
@@ -130,7 +164,7 @@ def _application_dir():
 
 DEFAULT_COOKIES_PATH = os.path.join(_application_dir(), "cookies.json")
 CONFIG_PATH = os.path.join(_application_dir(), "config.json")
-RAPIDAPI_SIGNER_DOCS_URL = "https://rapidapi.com/07wael/api/tiktok-live-studio-api-signer"
+RAPIDAPI_SIGNER_DOCS_URL = "https://rapidapi.com/Loukious/api/tiktok-live-studio-api-signer1"
 
 
 def _normalize_configured_path(path, default=DEFAULT_COOKIES_PATH):
@@ -220,16 +254,15 @@ def _param_value(params, name, default=None):
 
 
 def _build_signature_headers(timestamp, aid="8311", params=None, x_ss_stub=None):
-    argus_options = {"timestamp": timestamp, "aid": aid}
     device_id = _param_value(params, "device_id")
-    if device_id:
-        argus_options["device_id"] = str(device_id)
-
-    return {
-        "x-khronos": str(timestamp),
-        "x-ladon": make_ladon(timestamp, LADON_LOCAL_ID, aid),
-        "x-argus": make_x_argus(params, x_ss_stub, **argus_options),
-    }
+    return TikTokSigners.signature_headers(
+        timestamp,
+        aid,
+        params=params,
+        x_ss_stub=x_ss_stub,
+        device_id=device_id,
+        local_id=LADON_LOCAL_ID,
+    )
 
 
 def _encode_form_body(data):
@@ -331,7 +364,7 @@ def _encode_multipart_form_data(fields, files, boundary=None):
 
 class Stream:
     def __init__(self, cookies_path=None):
-        self.s = requests.session()
+        self.s = _new_http_session()
         self.s.headers.update(build_common_headers(self.s))
         self.roomId = ""
         self.streamId = ""
@@ -491,34 +524,26 @@ class Stream:
             "live_mode": "6",
         }
 
-    def _webcast_candidate_urls(self, url):
+    def _webcast_candidate_urls(self, url, priority_region=""):
         split = urllib.parse.urlsplit(url)
         current_host = split.netloc
         if not current_host or "webcast" not in current_host:
             return [url]
 
-        hosts = [current_host]
+        # Do not route Webcast by priority_region. Live Studio gets the real IDC
+        # from TNC/domain dispatch and session cookies. For alisg accounts, forcing
+        # priority_region=fr to no1a produces HTTP 403 on heartbeat/safety endpoints.
+        hosts = []
         try:
             hosts.extend(resolve_webcast_host_candidates(self.s))
         except Exception:
             pass
-
-        # Keep these as last-resort fallbacks because different Passport/Webcast
-        # sessions can land on different IDCs. Some endpoints reject the wrong IDC
-        # with a raw HTTP 403 instead of a JSON payload.
-        hosts.extend(
-            [
-                "webcast16-normal-c-alisg.tiktokv.com",
-                "webcast16-normal-no1a.tiktokv.eu",
-                "webcast16-normal-useast8.tiktokv.us",
-                "webcast16-normal-useast5.tiktokv.us",
-            ]
-        )
+        hosts.append(current_host)
 
         urls = []
         seen_hosts = set()
         for host in hosts:
-            host = str(host or "").strip()
+            host = str(host or "").strip().lower()
             if not host or host in seen_hosts:
                 continue
             seen_hosts.add(host)
@@ -536,7 +561,7 @@ class Stream:
         return urls or [url]
 
     def _is_retryable_request_error(self, exc):
-        if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        if _is_http_connection_error(exc):
             return True
         if isinstance(exc, WebcastError):
             if exc.status_code in (403, 404, 421, 429, 500, 502, 503, 504):
@@ -562,6 +587,64 @@ class Stream:
         if region:
             headers["x-tt-store-region"] = region
         return self._request_json_with_webcast_fallback("GET", url, params=params, headers=headers)
+
+    def _signed_post_json(self, url, *, params, payload, priority_region="", timeout=20):
+        self._apply_live_studio_headers()
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        x_ss_stub = _make_x_ss_stub(body)
+        timestamp = get_synced_unix_seconds()
+        headers = {
+            "content-type": "application/json",
+            "pragma": "no-cache",
+            "cache-control": "no-cache",
+            "x-ss-stub": x_ss_stub,
+            **_build_signature_headers(
+                timestamp,
+                params.get("aid", "8311"),
+                params=params,
+                x_ss_stub=x_ss_stub,
+            ),
+        }
+        region = params.get("priority_region") or self._effective_priority_region(priority_region)
+        if region:
+            headers["x-tt-store-region"] = region
+        return self._request_json_with_webcast_fallback(
+            "POST",
+            url,
+            params=params,
+            data=body,
+            headers=headers,
+            timeout=timeout,
+        )
+
+    def _signed_post_form(self, url, *, params, data, priority_region="", timeout=20):
+        self._apply_live_studio_headers()
+        body = _encode_form_body(data)
+        x_ss_stub = _make_x_ss_stub(body)
+        timestamp = get_synced_unix_seconds()
+        headers = {
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "pragma": "no-cache",
+            "cache-control": "no-cache",
+            "x-ss-stub": x_ss_stub,
+            **_build_signature_headers(
+                timestamp,
+                params.get("aid", "8311"),
+                params=params,
+                x_ss_stub=x_ss_stub,
+            ),
+        }
+        region = params.get("priority_region") or self._effective_priority_region(priority_region)
+        if region:
+            headers["x-tt-store-region"] = region
+        return self._request_json_with_webcast_fallback(
+            "POST",
+            url,
+            params=params,
+            data=body,
+            headers=headers,
+            timeout=timeout,
+        )
 
     def _request_json(
         self,
@@ -619,7 +702,10 @@ class Stream:
             ) from exc
 
     def _request_json_with_webcast_fallback(self, method, url, **kwargs):
-        candidate_urls = self._webcast_candidate_urls(url)
+        candidate_urls = self._webcast_candidate_urls(
+            url,
+            priority_region=(kwargs.get("params") or {}).get("priority_region", ""),
+        )
         last_error = None
 
         for index, candidate_url in enumerate(candidate_urls):
@@ -672,8 +758,6 @@ class Stream:
             "game_tag_id": str(game_tag_id),
             "game_bitrate_type": "high",
             "screenshot_cover_status": "1",
-            "live_sub_only": "0",
-            "chat_sub_only_auth": "2",
             "multi_stream_scene": "1" if multi_stream_scene else "0",
             "gift_auth": "1",
             "chat_l2": "1",
@@ -884,7 +968,9 @@ class Stream:
                     headers=request_headers,
                     timeout=PING_ANCHOR_TIMEOUT_SECONDS,
                 )
-            except requests.Timeout:
+            except Exception as exc:
+                if not _is_http_timeout(exc):
+                    raise
                 streamInfo = self._request_json_with_webcast_fallback(
                     "POST",
                     base_url + "webcast/room/ping/anchor/",
@@ -1334,65 +1420,12 @@ class Stream:
             parts.append(f"Until: {end_time}")
         return " | ".join(parts)
 
-    def _is_active_perception_status(self, item):
-        status = item.get("status")
-        punish = item.get("punish_event") or {}
-        if status not in (0, "0", None, ""):
-            return True
-        for key in ("punish_id", "punish_reason", "punish_type", "show_reason"):
-            if punish.get(key):
-                return True
-        end_time = punish.get("end_time")
-        try:
-            return bool(end_time and int(end_time) > int(time.time()))
-        except (TypeError, ValueError):
-            return False
-
-    def _format_perception_violation_status(self, item):
-        scene = item.get("scene")
-        if item.get("active"):
-            punish = item.get("punish_event") or {}
-            reason = punish.get("show_reason") or punish.get("punish_reason") or punish.get("punish_type") or "Active"
-            end_time = self._format_epoch_seconds(punish.get("end_time"))
-            if end_time:
-                return f"Scene {scene}: {reason} until {end_time}"
-            return f"Scene {scene}: {reason}"
-        return f"Scene {scene}: OK"
-
-    def getPerceptionViolationStatus(self, device_id="", install_id="", priority_region="", scene=10):
-        params = self._studio_params(
-            device_id=device_id,
-            install_id=install_id,
-            priority_region=priority_region,
-        )
-        params["scene"] = str(scene)
-
-        payload = self._signed_get_json(
-            self.getServerUrl() + "webcast/perception/violation/status/",
-            params=params,
-            priority_region=params.get("priority_region", ""),
-        )
-        _raise_for_webcast_error(payload, f"Perception violation status scene {scene}")
-
-        data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        if not isinstance(data, dict):
-            data = {}
-        punish = data.get("punish_event") or {}
-        item = {
-            "scene": scene,
-            "status": data.get("status"),
-            "punish_event": punish,
-            "active": False,
-            "raw": payload,
-        }
-        item["active"] = self._is_active_perception_status(item)
-        item["summary"] = self._format_perception_violation_status(item)
-        return item
-
     def getEcoViolationList(self, device_id="", install_id="", priority_region="", violation_list_type=1):
         # Captured Live Studio-compatible request uses aid=8311 for this endpoint.
-        # The response may return records even when active_count/history_count are 0,
-        # so do not rely on those counters for GUI history/recent display.
+        # violation_list_type=0 returns active violations; type=1 returns history.
+        # The response may return records even when counters are 0, so keep both
+        # server counters and actual record counts for display.
+        violation_list_type = int(violation_list_type)
         params = {
             "aid": "8311",
             "violation_list_type": str(violation_list_type),
@@ -1413,7 +1446,7 @@ class Stream:
         if not isinstance(records, list):
             records = []
 
-        active_records = self._active_eco_violation_records(payload)
+        active_records = records if violation_list_type == 0 else []
         active_ids = [
             self._eco_violation_id(record)
             for record in active_records
@@ -1426,6 +1459,7 @@ class Stream:
         ]
 
         return {
+            "violation_list_type": violation_list_type,
             "server_active_count": data.get("active_count"),
             "active_count": len(active_records),
             "server_history_count": data.get("history_count"),
@@ -1471,38 +1505,26 @@ class Stream:
             except Exception as exc:
                 errors.append(f"room_info: {exc}")
 
-        perception_statuses = []
-        for scene in PERCEPTION_VIOLATION_SCENES:
-            try:
-                perception_statuses.append(
-                    self.getPerceptionViolationStatus(
-                        device_id=device_id,
-                        install_id=install_id,
-                        priority_region=priority_region,
-                        scene=scene,
-                    )
-                )
-            except Exception as exc:
-                errors.append(f"perception_scene_{scene}: {exc}")
-
-        perception_countdown = self._safe_signed_get(
-            "webcast/perception/count_down/",
-            params=self._studio_params(
-                device_id=device_id,
-                install_id=install_id,
-                priority_region=priority_region,
-            ),
-            priority_region=priority_region,
-            action="Perception countdown",
-        )
-        if not perception_countdown.get("ok") and perception_countdown.get("error"):
-            errors.append(f"perception_countdown: {perception_countdown['error']}")
-
-        eco_violation_list = {
+        active_eco_violation_list = {
             "active_records": [],
             "active_ids": [],
             "active_summaries": [],
             "active_count": 0,
+            "server_active_count": None,
+            "server_history_count": None,
+            "history_count": None,
+            "record_count": 0,
+            "recent_count": 0,
+            "recent_records": [],
+            "recent_summaries": [],
+        }
+        history_eco_violation_list = {
+            "active_records": [],
+            "active_ids": [],
+            "active_summaries": [],
+            "active_count": 0,
+            "server_active_count": None,
+            "server_history_count": None,
             "history_count": None,
             "record_count": 0,
             "recent_count": 0,
@@ -1510,14 +1532,23 @@ class Stream:
             "recent_summaries": [],
         }
         try:
-            eco_violation_list = self.getEcoViolationList(
+            active_eco_violation_list = self.getEcoViolationList(
+                device_id=device_id,
+                install_id=install_id,
+                priority_region=priority_region,
+                violation_list_type=0,
+            )
+        except Exception as exc:
+            errors.append(f"active_eco_violation_list: {exc}")
+        try:
+            history_eco_violation_list = self.getEcoViolationList(
                 device_id=device_id,
                 install_id=install_id,
                 priority_region=priority_region,
                 violation_list_type=1,
             )
         except Exception as exc:
-            errors.append(f"eco_violation_list: {exc}")
+            errors.append(f"history_eco_violation_list: {exc}")
 
         ban_status = create_data.get("ban_status") or {}
         advanced_ban_status = create_data.get("advanced_live_ban_status") or {}
@@ -1533,18 +1564,19 @@ class Stream:
         violations_entrance = bool(perception_info.get("show_violations_entrance"))
         violations_entrance_end_time = perception_info.get("violations_entrance_end_time")
 
-        active_perception_statuses = [item for item in perception_statuses if item.get("active")]
-        active_eco_records = eco_violation_list.get("active_records") or []
-        active_eco_summaries = eco_violation_list.get("active_summaries") or []
-        active_violation_ids = set(eco_violation_list.get("active_ids") or [])
-        for item in active_perception_statuses:
-            active_violation_ids.add(f"perception_scene_{item.get('scene')}")
+        active_eco_records = active_eco_violation_list.get("active_records") or []
+        active_eco_summaries = active_eco_violation_list.get("active_summaries") or []
+        history_eco_records = history_eco_violation_list.get("recent_records") or history_eco_violation_list.get("records") or []
+        active_violation_ids = set(active_eco_violation_list.get("active_ids") or [])
 
-        status = "OK"
-        if active_eco_records or active_perception_statuses or ban_active or blocked or locale_restricted:
+        if active_eco_records:
+            status = "Active violation"
+        elif ban_active or blocked or locale_restricted:
             status = "Restricted"
         elif community_flagged or community_review or violations_entrance:
             status = "Warning"
+        else:
+            status = "OK"
 
         return {
             "status": status,
@@ -1558,23 +1590,27 @@ class Stream:
             "community_review": community_review,
             "violations_entrance": violations_entrance,
             "violations_entrance_end_time": violations_entrance_end_time,
-            "perception_summary": perception_countdown.get("summary", "Unavailable"),
-            "perception_violation_statuses": perception_statuses,
-            "active_perception_statuses": active_perception_statuses,
-            "eco_violation_list": eco_violation_list,
-            "active_violation_count": len(active_eco_records) + len(active_perception_statuses),
+            "eco_violation_list": history_eco_violation_list,
+            "active_eco_violation_list": active_eco_violation_list,
+            "history_eco_violation_list": history_eco_violation_list,
+            "active_violation_records": active_eco_records,
+            "history_violation_records": history_eco_records,
+            "active_violation_count": len(active_eco_records),
             "active_violation_ids": sorted(active_violation_ids),
-            "active_violation_summaries": active_eco_summaries + [item.get("summary", "") for item in active_perception_statuses],
-            "history_violation_count": eco_violation_list.get("history_count"),
-            "recent_violation_count": eco_violation_list.get("record_count", 0),
-            "recent_violation_summaries": eco_violation_list.get("recent_summaries", []),
+            "active_violation_summaries": active_eco_summaries,
+            "history_violation_count": (
+                history_eco_violation_list.get("history_count")
+                if history_eco_violation_list.get("history_count") not in (None, "")
+                else active_eco_violation_list.get("history_count")
+            ),
+            "recent_violation_count": history_eco_violation_list.get("record_count", 0),
+            "recent_violation_summaries": history_eco_violation_list.get("recent_summaries", []),
             "errors": errors,
             "raw": {
                 "create_info": create_data,
                 "room_info": room_info,
-                "perception_countdown": perception_countdown,
-                "perception_violation_statuses": perception_statuses,
-                "eco_violation_list": eco_violation_list,
+                "active_eco_violation_list": active_eco_violation_list,
+                "history_eco_violation_list": history_eco_violation_list,
             },
         }
 
@@ -1876,7 +1912,7 @@ def _export_cookie_jar(cookie_jar):
 
 class LiveStudioBrowserLoginClient:
     def __init__(self, device_id, install_id):
-        self.session = requests.Session()
+        self.session = _new_http_session()
         self.version = fetch_live_studio_latest_version(self.session)
         self.browser_version = build_live_studio_browser_version(self.version)
         self.user_agent = f"Mozilla/{self.browser_version}"
@@ -2237,7 +2273,7 @@ def fetch_game_tags():
     try:
         headers = build_common_headers()
         t0_ms = attach_webcast_ntp_t0(headers)
-        response = requests.get(
+        response = _http_get(
             url,
             headers=headers,
             timeout=15,
@@ -2470,6 +2506,9 @@ class StreamKeyGeneratorWindow(QWidget):
         self.audience_safety_timer = QTimer(self)
         self.audience_safety_timer.setInterval(15000)
         self.audience_safety_timer.timeout.connect(self.refresh_audience_safety)
+        self.ffmpeg_proxy_watch_timer = QTimer(self)
+        self.ffmpeg_proxy_watch_timer.setInterval(3000)
+        self.ffmpeg_proxy_watch_timer.timeout.connect(self.check_ffmpeg_proxy_health)
         self.current_anchor_id = ""
         self.ffmpeg_proxy_process = None
         self.ffmpeg_proxy_log_file = None
@@ -2478,12 +2517,14 @@ class StreamKeyGeneratorWindow(QWidget):
         self.local_proxy_server_url = ""
         self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
         self.local_proxy_active = False
+        self.local_proxy_starting = False
         self.show_real_stream_credentials = False
         self.real_stream_url = ""
         self.real_base_stream_url = ""
         self.real_stream_key = ""
         self.real_share_url = ""
         self.active_violation_ids = set()
+        self.last_active_violation_count = 0
         self.cookie_file_path = _configured_cookies_path()
         self.rapidapi_key = _configured_rapidapi_key()
 
@@ -2960,14 +3001,14 @@ class StreamKeyGeneratorWindow(QWidget):
         add_audience_field(0, 2, "Preview", self.online_audience_preview_output)
 
         self.online_audience_table_output = QTableWidget(0, 5)
-        self.online_audience_table_output.setHorizontalHeaderLabels(["#", "Display ID", "Nickname", "Score", "Badges"])
+        self.online_audience_table_output.setHorizontalHeaderLabels(["#", "Username", "Nickname", "Score", "Badges"])
         self.online_audience_table_output.setAlternatingRowColors(True)
         self.online_audience_table_output.setMinimumHeight(150)
         self.online_audience_table_output.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.online_audience_table_output.verticalHeader().setVisible(False)
         self.online_audience_table_output.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.online_audience_table_output.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.online_audience_table_output.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.online_audience_table_output.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.online_audience_table_output.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.online_audience_table_output.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.online_audience_table_output.setWordWrap(False)
@@ -3008,25 +3049,22 @@ class StreamKeyGeneratorWindow(QWidget):
         allow_horizontal_shrink(self.ban_status_output)
         add_safety_field(1, 0, "Ban", self.ban_status_output)
 
-        self.perception_status_output = QLineEdit()
-        self.perception_status_output.setReadOnly(True)
-        self.perception_status_output.setFixedHeight(28)
-        allow_horizontal_shrink(self.perception_status_output)
-        add_safety_field(1, 2, "Perception", self.perception_status_output)
-
-        self.violation_details_output = QTableWidget(0, 3)
-        self.violation_details_output.setHorizontalHeaderLabels(["Type", "Status", "Details"])
+        self.violation_details_output = QTableWidget(0, 5)
+        self.violation_details_output.setHorizontalHeaderLabels(["Room", "Violation", "Reason", "Start", "End"])
         self.violation_details_output.setAlternatingRowColors(True)
         self.violation_details_output.setMinimumHeight(170)
         self.violation_details_output.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.violation_details_output.verticalHeader().setVisible(False)
-        self.violation_details_output.horizontalHeader().setStretchLastSection(True)
-        self.violation_details_output.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.violation_details_output.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.violation_details_output.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        header = self.violation_details_output.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.violation_details_output.setWordWrap(True)
         self.violation_details_output.setTextElideMode(Qt.ElideRight)
-        safety_layout.addWidget(QLabel("Details"), 2, 0, 1, 4)
+        safety_layout.addWidget(QLabel("Violations"), 2, 0, 1, 4)
         safety_layout.addWidget(self.violation_details_output, 3, 0, 1, 4)
 
         self.refresh_audience_safety_button = QPushButton("Refresh Audience / Safety")
@@ -3134,8 +3172,10 @@ class StreamKeyGeneratorWindow(QWidget):
         self.real_stream_key = ""
         self.real_share_url = ""
         self.active_violation_ids = set()
+        self.last_active_violation_count = 0
         self.local_proxy_server_url = ""
         self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
+        self.local_proxy_starting = False
         self.show_real_stream_credentials = False
         self.toggle_stream_credentials_button.setText("Show Real TikTok URL")
         self.toggle_stream_credentials_button.setEnabled(False)
@@ -3160,7 +3200,6 @@ class StreamKeyGeneratorWindow(QWidget):
         self.violation_status_output.clear()
         self.community_status_output.clear()
         self.ban_status_output.clear()
-        self.perception_status_output.clear()
         self.violation_details_output.setRowCount(0)
 
     def format_stat_value(self, value):
@@ -3253,7 +3292,8 @@ class StreamKeyGeneratorWindow(QWidget):
             print(f"Realtime stats refresh failed: {message}")
 
     def sync_audience_safety_timer(self):
-        should_run = bool(self.is_live and self.current_room_id)
+        has_cookies = self.get_cookie_file_status()[0]
+        should_run = bool(has_cookies)
         if should_run:
             if not self.audience_safety_timer.isActive():
                 self.audience_safety_timer.start()
@@ -3386,29 +3426,114 @@ class StreamKeyGeneratorWindow(QWidget):
             parts.append("Locale restricted")
         return " / ".join(parts) if parts else "None"
 
-    def _format_perception_status(self, safety):
-        active = safety.get("active_perception_statuses") or []
-        if active:
-            return f"Active ({len(active)})"
-        if safety.get("violations_entrance"):
-            end_time = safety.get("violations_entrance_end_time")
-            return f"Warning until {end_time}" if end_time else "Warning"
-        summary = safety.get("perception_summary")
-        if summary and summary not in ("None", "Unavailable"):
-            return summary[:120]
-        return "OK"
-
     def _set_table_item(self, table, row, column, text):
         item = QTableWidgetItem(str(text or ""))
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         table.setItem(row, column, item)
+        return item
 
     def _add_safety_detail_row(self, detail_type, status, details):
         row = self.violation_details_output.rowCount()
         self.violation_details_output.insertRow(row)
-        self._set_table_item(self.violation_details_output, row, 0, detail_type)
-        self._set_table_item(self.violation_details_output, row, 1, status)
+        self._set_table_item(self.violation_details_output, row, 0, "")
+        self._set_table_item(self.violation_details_output, row, 1, detail_type)
         self._set_table_item(self.violation_details_output, row, 2, details)
+        self._set_table_item(self.violation_details_output, row, 3, "")
+        self._set_table_item(self.violation_details_output, row, 4, "")
+
+    def _format_violation_epoch(self, value):
+        if value in (None, "", 0, "0"):
+            return ""
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(value)))
+        except (TypeError, ValueError, OSError):
+            return str(value)
+
+    def _violation_record_id(self, record):
+        if not isinstance(record, dict):
+            return ""
+        return (
+            record.get("violation_id_str")
+            or record.get("violation_id")
+            or (record.get("punish_info") or {}).get("punish_record_id_str")
+            or (record.get("punish_info") or {}).get("punish_record_id")
+            or ""
+        )
+
+    def _style_active_violation_row(self, row):
+        highlight = QBrush(QColor(80, 64, 24))
+        text = QBrush(QColor(255, 230, 180))
+        bold_font = QFont()
+        bold_font.setBold(True)
+        for column in range(self.violation_details_output.columnCount()):
+            item = self.violation_details_output.item(row, column)
+            if item is None:
+                continue
+            item.setBackground(highlight)
+            item.setForeground(text)
+            item.setFont(bold_font)
+
+    def _add_violation_row(self, record, is_active=False):
+        if not isinstance(record, dict):
+            return
+        punish = record.get("punish_info") or {}
+        live = record.get("live_info") or {}
+        row = self.violation_details_output.rowCount()
+        self.violation_details_output.insertRow(row)
+        room_title = live.get("title") or ""
+        self._set_table_item(self.violation_details_output, row, 0, room_title)
+        self._set_table_item(
+            self.violation_details_output,
+            row,
+            1,
+            punish.get("punish_title") or punish.get("perception_code") or punish.get("violation_type") or "Violation",
+        )
+        self._set_table_item(
+            self.violation_details_output,
+            row,
+            2,
+            punish.get("punish_reason") or punish.get("moderation_info") or punish.get("perception_code") or "",
+        )
+        self._set_table_item(
+            self.violation_details_output,
+            row,
+            3,
+            self._format_violation_epoch(punish.get("punish_start_time") or live.get("start_time")),
+        )
+        self._set_table_item(
+            self.violation_details_output,
+            row,
+            4,
+            self._format_violation_epoch(
+                punish.get("punish_real_end_time")
+                or punish.get("punish_expected_end_time")
+                or punish.get("punish_end_time")
+            ),
+        )
+        if is_active:
+            self._style_active_violation_row(row)
+
+    def _populate_violation_table(self, safety):
+        self.violation_details_output.setRowCount(0)
+        self.violation_details_output.clearSpans()
+
+        active_records = safety.get("active_violation_records") or []
+        history_records = safety.get("history_violation_records") or []
+        active_ids = {str(self._violation_record_id(record)) for record in active_records if self._violation_record_id(record)}
+
+        for record in active_records:
+            self._add_violation_row(record, is_active=True)
+        for record in history_records:
+            record_id = str(self._violation_record_id(record))
+            if record_id and record_id in active_ids:
+                continue
+            self._add_violation_row(record, is_active=False)
+
+        if self.violation_details_output.rowCount() == 0:
+            self.violation_details_output.insertRow(0)
+            self.violation_details_output.setSpan(0, 0, 1, 5)
+            self._set_table_item(self.violation_details_output, 0, 0, "No violations returned by violation_list.")
+        self.violation_details_output.resizeRowsToContents()
 
     def _populate_audience_list(self, ranks, notice):
         self.online_audience_table_output.setRowCount(0)
@@ -3440,13 +3565,8 @@ class StreamKeyGeneratorWindow(QWidget):
     def refresh_audience_safety(self, force=False):
         if self.audience_safety_in_flight:
             return
-        if not self.current_room_id:
-            self.sync_audience_safety_timer()
-            return
-        if not self.is_live and not force:
-            self.sync_audience_safety_timer()
-            return
         if not self.get_cookie_file_status()[0]:
+            self.sync_audience_safety_timer()
             return
 
         self.audience_safety_in_flight = True
@@ -3455,6 +3575,9 @@ class StreamKeyGeneratorWindow(QWidget):
             self.refresh_audience_safety_button.setText("Refreshing...")
 
         room_id = self.current_room_id
+        can_fetch_audience = bool(self.is_live and room_id)
+        if not can_fetch_audience:
+            room_id = ""
         anchor_id = self.current_anchor_id or self.account_user_id.text().strip()
         priority_region = self.stream_priority_region or self.region_combo.currentText()
         topic_id = self.get_selected_topic_id() or "5"
@@ -3462,13 +3585,21 @@ class StreamKeyGeneratorWindow(QWidget):
         def worker():
             try:
                 with Stream() as stream:
-                    audience = stream.getOnlineAudience(
-                        device_id=self.device_id,
-                        install_id=self.install_id,
-                        priority_region=priority_region,
-                        room_id=room_id,
-                        anchor_id=anchor_id,
-                    )
+                    if can_fetch_audience:
+                        audience = stream.getOnlineAudience(
+                            device_id=self.device_id,
+                            install_id=self.install_id,
+                            priority_region=priority_region,
+                            room_id=room_id,
+                            anchor_id=anchor_id,
+                        )
+                    else:
+                        audience = {
+                            "total": None,
+                            "preview_count": None,
+                            "ranks": [],
+                            "bottom_notice": "Not live. Audience data is unavailable.",
+                        }
                     safety = stream.getViolationStatus(
                         device_id=self.device_id,
                         install_id=self.install_id,
@@ -3496,59 +3627,23 @@ class StreamKeyGeneratorWindow(QWidget):
         ranks = audience.get("ranks") or []
         self._populate_audience_list(ranks, audience.get("bottom_notice"))
 
-        self.violation_status_output.setText(str(safety.get("status") or "Unknown"))
+        status_text = str(safety.get("status") or "OK")
         self.community_status_output.setText(self._format_community_status(safety))
         self.ban_status_output.setText(self._format_ban_status(safety))
-        self.perception_status_output.setText(self._format_perception_status(safety))
 
         active_summaries = safety.get("active_violation_summaries") or []
         active_ids = set(safety.get("active_violation_ids") or [])
         new_ids = active_ids - self.active_violation_ids
+        active_count = safety.get("active_violation_count", 0) or 0
         if new_ids:
             first_summary = active_summaries[0] if active_summaries else "A new LIVE violation was detected."
             self.new_violation_detected.emit(first_summary)
+        elif active_count > 0 and self.last_active_violation_count == 0:
+            self.flash_taskbar()
         self.active_violation_ids = active_ids
-
-        active_count = safety.get("active_violation_count", 0) or 0
-        history_count = safety.get("history_violation_count")
-        recent_count = safety.get("recent_violation_count", 0) or 0
-        recent_summaries = safety.get("recent_violation_summaries") or []
-        self.violation_details_output.setRowCount(0)
-        self._add_safety_detail_row("Active", self.format_stat_value(active_count), "No active violations" if not active_count else "Active moderation item detected")
-        self._add_safety_detail_row("Recent", self.format_stat_value(recent_count), "Records returned by violation_list" if recent_count else "No recent violation records")
-        if history_count not in (None, "") and str(history_count) != str(recent_count):
-            self._add_safety_detail_row("API history_count", self.format_stat_value(history_count), "Server counter, not used as the recent-record count")
-
-        if active_summaries:
-            for line in active_summaries[:8]:
-                self._add_safety_detail_row("Violation", "Active", line)
-            if len(active_summaries) > 8:
-                self._add_safety_detail_row("Violation", "More", f"{len(active_summaries) - 8} more active items")
-
-        expired_recent = [line for line in recent_summaries if line not in active_summaries]
-        if expired_recent:
-            for line in expired_recent[:8]:
-                self._add_safety_detail_row("Violation", "Recent", line)
-            if len(expired_recent) > 8:
-                self._add_safety_detail_row("Violation", "More", f"{len(expired_recent) - 8} more recent items")
-
-        perception_statuses = safety.get("perception_violation_statuses") or []
-        for item in perception_statuses[:8]:
-            scene = item.get("scene", "")
-            status = item.get("status", "")
-            summary = item.get("summary", "")
-            self._add_safety_detail_row(f"Scene {scene}", status if status not in (None, "") else "OK", summary)
-
-        perception_countdown = safety.get("perception_summary") or "None"
-        if perception_countdown not in ("None", "Unavailable", ""):
-            self._add_safety_detail_row("Countdown", "Active", perception_countdown)
-
-        # Optional endpoint failures are intentionally not shown here.
-        # They are noisy and can happen when an IDC rejects a non-critical check.
-
-        if self.violation_details_output.rowCount() == 0:
-            self._add_safety_detail_row("Status", "OK", "No safety details available yet")
-        self.violation_details_output.resizeRowsToContents()
+        self.last_active_violation_count = active_count
+        self.violation_status_output.setText(status_text)
+        self._populate_violation_table(safety)
 
     def handle_audience_safety_error(self, message):
         self.refresh_audience_safety_button.setEnabled(True)
@@ -3776,6 +3871,7 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.login_button.setEnabled(True)
         self.update_stream_controls(has_cookies=has_cookies)
+        self.sync_audience_safety_timer()
 
     def set_proxy_status(self, message):
         if hasattr(self, "proxy_status_output"):
@@ -3793,6 +3889,12 @@ class StreamKeyGeneratorWindow(QWidget):
         has_local_credentials = bool(self.local_proxy_active and self.local_proxy_server_url)
         self.toggle_stream_credentials_button.setEnabled(has_real_credentials and has_local_credentials)
 
+        if self.local_proxy_starting:
+            self.url_output.clear()
+            self.key_output.clear()
+            self.toggle_stream_credentials_button.setText("Show Real TikTok URL")
+            return
+
         if self.show_real_stream_credentials or not has_local_credentials:
             self.url_output.setText(self.real_base_stream_url)
             self.key_output.setText(self.real_stream_key)
@@ -3806,7 +3908,58 @@ class StreamKeyGeneratorWindow(QWidget):
     def ffmpeg_proxy_is_running(self):
         return self.ffmpeg_proxy_process is not None and self.ffmpeg_proxy_process.poll() is None
 
+    def wait_for_ffmpeg_proxy_listener(self, timeout_seconds=25):
+        marker = "waiting for OBS/local RTMP connection"
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        sei_log_path = getattr(self, "ffmpeg_proxy_sei_log_path", "")
+        while time.monotonic() < deadline:
+            if self.ffmpeg_proxy_process is None:
+                return False
+            return_code = self.ffmpeg_proxy_process.poll()
+            if return_code is not None:
+                return False
+            if sei_log_path and os.path.exists(sei_log_path):
+                try:
+                    with open(sei_log_path, "r", encoding="utf-8", errors="replace") as file:
+                        if marker in file.read():
+                            return True
+                except Exception:
+                    pass
+            QApplication.processEvents()
+            time.sleep(0.1)
+        return False
+
     def build_ffmpeg_proxy_command(self, ffmpeg_path, local_input_url, tiktok_output_url):
+        sei_proxy = os.path.join(_runtime_base_dir(), "Libs", "ffmpeg_sei_proxy.py")
+        if os.path.exists(sei_proxy):
+            self.ffmpeg_proxy_sei_log_path = os.path.join(_runtime_logs_dir(), "ffmpeg_proxy_sei.log")
+            return [
+                sys.executable,
+                sei_proxy,
+                "--ffmpeg",
+                ffmpeg_path,
+                "--listen-url",
+                local_input_url,
+                "--output-url",
+                tiktok_output_url,
+                "--uid",
+                str(self.current_anchor_id or ""),
+                "--device-id",
+                str(self.device_id or ""),
+                "--room-id",
+                str(self.current_room_id or ""),
+                "--aid",
+                "8311",
+                "--fps",
+                "60",
+                "--resolution",
+                "1920x1080",
+                "--timeout",
+                str(LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS),
+                "--log",
+                self.ffmpeg_proxy_sei_log_path,
+            ]
+
         return [
             ffmpeg_path,
             "-hide_banner",
@@ -3836,43 +3989,73 @@ class StreamKeyGeneratorWindow(QWidget):
         if not tiktok_output_url:
             raise RuntimeError("Missing TikTok RTMP URL for local FFmpeg proxy.")
 
-        ffmpeg_path = _bundled_ffmpeg_path()
-        self.local_proxy_port = _pick_local_proxy_port(LOCAL_PROXY_DEFAULT_PORT)
-        self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
-        self.local_proxy_server_url = f"rtmp://127.0.0.1:{self.local_proxy_port}/{LOCAL_PROXY_APP_NAME}"
-        local_input_url = f"{self.local_proxy_server_url}/{self.local_proxy_stream_key}"
-        self.ffmpeg_proxy_log_path = os.path.join(_runtime_logs_dir(), LOCAL_PROXY_LOG_NAME)
-        self.ffmpeg_proxy_log_file = open(self.ffmpeg_proxy_log_path, "w", encoding="utf-8", errors="replace")
+        progress = QProgressDialog("Preparing local FFmpeg proxy signatures...", None, 0, 0, self)
+        progress.setWindowTitle("Starting Stream")
+        progress.setWindowModality(Qt.ApplicationModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
 
-        command = self.build_ffmpeg_proxy_command(ffmpeg_path, local_input_url, tiktok_output_url)
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        self.ffmpeg_proxy_process = subprocess.Popen(
-            command,
-            cwd=_runtime_base_dir(),
-            stdin=subprocess.DEVNULL,
-            stdout=self.ffmpeg_proxy_log_file,
-            stderr=subprocess.STDOUT,
-            creationflags=creationflags,
-        )
-
-        time.sleep(0.35)
-        return_code = self.ffmpeg_proxy_process.poll()
-        if return_code is not None:
-            tail = _safe_log_tail(self.ffmpeg_proxy_log_path)
-            self.stop_ffmpeg_proxy(clear_status=False)
-            details = f"\n\nFFmpeg log tail:\n{tail}" if tail else ""
-            raise RuntimeError(f"FFmpeg proxy exited early with code {return_code}.{details}")
-
-        self.local_proxy_active = True
+        self.local_proxy_starting = True
         self.show_real_stream_credentials = False
-        self.set_proxy_status("Proxy ready. Start streaming in OBS.")
         self.refresh_stream_credentials_display()
-        return True
+
+        ffmpeg_path = _bundled_ffmpeg_path()
+        try:
+            self.local_proxy_port = _pick_local_proxy_port(LOCAL_PROXY_DEFAULT_PORT)
+            self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
+            self.local_proxy_server_url = f"rtmp://127.0.0.1:{self.local_proxy_port}/{LOCAL_PROXY_APP_NAME}"
+            local_input_url = f"{self.local_proxy_server_url}/{self.local_proxy_stream_key}"
+            self.ffmpeg_proxy_log_path = os.path.join(_runtime_logs_dir(), LOCAL_PROXY_LOG_NAME)
+            self.ffmpeg_proxy_sei_log_path = os.path.join(_runtime_logs_dir(), "ffmpeg_proxy_sei.log")
+            self.ffmpeg_proxy_log_file = open(self.ffmpeg_proxy_log_path, "w", encoding="utf-8", errors="replace")
+
+            command = self.build_ffmpeg_proxy_command(ffmpeg_path, local_input_url, tiktok_output_url)
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            self.ffmpeg_proxy_process = subprocess.Popen(
+                command,
+                cwd=_runtime_base_dir(),
+                stdin=subprocess.DEVNULL,
+                stdout=self.ffmpeg_proxy_log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+            )
+
+            time.sleep(0.35)
+            return_code = self.ffmpeg_proxy_process.poll()
+            if return_code is not None:
+                tail = _safe_log_tail(self.ffmpeg_proxy_log_path)
+                self.stop_ffmpeg_proxy(clear_status=False)
+                details = f"\n\nFFmpeg log tail:\n{tail}" if tail else ""
+                raise RuntimeError(f"FFmpeg proxy exited early with code {return_code}.{details}")
+
+            self.set_proxy_status("Preparing local FFmpeg proxy signatures...")
+            if not self.wait_for_ffmpeg_proxy_listener(timeout_seconds=25):
+                return_code = self.ffmpeg_proxy_process.poll() if self.ffmpeg_proxy_process is not None else None
+                tail = _safe_log_tail(getattr(self, "ffmpeg_proxy_sei_log_path", ""))
+                self.stop_ffmpeg_proxy(clear_status=False)
+                details = f"\n\nSEI proxy log tail:\n{tail}" if tail else ""
+                if return_code is not None:
+                    raise RuntimeError(f"FFmpeg proxy exited before the local listener was ready with code {return_code}.{details}")
+                raise RuntimeError(f"FFmpeg proxy did not open the local listener in time.{details}")
+
+            self.local_proxy_active = True
+            self.local_proxy_starting = False
+            self.show_real_stream_credentials = False
+            self.set_proxy_status("Proxy ready. Start streaming in OBS.")
+            self.ffmpeg_proxy_watch_timer.start()
+            self.refresh_stream_credentials_display()
+            return True
+        finally:
+            self.local_proxy_starting = False
+            progress.close()
 
     def stop_ffmpeg_proxy(self, clear_status=True):
         process = self.ffmpeg_proxy_process
         self.ffmpeg_proxy_process = None
         self.local_proxy_active = False
+        self.local_proxy_starting = False
 
         if process is not None and process.poll() is None:
             try:
@@ -3897,6 +4080,23 @@ class StreamKeyGeneratorWindow(QWidget):
 
         if clear_status:
             self.set_proxy_status("")
+        if hasattr(self, "ffmpeg_proxy_watch_timer"):
+            self.ffmpeg_proxy_watch_timer.stop()
+        self.refresh_stream_credentials_display()
+
+    def check_ffmpeg_proxy_health(self):
+        if not self.local_proxy_active or self.ffmpeg_proxy_process is None:
+            self.ffmpeg_proxy_watch_timer.stop()
+            return
+
+        return_code = self.ffmpeg_proxy_process.poll()
+        if return_code is None:
+            return
+
+        self.local_proxy_active = False
+        self.show_real_stream_credentials = True
+        self.ffmpeg_proxy_watch_timer.stop()
+        self.set_proxy_status(f"Proxy stopped with code {return_code}. Showing real TikTok URL.")
         self.refresh_stream_credentials_display()
 
     def update_stream_controls(self, has_cookies=None):
@@ -3911,7 +4111,7 @@ class StreamKeyGeneratorWindow(QWidget):
         self.end_live_button.setEnabled(has_cookies and self.is_live)
         self.refresh_stats_button.setEnabled(has_cookies and bool(self.current_room_id))
         if hasattr(self, "refresh_audience_safety_button"):
-            self.refresh_audience_safety_button.setEnabled(has_cookies and bool(self.current_room_id))
+            self.refresh_audience_safety_button.setEnabled(has_cookies)
         if hasattr(self, "toggle_stream_credentials_button"):
             self.toggle_stream_credentials_button.setEnabled(
                 bool(self.real_stream_url and self.local_proxy_active and self.local_proxy_server_url)

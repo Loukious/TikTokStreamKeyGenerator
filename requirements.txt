@@ -1,4 +1,5 @@
 requests>=2.31.0
+curl_cffi>=0.15.0
 PySide6>=6.7.2
 nuitka>=2.6.9
 clang>=20.1.0

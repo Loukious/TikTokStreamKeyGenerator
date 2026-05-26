@@ -6,6 +6,10 @@ import string
 import uuid
 
 import requests
+try:
+    from curl_cffi import requests as curl_requests
+except Exception:
+    curl_requests = None
 
 from .log_encrypt_codec import DEFAULT_LOG_ENCRYPT_KEY, log_encrypt
 from .domain_routing import (
@@ -14,6 +18,27 @@ from .domain_routing import (
     build_endpoint,
     update_ntp_from_response,
 )
+
+
+MIN_LIVE_STUDIO_VERSION = "1.27.0"
+
+
+def _new_http_session():
+    if curl_requests is not None:
+        return curl_requests.Session(impersonate="chrome")
+    return requests.session()
+
+
+def _version_tuple(value):
+    parts = []
+    for item in str(value or "").split("."):
+        try:
+            parts.append(int(item))
+        except ValueError:
+            parts.append(0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
 
 
 DEVICE_REGISTER_PATH = "/service/2/desktop/device_register/"
@@ -88,17 +113,23 @@ def fetch_live_studio_latest_version(session=None):
     }
 
     close_session = session is None
-    client = session if session is not None else requests.session()
+    client = session if session is not None else _new_http_session()
     try:
-        with client.get(
+        response = client.get(
             LIVE_STUDIO_UPDATE_ENDPOINT,
             params=params,
             headers=build_common_headers(client),
             timeout=15,
-        ) as response:
-            return response.json()["data"]["manifest"]["win32"]["version"]
+        )
+        discovered = response.json()["data"]["manifest"]["win32"]["version"]
+        if _version_tuple(discovered) < _version_tuple(MIN_LIVE_STUDIO_VERSION):
+            return MIN_LIVE_STUDIO_VERSION
+        return discovered
     except Exception:
-        return "0.99.0"
+        # Keep the fallback close to the current captured Live Studio line. An
+        # ancient version here makes signed Webcast traffic look inconsistent
+        # even when the request itself is otherwise correct.
+        return MIN_LIVE_STUDIO_VERSION
     finally:
         if close_session:
             client.close()
@@ -223,7 +254,7 @@ def _build_device_register_payload(version, pc_uuid, pc_serial, fingerprint):
 
 def register_desktop_device_identifiers(session=None, timeout=25):
     close_session = session is None
-    client = session if session is not None else requests.session()
+    client = session if session is not None else _new_http_session()
     try:
         client.headers.update(build_common_headers(client))
 

@@ -1,7 +1,18 @@
 import time
 import os
+import re
 
 import requests
+try:
+    from curl_cffi import requests as curl_requests
+except Exception:
+    curl_requests = None
+
+
+def _new_http_session():
+    if curl_requests is not None:
+        return curl_requests.Session(impersonate="chrome")
+    return requests.session()
 
 
 DEFAULT_TIKTOK_USER_AGENT = os.getenv(
@@ -21,6 +32,7 @@ def _load_tnc_endpoints():
             return tuple(endpoints)
 
     return (
+        "https://tnc0-normal-alisg.tiktokv.com/get_domains/v4/",
         "https://tnc16-platform-useast1a.tiktokv.com/get_domains/v4/",
         "https://tnc16-platform-alisg.tiktokv.com/get_domains/v4/",
     )
@@ -32,6 +44,7 @@ TNC_DISCOVERY_PARAMS = {
     "aid": "8311",
     "ttwebview_version": "1130022001",
     "device_platform": "win",
+    "tnc_src": "6",
 }
 
 _DISPATCH_CACHE = {
@@ -62,6 +75,14 @@ def get_tiktok_user_agent(session=None):
             return candidate
 
     return DEFAULT_TIKTOK_USER_AGENT
+
+
+def _live_studio_version_from_user_agent(session=None):
+    user_agent = get_tiktok_user_agent(session)
+    match = re.search(r"TikTokLIVEStudio/([0-9]+(?:\.[0-9]+){1,3})", user_agent)
+    if match:
+        return match.group(1)
+    return "1.27.0"
 
 
 def build_common_headers(session=None):
@@ -131,34 +152,59 @@ def _extract_strategy_maps(response_json):
     if not isinstance(actions, list):
         return []
 
+    # Live Studio's domain response contains both load-balancing candidate rules
+    # and final IDC rewrite rules. For this tool we want the deterministic final
+    # host, for example webcast.tiktokv.com -> webcast16-normal-c-alisg.tiktokv.com.
+    # Turning candidate rules into mappings can incorrectly select webcast19 or a
+    # region host before the IDC rewrite is applied, so keep direct string maps only.
     strategy_maps = []
-    for action in actions:
+    for action in sorted(actions, key=lambda item: int(item.get("act_priority") or 0)):
         if not isinstance(action, dict):
             continue
         params = action.get("param")
         if not isinstance(params, dict):
             continue
         strategy_info = params.get("strategy_info")
-        if isinstance(strategy_info, dict) and strategy_info:
-            strategy_maps.append(strategy_info)
+        if not isinstance(strategy_info, dict) or not strategy_info:
+            continue
+
+        direct_map = {
+            _canonicalize_tiktok_host(key): _canonicalize_tiktok_host(value)
+            for key, value in strategy_info.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+        if direct_map:
+            strategy_maps.append(direct_map)
 
     return strategy_maps
+
+
+def _tnc_discovery_params(session):
+    params = dict(TNC_DISCOVERY_PARAMS)
+    params["version_code"] = _live_studio_version_from_user_agent(session)
+    device_id = _session_cookie_value(session, "device_id") or _session_cookie_value(session, "ttwid") or ""
+    if device_id:
+        params["device_id"] = str(device_id)
+    region = _session_cookie_value(session, "store-country-code") or ""
+    if region:
+        params["region"] = str(region).lower()
+    return params
 
 
 def _fetch_strategy_maps(session, timeout):
     headers = build_common_headers(session)
     for endpoint in TNC_DISCOVERY_ENDPOINTS:
         try:
-            with session.get(
+            response = session.get(
                 endpoint,
-                params=TNC_DISCOVERY_PARAMS,
+                params=_tnc_discovery_params(session),
                 headers=headers,
                 timeout=timeout,
-            ) as response:
-                response.raise_for_status()
-                strategy_maps = _extract_strategy_maps(response.json())
-                if strategy_maps:
-                    return strategy_maps
+            )
+            response.raise_for_status()
+            strategy_maps = _extract_strategy_maps(response.json())
+            if strategy_maps:
+                return strategy_maps
         except Exception:
             continue
 
@@ -225,6 +271,9 @@ def _canonicalize_tiktok_host(host):
     if value.startswith("api16-normal-alisg."):
         return "api16-normal-c-alisg.tiktokv.com"
 
+    if value.startswith("webcast16-ws-alisg."):
+        return "webcast16-ws-c-alisg.tiktokv.com"
+
     return value
 
 
@@ -269,6 +318,25 @@ def _authenticated_webcast_host(session):
     return _canonicalize_tiktok_host(f"webcast16-normal-{idc_segment}.{suffix}")
 
 
+def _region_webcast_host(session):
+    store_country = str(_session_cookie_value(session, "store-country-code") or "").strip().lower()
+    target_idc = str(_session_cookie_value(session, "tt-target-idc") or "").strip().lower()
+
+    eu_regions = {
+        "at", "be", "bg", "ch", "cy", "cz", "de", "dk", "ee", "es", "fi", "fr", "gb",
+        "gr", "hr", "hu", "ie", "is", "it", "li", "lt", "lu", "lv", "mt", "nl", "no",
+        "pl", "pt", "ro", "se", "si", "sk",
+    }
+
+    if target_idc.startswith("eu") or store_country in eu_regions:
+        return "webcast16-normal-no1a.tiktokv.eu"
+
+    if store_country == "us" or target_idc.startswith("useast"):
+        return "webcast16-normal-useast5.tiktokv.us"
+
+    return None
+
+
 def _authenticated_api_host(session):
     idc_segment = _authenticated_idc_segment(session)
     if not idc_segment:
@@ -294,7 +362,7 @@ def resolve_host(seed_host, session=None, timeout=12, max_hops=8):
             return authenticated_host
 
     close_session = session is None
-    client = session if session is not None else requests.session()
+    client = session if session is not None else _new_http_session()
     try:
         strategy_maps = _get_strategy_maps(client, timeout=timeout)
 
@@ -372,16 +440,17 @@ def resolve_api_host_candidates(session=None, timeout=12):
 
 
 def resolve_webcast_host_candidates(session=None, timeout=12):
-    candidates = [
-        _authenticated_webcast_host(session),
-    ]
+    # Prefer the account/IDC route over UI region. A user may choose priority_region=fr
+    # while their logged-in session is stored in alisg; forcing no1a causes 403s.
+    authenticated = _authenticated_webcast_host(session)
+    if authenticated:
+        return _dedupe_hosts([authenticated, _region_webcast_host(session)])
 
+    candidates = []
     seed_candidates = [
         "webcast-normal.tiktokv.com",
-        "webcast16-normal-c-alisg.tiktokv.com",
-        "webcast16-normal-no1a.tiktokv.eu",
-        "webcast16-normal-useast8.tiktokv.us",
-        "webcast16-normal-useast5.tiktokv.us",
+        "webcast.tiktokv.com",
+        "webcast16-normal.tiktokv.com",
     ]
 
     for seed_host in seed_candidates:
@@ -389,5 +458,8 @@ def resolve_webcast_host_candidates(session=None, timeout=12):
             candidates.append(resolve_host(seed_host, session=session, timeout=timeout))
         except Exception:
             candidates.append(seed_host)
+
+    # Region-based fallback is last-resort only, never first.
+    candidates.append(_region_webcast_host(session))
 
     return _dedupe_hosts(candidates)
