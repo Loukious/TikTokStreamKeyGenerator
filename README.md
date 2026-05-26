@@ -1,70 +1,124 @@
-# This project is discontinued!
-For a simpler solution to generate TikTok stream keys check my other project [here](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator)
-
-
 # TikTok Live Stream Key Generator for OBS Studio
 
-## Description
-This Python script is a valuable tool for content creators looking to broadcast on TikTok's live streaming platform using OBS Studio, an alternative to TikTok LIVE Studio. The script's standout feature is generating a stream key, a capability typically restricted and highly sought after. This stream key enables users to stream via OBS Studio, offering more control and flexibility over their live broadcasts. Additionally, the script provides the base stream URL and a shareable URL for the stream.
+This project creates a TikTok LIVE room and gives OBS an RTMP target through a local FFmpeg proxy. OBS does not stream directly to TikTok; it streams to the local proxy, and the proxy forwards the stream with the metadata TikTok expects.
+
+For most users, [Loukious/StreamLabsTikTokStreamKeyGenerator](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator) is still the preferred option. It has a smaller architecture, fewer moving parts, and therefore less that can go wrong. Use this project if you specifically need the newer local FFmpeg proxy flow, SEI injection path, RapidAPI signing integration, or the extra GUI controls here.
 
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/loukious)
 
+## What It Does
 
-## Features
-- Retrieve the base stream URL.
-- Generate a TikTok stream key.
-- Obtain a shareable URL for the TikTok live stream.
-- Support for specifying different topics including games, music, and more.
-- Option to enable replay generation.
-- Option to close the room when the stream ends.
-- Option to choose region priority.
-- Option to mark the stream as mature content.
-- Button to end the stream.
-- Option to use custom thumbnail.
+- Creates a TikTok LIVE room.
+- Retrieves the stream server, stream key, and share URL.
+- Supports OBS Studio by exposing a local RTMP server/key pair.
+- Runs a local FFmpeg RTMP proxy between OBS and TikTok.
+- Adds the LIVE Studio-style stream metadata needed by the proxy path.
+- Supports game/topic tags, replay settings, mature content, thumbnails, region priority, and ending the room from the app.
+- Uses RapidAPI for request signing and stream frame signing.
+
+## Architecture
+
+The supported streaming path is:
+
+1. The app creates a TikTok LIVE room and receives the real TikTok push URL/key.
+2. The app starts a local FFmpeg RTMP proxy.
+3. OBS connects to the local RTMP address shown by the app, usually something like `rtmp://127.0.0.1:<port>/...`.
+4. The proxy receives the OBS stream, adds the stream metadata path TikTok expects, and forwards it to TikTok.
+
+The real TikTok URL/key is not meant to be used directly in OBS. In current testing, TikTok closes direct OBS connections immediately, and using the real TikTok URL/key without the LIVE Studio-style stream metadata can lead to a LIVE visibility restriction for integrity/authenticity.
+
+The local proxy exists because TikTok LIVE Studio sends extra stream-side metadata while pushing video. OBS does not send that metadata by itself. The proxy lets OBS stay simple while the app handles the TikTok-specific stream wrapping before forwarding.
+
+## RapidAPI Signing
+
+This app requires a signer API key for TikTok request headers and stream frame signing. The app does not explain or expose the signing algorithms; it calls the hosted signer API and uses the returned values.
+
+You need a RapidAPI key from:
+
+[TikTok LIVE Studio API Signer on RapidAPI](https://rapidapi.com/Loukious/api/tiktok-live-studio-api-signer1)
+
+After subscribing:
+
+1. Open the app.
+2. Paste your RapidAPI key into the **RapidAPI Key** field.
+3. Save/apply it.
+4. Start the stream normally.
+
+Without a valid RapidAPI key, streaming is expected to fail or receive a LIVE visibility restriction such as an integrity/authenticity violation. Treat the RapidAPI key as required, not optional.
 
 ## Requirements
-- Python 3.6+
-- Google Chrome browser
-- Game tag ID
-- Logged into TikTok LIVE studio at least once
-- Have TikTok LIVE studio access or Live access
+
+- Python 3.10+ recommended.
+- FFmpeg available on `PATH`.
+- OBS Studio.
+- TikTok LIVE access.
+- TikTok LIVE Studio access or an account that has already been enabled for LIVE Studio.
+- A valid RapidAPI key for this app's signer API.
 
 ## Installation
-Either download and use the provided exe from [here](https://github.com/Loukious/TikTokStreamKeyGenerator/releases/latest) or follow the steps below to run the script.
-Ensure you have Python and PIP working.
-In the command line, install the required packages using the following command (run the command in the same directory as the script):
+
+Download the latest release from:
+
+https://github.com/Loukious/TikTokStreamKeyGenerator/releases/latest
+
+Or run from source:
+
 ```bash
 pip install -r requirements.txt
 ```
-or if pip is not working, try:
+
+If `pip` is not available:
+
 ```bash
 python -m pip install -r requirements.txt
 ```
 
 ## Usage
-Simply run the script to open the GUI.
 
-### Command Format
+Run the GUI:
+
 ```bash
-python TiktokStreamKeyGenerator_v2.py
+python TiktokStreamKeyGenerator.py
 ```
 
-Press the login button to login to TikTok. After logging in, you can enter the game tag ID, stream title, and other options. Press the go live button to generate the stream key.
+Then:
+
+1. Log in to TikTok.
+2. Enter your stream title and game/topic options.
+3. Paste your RapidAPI key if it is not already saved.
+4. Click **Go Live**.
+5. Copy the local server/key shown by the app into OBS.
+
+OBS should use the local RTMP server/key shown by the app, not the real TikTok URL/key.
 
 ## Output
 
-The script will output:
-- **Base stream URL:** The URL needed to connect to the TikTok live stream.
-- **Stream key for OBS Studio integration:** Stream key that that you can use in OBS Studio to stream to TikTok.
-- **Shareable URL for the live stream:** A URL that can be shared for others to view the live stream.
+The app can show:
+
+- **Server URL:** The RTMP server OBS should connect to.
+- **Stream key:** The OBS stream key.
+- **Share URL:** A public link to the TikTok live room.
+
+The shown server/key are local proxy values. The app keeps the real TikTok push URL internal so OBS only talks to the local proxy.
 
 ## FAQ
-### I'm getting a `Please login first` error. What should I do?
-Try a different server from the one you're using.
-### I'm getting a `Maximum number of attempts reached. Try again later.` error. What should I do?
-This error sometimes occurs when TikTok detects selenium. You can use this [extension](https://chromewebstore.google.com/detail/export-cookie-json-file-f/nmckokihipjgplolmcmjakknndddifde) to export your cookies and import them into the script.
-- Start by installing the above extension in your browser.
-- Log into TikTok in the browser (if not already logged in), then export the cookies using the extension (while being on TikTok's website). 
-- After that, place the file in the same directory as the script and rename it to `cookies.json` then start the app.
-### Do I need live access to use this script?
-Yes, you need to have access to TikTok LIVE to use this script.
+
+### Why is the StreamLabs project preferred?
+
+It has a smaller flow and fewer dependencies. This project has more advanced features, but that also means more components: login, room creation, request signing, FFmpeg, local RTMP proxying, and stream metadata injection.
+
+### Why do I need FFmpeg?
+
+FFmpeg is used as the local RTMP receiver/forwarder. OBS streams to FFmpeg locally, and FFmpeg forwards the stream after the app adds the TikTok-specific stream metadata path. Direct OBS-to-TikTok streaming is not the supported path here.
+
+### Why do I need RapidAPI?
+
+TikTok LIVE Studio requests and stream metadata require signed values. The app gets those signed values from the RapidAPI signer service. Without them, the stream can be restricted for integrity/authenticity.
+
+### Do I need TikTok LIVE access?
+
+Yes. The app cannot give LIVE access to accounts that do not already have permission to go live.
+
+### I get a login error. What should I do?
+
+Try logging in again, restarting the app, or using another available TikTok server/region option. If browser login is blocked, export TikTok cookies from your browser and import them into the app when supported.
