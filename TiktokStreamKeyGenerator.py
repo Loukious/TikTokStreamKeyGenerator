@@ -3950,35 +3950,38 @@ class StreamKeyGeneratorWindow(QWidget):
         return False
 
     def build_ffmpeg_proxy_command(self, ffmpeg_path, local_input_url, tiktok_output_url):
+        proxy_args = [
+            "--ffmpeg",
+            ffmpeg_path,
+            "--listen-url",
+            local_input_url,
+            "--output-url",
+            tiktok_output_url,
+            "--uid",
+            str(self.current_anchor_id or ""),
+            "--device-id",
+            str(self.device_id or ""),
+            "--room-id",
+            str(self.current_room_id or ""),
+            "--aid",
+            "8311",
+            "--fps",
+            "60",
+            "--resolution",
+            "1920x1080",
+            "--timeout",
+            str(LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS),
+            "--log",
+            self.ffmpeg_proxy_sei_log_path,
+        ]
+
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--sei-proxy", *proxy_args]
+
         sei_proxy = os.path.join(_runtime_base_dir(), "Libs", "ffmpeg_sei_proxy.py")
         if os.path.exists(sei_proxy):
             self.ffmpeg_proxy_sei_log_path = os.path.join(_runtime_logs_dir(), "ffmpeg_proxy_sei.log")
-            return [
-                sys.executable,
-                sei_proxy,
-                "--ffmpeg",
-                ffmpeg_path,
-                "--listen-url",
-                local_input_url,
-                "--output-url",
-                tiktok_output_url,
-                "--uid",
-                str(self.current_anchor_id or ""),
-                "--device-id",
-                str(self.device_id or ""),
-                "--room-id",
-                str(self.current_room_id or ""),
-                "--aid",
-                "8311",
-                "--fps",
-                "60",
-                "--resolution",
-                "1920x1080",
-                "--timeout",
-                str(LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS),
-                "--log",
-                self.ffmpeg_proxy_sei_log_path,
-            ]
+            return [sys.executable, sei_proxy, *proxy_args]
 
         return [
             ffmpeg_path,
@@ -4032,7 +4035,10 @@ class StreamKeyGeneratorWindow(QWidget):
             self.ffmpeg_proxy_log_file = open(self.ffmpeg_proxy_log_path, "w", encoding="utf-8", errors="replace")
 
             command = self.build_ffmpeg_proxy_command(ffmpeg_path, local_input_url, tiktok_output_url)
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+                creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self.ffmpeg_proxy_process = subprocess.Popen(
                 command,
                 cwd=_runtime_base_dir(),
@@ -5006,6 +5012,12 @@ def handle_protocol_callback(port, url):
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--sei-proxy":
+        from Libs.ffmpeg_sei_proxy import main as sei_proxy_main
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        raise SystemExit(sei_proxy_main())
+
     # Check if this invocation is for protocol callback
     if len(sys.argv) >= 3 and sys.argv[1] == "--protocol-callback":
         port = sys.argv[2]

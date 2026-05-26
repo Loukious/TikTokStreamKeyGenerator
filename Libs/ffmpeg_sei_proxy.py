@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import struct
 import subprocess
 import sys
@@ -508,6 +509,12 @@ def _terminate_process(proc):
                 pass
 
 
+def _subprocess_creationflags():
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _relay_once(args, signer, log):
     listen_proc = None
     input_stream = sys.stdin.buffer
@@ -516,6 +523,7 @@ def _relay_once(args, signer, log):
             ffmpeg_listen_cmd(args.ffmpeg, args.listen_url, args.timeout),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            creationflags=_subprocess_creationflags(),
         )
         input_stream = listen_proc.stdout
 
@@ -523,6 +531,7 @@ def _relay_once(args, signer, log):
         ffmpeg_push_cmd(args.ffmpeg, args.output_url),
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        creationflags=_subprocess_creationflags(),
     )
     if listen_proc is not None:
         threading.Thread(target=pump_stderr, args=("listen", listen_proc, log), daemon=True).start()
