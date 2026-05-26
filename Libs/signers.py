@@ -89,10 +89,25 @@ def _normalize_headers(value) -> dict[str, str]:
     if not isinstance(value, dict):
         raise ValueError("signature API response is not an object")
     return {
-        "x-khronos": str(value.get("x-khronos", "")),
-        "x-ladon": str(value.get("x-ladon", "")),
-        "x-argus": str(value.get("x-argus", "")),
+        "x-khronos": _string_header(value.get("x-khronos")),
+        "x-ladon": _string_header(value.get("x-ladon")),
+        "x-argus": _string_header(value.get("x-argus")),
     }
+
+
+def _string_header(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _fallback_khronos(timestamp=None) -> str:
+    try:
+        if timestamp is not None:
+            return str(int(timestamp))
+    except (TypeError, ValueError):
+        pass
+    return str(int(time.time()))
 
 
 def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
@@ -133,17 +148,17 @@ def signature_headers(
     device_id=None,
     local_id=1877999593,
 ):
-    timestamp = int(timestamp)
+    khronos = _fallback_khronos(timestamp)
     if not _should_use_api():
         _log("missing RapidAPI key; returning blank signature headers")
         return {
-            "x-khronos": str(timestamp),
+            "x-khronos": khronos,
             "x-ladon": "",
             "x-argus": "",
         }
 
     payload = {
-        "timestamp": timestamp,
+        "timestamp": int(khronos),
         "aid": str(aid),
         "device_id": str(device_id or ""),
         "license_id": int(local_id),
@@ -153,12 +168,12 @@ def signature_headers(
     try:
         headers = _post_signatures(payload)
         if not headers["x-khronos"]:
-            headers["x-khronos"] = str(timestamp)
+            headers["x-khronos"] = khronos
         return headers
     except Exception as exc:
         _log(f"signature API failed; returning blank signatures: {exc}")
         return {
-            "x-khronos": str(timestamp),
+            "x-khronos": khronos,
             "x-ladon": "",
             "x-argus": "",
         }
