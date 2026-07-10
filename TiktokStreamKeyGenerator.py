@@ -778,7 +778,6 @@ class Stream:
         multi_stream_source=1,
     ):
         base_url = self.getServerUrl()
-        aid = "8311"
         self._apply_live_studio_headers()
 
         params = self._studio_params(
