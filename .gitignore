@@ -1,10 +1,11 @@
 cookies*
 config*
 TiktokStreamKeyGenerator.spec
-build/*
-dist/*
+*.build/*
+*.dist/*
 *.pem
 __pycache__/
 .env
 DevTools/
 *.log
+logs/

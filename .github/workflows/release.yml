@@ -73,8 +73,12 @@ jobs:
             --nofollow-import-to="*.tests" `
             --nofollow-import-to="pydoc" `
             --nofollow-import-to="test" `
+            --nofollow-import-to="DevTools" `
             --prefer-source-code `
             --include-module=unittest `
+            --include-module=Libs.ffmpeg_sei_proxy `
+            --include-module=Libs.XFrameSign `
+            --include-module=Libs.signers `
             --windows-console-mode=disable `
             --plugin-enable=pyside6 `
             --windows-company-name="Loukious" `
@@ -101,8 +105,12 @@ jobs:
             --nofollow-import-to="*.tests" `
             --nofollow-import-to="pydoc" `
             --nofollow-import-to="test" `
+            --nofollow-import-to="DevTools" `
             --prefer-source-code `
             --include-module=unittest `
+            --include-module=Libs.ffmpeg_sei_proxy `
+            --include-module=Libs.XFrameSign `
+            --include-module=Libs.signers `
             --plugin-enable=pyside6 `
             TiktokStreamKeyGenerator.py
           }
@@ -166,7 +174,11 @@ jobs:
           --standalone \
           --enable-plugin=anti-bloat \
           --enable-plugin=pyside6 \
+          --nofollow-import-to=DevTools \
           --prefer-source-code \
+          --include-module=Libs.ffmpeg_sei_proxy \
+          --include-module=Libs.XFrameSign \
+          --include-module=Libs.signers \
           --macos-target-arch=${{ matrix.architecture }} \
           --macos-create-app-bundle \
           --macos-app-version="${{ github.event.inputs.version }}" \
@@ -237,7 +249,11 @@ jobs:
           --show-anti-bloat-changes \
           --follow-stdlib \
           --follow-imports \
+          --nofollow-import-to=DevTools \
           --prefer-source-code \
+          --include-module=Libs.ffmpeg_sei_proxy \
+          --include-module=Libs.XFrameSign \
+          --include-module=Libs.signers \
           TiktokStreamKeyGenerator.py
 
       - name: Download FFmpeg

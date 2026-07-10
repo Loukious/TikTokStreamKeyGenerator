@@ -12,7 +12,11 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
-from Libs.XFrameSign import frame_sign, frame_sign_batch
+# Production SEI signatures are obtained from the hosted RapidAPI signer.
+# Local-only testing note: in a source checkout, temporarily change this to
+# `from DevTools.XFrameSign import frame_sign`. Do not include that development
+# module in a production build.
+from Libs.XFrameSign import frame_sign
 
 
 def _read_u24_be(data):
@@ -76,6 +80,17 @@ def inject_sei_into_tag(tag_data, sei_nals):
     return tag_data, False
 
 
+def video_tag_accepts_sei(tag_data):
+    if len(tag_data) < 5:
+        return False
+    byte0 = tag_data[0]
+    if byte0 & 0x80:
+        packet_type = byte0 & 0x0F
+        fourcc = tag_data[1:5]
+        return fourcc in (b"hvc1", b"hev1") and packet_type in (1, 3)
+    return (byte0 & 0x0F) == 7 and len(tag_data) >= 2 and tag_data[1] == 1
+
+
 def _sign_result_summary(value):
     signinfo = str((value or {}).get("signinfo", "") or "") if isinstance(value, dict) else ""
     signvalue = str((value or {}).get("signvalue", "") or "") if isinstance(value, dict) else ""
@@ -102,8 +117,6 @@ class LocalSeiSigner:
         self._next_refresh_flv_ts = None
         self._sign_lock = threading.Lock()
         self._sign_refreshing = False
-        self._sign_cache = {}
-        self._sign_cache_until_ts = 0
 
     def _log_sign_result(self, source, now_ms, result):
         if self.log is None:
@@ -137,81 +150,27 @@ class LocalSeiSigner:
             self._sign_refreshing = False
         self._log_sign_result(source, now_ms, result)
 
-    def _store_sign_batch(self, source, items):
-        stored = 0
-        max_ts = 0
-        with self._sign_lock:
-            for item in items or []:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    timestamp = int(item.get("timestamp", 0))
-                except (TypeError, ValueError):
-                    continue
-                result = item.get("signResult")
-                if not isinstance(result, dict):
-                    continue
-                self._sign_cache[timestamp] = result
-                max_ts = max(max_ts, timestamp)
-                stored += 1
-            if max_ts:
-                self._sign_cache_until_ts = max(self._sign_cache_until_ts, max_ts)
-            self._sign_refreshing = False
-        self._log_cache(f"source={source} stored={stored} cache_until={self._sign_cache_until_ts}")
-
-    def _prefetch_sign_batch(self, start_ts, *, blocking=False, count=10, step_seconds=30):
+    def _refresh_sign_result(self, now_ms, source):
         with self._sign_lock:
             if self._sign_refreshing:
-                return
+                return None
             self._sign_refreshing = True
 
-        def fetch():
+        def refresh():
             try:
-                base_ms = int(start_ts) * 1000
-                items = frame_sign_batch(
-                    self._build_sign_input(base_ms),
-                    start_timestamp=int(start_ts),
-                    count=count,
-                    step_seconds=step_seconds,
-                    include_startup=True,
-                )
-                self._store_sign_batch("batch", items)
+                sign_result = frame_sign(self._build_sign_input(now_ms))
+                self._set_sign_result(source, now_ms, sign_result)
             except Exception as exc:
                 with self._sign_lock:
                     self._sign_refreshing = False
-                self._log_cache(f"batch failed error={type(exc).__name__}: {exc}")
+                self._log_cache(f"direct failed error={type(exc).__name__}: {exc}")
 
-        if blocking:
-            fetch()
-        else:
-            threading.Thread(target=fetch, daemon=True).start()
-
-    def _take_cached_sign(self, now_ms):
-        now_ts = int(now_ms // 1000)
-        with self._sign_lock:
-            if not self._sign_cache:
-                return None
-            candidates = [timestamp for timestamp in self._sign_cache if timestamp <= now_ts]
-            if not candidates:
-                timestamp = min(self._sign_cache)
-            else:
-                timestamp = max(candidates)
-            result = self._sign_cache.get(timestamp)
-            for old_ts in list(self._sign_cache):
-                if old_ts < timestamp - 60:
-                    self._sign_cache.pop(old_ts, None)
-            cache_until = self._sign_cache_until_ts
-        if cache_until - now_ts <= 60:
-            self._prefetch_sign_batch(cache_until + 30, blocking=False)
-        return result
+        return refresh
 
     def _refresh_sign_result_background(self, now_ms):
-        cached = self._take_cached_sign(now_ms)
-        if cached is not None:
-            self._set_sign_result("signed_payload_cache", now_ms, cached)
-            return
-
-        self._prefetch_sign_batch(now_ms // 1000, blocking=False)
+        refresh = self._refresh_sign_result(now_ms, "signed_payload_direct")
+        if refresh is not None:
+            threading.Thread(target=refresh, daemon=True).start()
 
     def _current_sign_result(self):
         with self._sign_lock:
@@ -219,10 +178,12 @@ class LocalSeiSigner:
 
     def has_sign_result(self):
         with self._sign_lock:
-            return self._last_sign_result is not None or bool(self._sign_cache)
+            return self._last_sign_result is not None
 
     def start_initial_prefetch(self):
-        self._prefetch_sign_batch(int(time.time()), blocking=True)
+        refresh = self._refresh_sign_result(int(time.time() * 1000), "startup_direct")
+        if refresh is not None:
+            refresh()
 
     def _next_index(self):
         self.index += 1
@@ -233,11 +194,8 @@ class LocalSeiSigner:
             now_ms = int(time.time() * 1000)
         sign_result, signed_ms = self._current_sign_result()
         if sign_result is None:
-            self._prefetch_sign_batch(now_ms // 1000, blocking=True)
-            sign_result = self._take_cached_sign(now_ms)
-            if sign_result is None:
-                sign_result = frame_sign(self._build_sign_input(now_ms))
-            self._set_sign_result("signed_payload_initial", now_ms, sign_result)
+            sign_result = frame_sign(self._build_sign_input(now_ms))
+            self._set_sign_result("signed_payload_initial_direct", now_ms, sign_result)
             signed_ms = now_ms
         elif refresh_signature:
             self._refresh_sign_result_background(now_ms)
@@ -258,10 +216,7 @@ class LocalSeiSigner:
             now_ms = int(time.time() * 1000)
         sign_result, _ = self._current_sign_result()
         if sign_result is None:
-            self._prefetch_sign_batch(now_ms // 1000, blocking=True)
-            sign_result = self._take_cached_sign(now_ms)
-            if sign_result is None:
-                sign_result = frame_sign(self._build_sign_input(now_ms))
+            sign_result = frame_sign(self._build_sign_input(now_ms))
             self._set_sign_result("startup", now_ms, sign_result)
         value = {
             "live_sei_mute_mic": {"is_mute_mic": 0},
@@ -308,10 +263,8 @@ class LocalSeiSigner:
 
 class StudioSeiPacer:
     """
-    Observed official cadence:
-    startup signed + small at the first video timestamp, then a repeating
-    two-second cycle of signed + small on the boundary plus two more signed
-    messages inside the same window.
+    Cadence used by the standalone mirror: startup signed + small, followed by
+    signed and small messages distributed through a repeating two-second cycle.
     """
 
     OFFSETS_MS = (0, 0, 16, 700, 1000)
@@ -325,7 +278,6 @@ class StudioSeiPacer:
     def due(self, flv_timestamp):
         if self.base_timestamp is None:
             self.base_timestamp = flv_timestamp
-
         elapsed = max(0, int(flv_timestamp) - self.base_timestamp)
         due = []
         while True:
@@ -344,7 +296,7 @@ class StudioSeiPacer:
 
 
 def bind_listen_url(url):
-    return str(url).replace("rtmp://127.0.0.1:", "rtmp://0.0.0.0:").replace("rtmp://localhost:", "rtmp://0.0.0.0:")
+    return str(url)
 
 
 def ffmpeg_listen_cmd(ffmpeg, listen_url, timeout):
@@ -409,6 +361,42 @@ def pump_stderr(name, proc, log):
         log.flush()
 
 
+class TeeOutput:
+    def __init__(self, primary, dump_file, log):
+        self.primary = primary
+        self.dump_file = dump_file
+        self.log = log
+
+    def write(self, data):
+        self.primary.write(data)
+        if self.dump_file is None:
+            return
+        try:
+            self.dump_file.write(data)
+        except OSError as exc:
+            self.log.write(f"[dump] disabled after write failure: {exc}\n")
+            self.log.flush()
+            try:
+                self.dump_file.close()
+            except Exception:
+                pass
+            self.dump_file = None
+
+    def flush(self):
+        self.primary.flush()
+        if self.dump_file is not None:
+            try:
+                self.dump_file.flush()
+            except OSError as exc:
+                self.log.write(f"[dump] disabled after flush failure: {exc}\n")
+                self.log.flush()
+                try:
+                    self.dump_file.close()
+                except Exception:
+                    pass
+                self.dump_file = None
+
+
 def inject_stream(src, dst, signer, fps, log):
     pacer = StudioSeiPacer()
     video_tags = 0
@@ -448,7 +436,7 @@ def inject_stream(src, dst, signer, fps, log):
         if tag_header[0] == 9:
             video_tags += 1
             timestamp = int.from_bytes(tag_header[7:8] + tag_header[4:7], "big")
-            due = pacer.due(timestamp)
+            due = pacer.due(timestamp) if video_tag_accepts_sei(tag_data) else []
             if due:
                 hevc = bool(tag_data and (tag_data[0] & 0x80))
                 nals = []
@@ -515,8 +503,16 @@ def _subprocess_creationflags():
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+def _unique_dump_path(path):
+    dump_path = Path(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    nonce = f"{os.getpid()}-{time.time_ns() % 1000000:06d}"
+    return dump_path.with_name(f"{dump_path.stem}.{stamp}.{nonce}{dump_path.suffix or '.flv'}")
+
+
 def _relay_once(args, signer, log):
     listen_proc = None
+    dump_file = None
     input_stream = sys.stdin.buffer
     if args.input_flv == "listen":
         listen_proc = subprocess.Popen(
@@ -538,8 +534,21 @@ def _relay_once(args, signer, log):
     threading.Thread(target=pump_stderr, args=("push", push_proc, log), daemon=True).start()
 
     try:
-        inject_stream(input_stream, push_proc.stdin, signer, args.fps, log)
+        output_stream = push_proc.stdin
+        if args.dump_output_flv:
+            dump_path = _unique_dump_path(args.dump_output_flv)
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            dump_file = dump_path.open("wb")
+            log.write(f"[dump] writing post-SEI outbound FLV to {dump_path}\n")
+            log.flush()
+            output_stream = TeeOutput(output_stream, dump_file, log)
+        inject_stream(input_stream, output_stream, signer, args.fps, log)
     finally:
+        if dump_file is not None:
+            try:
+                dump_file.close()
+            except Exception:
+                pass
         _terminate_process(listen_proc)
         _terminate_process(push_proc)
 
@@ -562,6 +571,7 @@ def main():
     parser.add_argument("--resolution", default="1920x1080")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--log", default="")
+    parser.add_argument("--dump-output-flv", default="")
     args = parser.parse_args()
 
     if args.input_flv == "listen" and not args.listen_url:
@@ -585,6 +595,8 @@ def main():
         height=args.height,
         log=log,
     )
+    log.write("[framesign] implementation=rapidapi\n")
+    log.flush()
     signer.start_initial_prefetch()
 
     try:

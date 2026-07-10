@@ -88,11 +88,16 @@ def _normalize_headers(value) -> dict[str, str]:
         value = value["headers"]
     if not isinstance(value, dict):
         raise ValueError("signature API response is not an object")
-    return {
+    headers = {
         "x-khronos": _string_header(value.get("x-khronos")),
         "x-ladon": _string_header(value.get("x-ladon")),
         "x-argus": _string_header(value.get("x-argus")),
     }
+    if not headers["x-khronos"] or not headers["x-ladon"] or not headers["x-argus"]:
+        raise ValueError(
+            "signature API response has blank x-khronos/x-ladon/x-argus"
+        )
+    return headers
 
 
 def _string_header(value) -> str:
@@ -135,7 +140,10 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
         "path=/signatures "
         f"status={response.status_code} elapsed_ms={elapsed_ms} "
         f"khronos={headers['x-khronos']} "
-        f"ladon_len={len(headers['x-ladon'])} argus_len={len(headers['x-argus'])}"
+        f"ladon_len={len(headers['x-ladon'])} argus_len={len(headers['x-argus'])} "
+        f"params_type={type(payload.get('params')).__name__} "
+        f"stub_len={len(str(payload.get('stub') or ''))} "
+        f"device_id_set={bool(str(payload.get('device_id') or ''))}"
     )
     return headers
 
@@ -150,12 +158,8 @@ def signature_headers(
 ):
     khronos = _fallback_khronos(timestamp)
     if not _should_use_api():
-        _log("missing RapidAPI key; returning blank signature headers")
-        return {
-            "x-khronos": khronos,
-            "x-ladon": "",
-            "x-argus": "",
-        }
+        _log("missing RapidAPI key; refusing to send blank signature headers")
+        raise RuntimeError("RapidAPI signer key is required for request signing")
 
     payload = {
         "timestamp": int(khronos),
@@ -171,12 +175,8 @@ def signature_headers(
             headers["x-khronos"] = khronos
         return headers
     except Exception as exc:
-        _log(f"signature API failed; returning blank signatures: {exc}")
-        return {
-            "x-khronos": khronos,
-            "x-ladon": "",
-            "x-argus": "",
-        }
+        _log(f"signature API failed; refusing to send blank signatures: {exc}")
+        raise RuntimeError(f"signature API failed: {exc}") from exc
 
 
 def make_ladon(x_khronos: int, local_id: int, aid: str = "8311", **_kwargs):

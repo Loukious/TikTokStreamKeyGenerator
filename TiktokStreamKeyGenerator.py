@@ -149,11 +149,14 @@ PING_ANCHOR_TIMEOUT_SECONDS = 2.5
 ROOM_HAS_FINISHED_CODES = {"30003", "30003001"}
 ROOM_IS_LIVING_CODE = "4003150"
 PERCEPTION_VIOLATION_SCENES = (7, 10, 16)
-LOCAL_PROXY_DEFAULT_PORT = 1935
+LOCAL_PROXY_DEFAULT_PORT = 19350
 LOCAL_PROXY_APP_NAME = "live"
 LOCAL_PROXY_STREAM_KEY = "obs"
 LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS = 120
 LOCAL_PROXY_LOG_NAME = "ffmpeg_proxy.log"
+ENABLE_STUDIO_STATS_POLLING = True
+ENABLE_ONLINE_AUDIENCE_POLLING = True
+ENABLE_SAFETY_DETAIL_POLLING = True
 
 
 def _application_dir():
@@ -201,6 +204,43 @@ class WebcastError(RuntimeError):
         self.status_code = status_code
         self.payload = payload
         self.action = action
+
+
+def _audit_webcast_request(method, url, params, headers, status_code):
+    try:
+        split = urllib.parse.urlsplit(url)
+        request_headers = headers or {}
+        khronos = str(request_headers.get("x-khronos", "") or "")
+        ladon = str(request_headers.get("x-ladon", "") or "")
+        argus = str(request_headers.get("x-argus", "") or "")
+        stub = str(request_headers.get("x-ss-stub", "") or "")
+        device_id = _param_value(params, "device_id")
+        line = (
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S')} "
+            f"method={method} path={split.path} status={status_code} "
+            f"khronos={khronos} ladon_len={len(ladon)} argus_len={len(argus)} "
+            f"stub_len={len(stub)} device_id_set={bool(device_id)}\n"
+        )
+        path = os.path.join(_runtime_logs_dir(), "webcast_requests.log")
+        with open(path, "a", encoding="utf-8", errors="replace") as file:
+            file.write(line)
+    except Exception:
+        pass
+
+
+def _audit_violation_list(violation_list_type, data, records, summaries):
+    try:
+        line = (
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S')} "
+            f"type={violation_list_type} server_active={data.get('active_count')} "
+            f"server_history={data.get('history_count')} records={len(records)} "
+            f"summaries={json.dumps(summaries[:3], ensure_ascii=False)}\n"
+        )
+        path = os.path.join(_runtime_logs_dir(), "violation_list.log")
+        with open(path, "a", encoding="utf-8", errors="replace") as file:
+            file.write(line)
+    except Exception:
+        pass
 
 
 def _is_already_ended_payload(payload):
@@ -672,6 +712,7 @@ class Stream:
             timeout=timeout,
         )
         update_ntp_from_response(t0_ms, response)
+        _audit_webcast_request(method, url, params, request_headers, response.status_code)
         try:
             self.save_cookies()
         except Exception:
@@ -1430,6 +1471,10 @@ class Stream:
             "aid": "8311",
             "violation_list_type": str(violation_list_type),
         }
+        if device_id:
+            params["device_id"] = str(device_id)
+        if install_id:
+            params["iid"] = str(install_id)
         url = self.getServerUrl() + "webcast/eco/violation_list/"
         payload = self._signed_get_json(
             url,
@@ -1457,6 +1502,9 @@ class Stream:
             for record in records
             if isinstance(record, dict) and self._eco_violation_id(record)
         ]
+        active_summaries = [self._format_eco_violation_record(record) for record in active_records]
+        recent_summaries = [self._format_eco_violation_record(record) for record in records if isinstance(record, dict)]
+        _audit_violation_list(violation_list_type, data, records, active_summaries if violation_list_type == 0 else recent_summaries)
 
         return {
             "violation_list_type": violation_list_type,
@@ -1473,8 +1521,8 @@ class Stream:
             "active_records": active_records,
             "active_ids": active_ids,
             "recent_ids": recent_ids,
-            "active_summaries": [self._format_eco_violation_record(record) for record in active_records],
-            "recent_summaries": [self._format_eco_violation_record(record) for record in records if isinstance(record, dict)],
+            "active_summaries": active_summaries,
+            "recent_summaries": recent_summaries,
             "raw": payload,
         }
 
@@ -1482,19 +1530,20 @@ class Stream:
         room_id = str(room_id or self.roomId or "").strip()
         errors = []
         create_data = {}
-        try:
-            create_info = self.getCreateRoomInfo(
-                device_id=device_id,
-                install_id=install_id,
-                priority_region=priority_region,
-                last_time_hashtag_id=last_time_hashtag_id,
-            )
-            create_data = self._payload_data(create_info)
-        except Exception as exc:
-            errors.append(f"create_info: {exc}")
+        if ENABLE_SAFETY_DETAIL_POLLING:
+            try:
+                create_info = self.getCreateRoomInfo(
+                    device_id=device_id,
+                    install_id=install_id,
+                    priority_region=priority_region,
+                    last_time_hashtag_id=last_time_hashtag_id,
+                )
+                create_data = self._payload_data(create_info)
+            except Exception as exc:
+                errors.append(f"create_info: {exc}")
 
         room_info = {"room": {}, "perception_info": {}, "room_auth": {}}
-        if room_id:
+        if ENABLE_SAFETY_DETAIL_POLLING and room_id:
             try:
                 room_info = self.getRoomInfo(
                     device_id=device_id,
@@ -2308,9 +2357,26 @@ def fetch_game_tags():
 
 
 def _runtime_base_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
+    if _is_packaged_app():
+        return os.path.dirname(_app_executable_path())
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _is_packaged_app():
+    return bool(getattr(sys, "frozen", False) or globals().get("__compiled__"))
+
+
+def _app_executable_path():
+    candidates = [
+        sys.argv[0] if sys.argv else "",
+        sys.executable,
+    ]
+    for candidate in candidates:
+        if candidate:
+            path = os.path.abspath(candidate)
+            if os.path.exists(path):
+                return path
+    return os.path.abspath(sys.executable)
 
 
 def _runtime_logs_dir():
@@ -2370,6 +2436,14 @@ def _safe_log_tail(path, max_lines=30):
             return "".join(file.readlines()[-max_lines:]).strip()
     except OSError:
         return ""
+
+
+def _mask_stream_url(value):
+    if not value.startswith("rtmp://"):
+        return value
+    if "?" not in value:
+        return value
+    return value.split("?", 1)[0] + "?..."
 
 
 # ----------------------------------------------------------------------
@@ -3231,14 +3305,32 @@ class StreamKeyGeneratorWindow(QWidget):
             return str(value)
 
     def sync_realtime_stats_timer(self):
-        should_run = bool(self.is_live and self.current_room_id)
-        if should_run:
-            if not self.realtime_stats_timer.isActive():
-                self.realtime_stats_timer.start()
-        else:
-            self.realtime_stats_timer.stop()
+        if ENABLE_STUDIO_STATS_POLLING:
+            should_run = bool(self.is_live and self.current_room_id)
+            if should_run:
+                if not self.realtime_stats_timer.isActive():
+                    self.realtime_stats_timer.start()
+            else:
+                self.realtime_stats_timer.stop()
+            return
+
+        self.realtime_stats_timer.stop()
 
     def refresh_realtime_stats(self, force=False):
+        self.sync_realtime_stats_timer()
+        if not ENABLE_STUDIO_STATS_POLLING:
+            # Keep the Studio stats/trends endpoints quiet while using the local
+            # RTMP proxy. They are not needed for stream health and are a strong
+            # integrity-signal suspect compared with the mirror path.
+            if force and hasattr(self, "refresh_stats_button"):
+                self.refresh_stats_button.setEnabled(True)
+                self.refresh_stats_button.setText("Refresh Stats")
+            return
+
+        if force and hasattr(self, "refresh_stats_button"):
+            self.refresh_stats_button.setEnabled(True)
+            self.refresh_stats_button.setText("Refresh Stats")
+
         if self.realtime_stats_in_flight:
             return
         if not self.current_room_id:
@@ -3595,7 +3687,7 @@ class StreamKeyGeneratorWindow(QWidget):
             self.refresh_audience_safety_button.setText("Refreshing...")
 
         room_id = self.current_room_id
-        can_fetch_audience = bool(self.is_live and room_id)
+        can_fetch_audience = bool(ENABLE_ONLINE_AUDIENCE_POLLING and self.is_live and room_id)
         if not can_fetch_audience:
             room_id = ""
         anchor_id = self.current_anchor_id or self.account_user_id.text().strip()
@@ -3975,8 +4067,8 @@ class StreamKeyGeneratorWindow(QWidget):
             self.ffmpeg_proxy_sei_log_path,
         ]
 
-        if getattr(sys, "frozen", False):
-            return [sys.executable, "--sei-proxy", *proxy_args]
+        if _is_packaged_app():
+            return [_app_executable_path(), "--sei-proxy", *proxy_args]
 
         sei_proxy = os.path.join(_runtime_base_dir(), "Libs", "ffmpeg_sei_proxy.py")
         if os.path.exists(sei_proxy):
@@ -4035,6 +4127,12 @@ class StreamKeyGeneratorWindow(QWidget):
             self.ffmpeg_proxy_log_file = open(self.ffmpeg_proxy_log_path, "w", encoding="utf-8", errors="replace")
 
             command = self.build_ffmpeg_proxy_command(ffmpeg_path, local_input_url, tiktok_output_url)
+            self.ffmpeg_proxy_log_file.write(
+                "[proxy] command: "
+                + " ".join(_mask_stream_url(str(part)) for part in command)
+                + "\n"
+            )
+            self.ffmpeg_proxy_log_file.flush()
             creationflags = 0
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -5013,10 +5111,26 @@ def handle_protocol_callback(port, url):
 
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--sei-proxy":
-        from Libs.ffmpeg_sei_proxy import main as sei_proxy_main
+        log_path = None
+        try:
+            log_path = os.path.join(_runtime_logs_dir(), "sei_proxy_boot.log")
+            with open(log_path, "a", encoding="utf-8", errors="replace") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} child entry argv={sys.argv[1:]}\n")
 
-        sys.argv = [sys.argv[0], *sys.argv[2:]]
-        raise SystemExit(sei_proxy_main())
+            from Libs.ffmpeg_sei_proxy import main as sei_proxy_main
+
+            sys.argv = [sys.argv[0], *sys.argv[2:]]
+            raise SystemExit(sei_proxy_main())
+        except SystemExit:
+            raise
+        except Exception as exc:
+            try:
+                if log_path:
+                    with open(log_path, "a", encoding="utf-8", errors="replace") as fh:
+                        fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} child failed: {exc!r}\n")
+            except Exception:
+                pass
+            raise
 
     # Check if this invocation is for protocol callback
     if len(sys.argv) >= 3 and sys.argv[1] == "--protocol-callback":
