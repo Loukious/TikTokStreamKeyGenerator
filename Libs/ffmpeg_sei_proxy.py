@@ -117,6 +117,7 @@ class LocalSeiSigner:
         self._next_refresh_flv_ts = None
         self._sign_lock = threading.Lock()
         self._sign_refreshing = False
+        self._sign_failure_ms = 0
 
     def _log_sign_result(self, source, now_ms, result):
         if self.log is None:
@@ -148,9 +149,10 @@ class LocalSeiSigner:
             self._last_sign_result = result
             self._last_signed_ms = now_ms
             self._sign_refreshing = False
+            self._sign_failure_ms = 0
         self._log_sign_result(source, now_ms, result)
 
-    def _refresh_sign_result(self, now_ms, source):
+    def _refresh_sign_result(self, now_ms, source, raise_on_error=False):
         with self._sign_lock:
             if self._sign_refreshing:
                 return None
@@ -163,7 +165,10 @@ class LocalSeiSigner:
             except Exception as exc:
                 with self._sign_lock:
                     self._sign_refreshing = False
+                    self._sign_failure_ms = int(time.time() * 1000)
                 self._log_cache(f"direct failed error={type(exc).__name__}: {exc}")
+                if raise_on_error:
+                    raise
 
         return refresh
 
@@ -181,7 +186,11 @@ class LocalSeiSigner:
             return self._last_sign_result is not None
 
     def start_initial_prefetch(self):
-        refresh = self._refresh_sign_result(int(time.time() * 1000), "startup_direct")
+        refresh = self._refresh_sign_result(
+            int(time.time() * 1000),
+            "startup_direct",
+            raise_on_error=True,
+        )
         if refresh is not None:
             refresh()
 
@@ -193,6 +202,12 @@ class LocalSeiSigner:
         if now_ms is None:
             now_ms = int(time.time() * 1000)
         sign_result, signed_ms = self._current_sign_result()
+        with self._sign_lock:
+            sign_failure_ms = self._sign_failure_ms
+        if sign_result is not None and sign_failure_ms:
+            raise RuntimeError(
+                "Frame-sign API unavailable; refusing to forward stale SEI signatures."
+            )
         if sign_result is None:
             sign_result = frame_sign(self._build_sign_input(now_ms))
             self._set_sign_result("signed_payload_initial_direct", now_ms, sign_result)

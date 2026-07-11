@@ -2992,7 +2992,7 @@ class StreamKeyGeneratorWindow(QWidget):
         self.proxy_status_output.setFixedHeight(28)
         allow_horizontal_shrink(self.proxy_status_output)
         proxy_row.addWidget(self.proxy_status_output)
-        self.toggle_stream_credentials_button = QPushButton("Show Real TikTok URL")
+        self.toggle_stream_credentials_button = QPushButton("Real TikTok URL hidden")
         self.toggle_stream_credentials_button.setEnabled(False)
         self.toggle_stream_credentials_button.setFixedHeight(28)
         allow_button_shrink(self.toggle_stream_credentials_button)
@@ -3270,7 +3270,7 @@ class StreamKeyGeneratorWindow(QWidget):
         self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
         self.local_proxy_starting = False
         self.show_real_stream_credentials = False
-        self.toggle_stream_credentials_button.setText("Show Real TikTok URL")
+        self.toggle_stream_credentials_button.setText("Real TikTok URL hidden")
         self.toggle_stream_credentials_button.setEnabled(False)
         if hasattr(self, "proxy_status_output") and not self.local_proxy_active:
             self.proxy_status_output.clear()
@@ -3989,32 +3989,29 @@ class StreamKeyGeneratorWindow(QWidget):
             self.proxy_status_output.setText(str(message or ""))
 
     def toggle_stream_credentials_display(self):
-        if not self.real_stream_url:
-            return
-        self.show_real_stream_credentials = not self.show_real_stream_credentials
+        # The real TikTok destination is intentionally never exposed by the GUI.
+        self.show_real_stream_credentials = False
         self.refresh_stream_credentials_display()
 
     def refresh_stream_credentials_display(self):
         self.share_url_output.setText(self.real_share_url)
-        has_real_credentials = bool(self.real_base_stream_url and self.real_stream_key)
         has_local_credentials = bool(self.local_proxy_active and self.local_proxy_server_url)
-        self.toggle_stream_credentials_button.setEnabled(has_real_credentials and has_local_credentials)
+        self.show_real_stream_credentials = False
+        self.toggle_stream_credentials_button.setEnabled(False)
+        self.toggle_stream_credentials_button.setText("Real TikTok URL hidden")
 
         if self.local_proxy_starting:
             self.url_output.clear()
             self.key_output.clear()
-            self.toggle_stream_credentials_button.setText("Show Real TikTok URL")
             return
 
-        if self.show_real_stream_credentials or not has_local_credentials:
-            self.url_output.setText(self.real_base_stream_url)
-            self.key_output.setText(self.real_stream_key)
-            self.toggle_stream_credentials_button.setText("Show Local OBS URL")
+        if not has_local_credentials:
+            self.url_output.clear()
+            self.key_output.clear()
             return
 
         self.url_output.setText(self.local_proxy_server_url)
         self.key_output.setText(self.local_proxy_stream_key)
-        self.toggle_stream_credentials_button.setText("Show Real TikTok URL")
 
     def ffmpeg_proxy_is_running(self):
         return self.ffmpeg_proxy_process is not None and self.ffmpeg_proxy_process.poll() is None
@@ -4217,10 +4214,17 @@ class StreamKeyGeneratorWindow(QWidget):
             return
 
         self.local_proxy_active = False
-        self.show_real_stream_credentials = True
         self.ffmpeg_proxy_watch_timer.stop()
-        self.set_proxy_status(f"Proxy stopped with code {return_code}. Showing real TikTok URL.")
+        self.set_stream_state(is_live=False)
+        self.clear_output_fields()
+        self.set_proxy_status(
+            f"Proxy stopped with code {return_code}; forwarding halted because signed metadata is unavailable."
+        )
         self.refresh_stream_credentials_display()
+        self.show_error(
+            "The signed FFmpeg proxy stopped, so forwarding was halted. "
+            "The real TikTok URL/key is intentionally not exposed."
+        )
 
     def update_stream_controls(self, has_cookies=None):
         if has_cookies is None:
@@ -4236,9 +4240,7 @@ class StreamKeyGeneratorWindow(QWidget):
         if hasattr(self, "refresh_audience_safety_button"):
             self.refresh_audience_safety_button.setEnabled(has_cookies)
         if hasattr(self, "toggle_stream_credentials_button"):
-            self.toggle_stream_credentials_button.setEnabled(
-                bool(self.real_stream_url and self.local_proxy_active and self.local_proxy_server_url)
-            )
+            self.toggle_stream_credentials_button.setEnabled(False)
 
     def apply_stream_outputs(self, stream, priority_region="", start_proxy=True):
         self.clear_output_fields()
@@ -4260,12 +4262,13 @@ class StreamKeyGeneratorWindow(QWidget):
             try:
                 self.start_ffmpeg_proxy(self.real_stream_url)
             except Exception as exc:
-                self.local_proxy_active = False
-                self.show_real_stream_credentials = True
-                self.set_proxy_status("Proxy failed. Showing real TikTok URL.")
+                self.set_stream_state(is_live=False)
+                self.clear_output_fields()
+                self.set_proxy_status("Stream blocked: signed FFmpeg proxy is unavailable.")
                 self.refresh_stream_credentials_display()
-                self.show_error(
-                    "The local FFmpeg proxy could not start, so the real TikTok URL/key is shown instead.\n\n"
+                raise RuntimeError(
+                    "The stream was blocked because the signed FFmpeg proxy could not start. "
+                    "The real TikTok URL/key was not exposed.\n\n"
                     f"{exc}"
                 )
 
@@ -4749,8 +4752,8 @@ class StreamKeyGeneratorWindow(QWidget):
                             room_id=room_id,
                             stream_id=stream_id,
                         )
-                        stream_started = True
                         self.apply_stream_outputs(stream, priority_region=effective_region)
+                        stream_started = True
                         self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                         self.set_stream_state(is_live=True, is_paused=False)
                         self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
@@ -4808,8 +4811,8 @@ class StreamKeyGeneratorWindow(QWidget):
                 )
 
                 if created:
-                    stream_started = True
                     self.apply_stream_outputs(stream, priority_region=selected_region)
+                    stream_started = True
                     self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                     self.set_stream_state(is_live=True, is_paused=False)
                     self.start_anchor_ping_loop(ANCHOR_STATUS_PREPARE, send_immediately=True)
