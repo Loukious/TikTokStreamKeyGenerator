@@ -131,7 +131,14 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
     except Exception:
         data = {"success": False, "error": response.text[:500]}
 
-    response.raise_for_status()
+    if response.status_code >= 400:
+        detail = ""
+        if isinstance(data, dict):
+            detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
+        detail = detail.strip() or response.text[:500].strip()
+        raise RuntimeError(
+            f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
+        )
     if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(str(data.get("error") or data))
 

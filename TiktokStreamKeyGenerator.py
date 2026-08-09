@@ -3201,7 +3201,91 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.on_topic_changed(self.topic_combo.currentText())
 
+    def _rapidapi_error_kind(self, message):
+        text = str(message or "").strip()
+        lowered = text.lower()
+        signer_markers = (
+            "rapidapi",
+            "signer",
+            "signature api",
+            "frame-sign",
+            "framesign",
+            "signed ffmpeg",
+            "signed metadata",
+        )
+        if not any(marker in lowered for marker in signer_markers):
+            return ""
+
+        quota_markers = (
+            "quota",
+            "rate limit",
+            "too many requests",
+            "monthly",
+            "exceeded",
+            "429",
+            "limit reached",
+        )
+        if any(marker in lowered for marker in quota_markers):
+            return "quota"
+
+        missing_markers = (
+            "required",
+            "not subscribed",
+            "subscription",
+            "401",
+            "403",
+            "forbidden",
+            "unauthorized",
+            "invalid api key",
+        )
+        if not self.get_rapidapi_key() or any(marker in lowered for marker in missing_markers):
+            return "subscription"
+        return "unavailable"
+
+    def show_rapidapi_error(self, message):
+        kind = self._rapidapi_error_kind(message)
+        if kind == "quota":
+            title = "RapidAPI quota exhausted"
+            body = (
+                "The RapidAPI signing quota has been exhausted.\n\n"
+                "The app cannot safely continue without fresh signatures. "
+                "Upgrade the RapidAPI plan or wait for the quota to reset, then try again."
+            )
+        elif kind == "subscription":
+            title = "RapidAPI subscription required"
+            body = (
+                "A RapidAPI signer subscription and key are required.\n\n"
+                "Subscribe to the free tier on the TikTok LIVE Studio API Signer page, "
+                "copy your RapidAPI key, and paste it into the app."
+            )
+        else:
+            title = "RapidAPI signer unavailable"
+            body = (
+                "The RapidAPI signer could not provide valid signatures.\n\n"
+                "Check your RapidAPI key, subscription, network connection, and remaining quota. "
+                "The app will not forward video without valid signatures."
+            )
+
+        details = str(message or "").strip()
+        if len(details) > 800:
+            details = details[:800] + "..."
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Critical)
+        dialog.setWindowTitle(title)
+        dialog.setText(body)
+        if details:
+            dialog.setInformativeText(f"Details:\n{details}")
+        open_button = dialog.addButton("Open RapidAPI signer", QMessageBox.AcceptRole)
+        dialog.addButton(QMessageBox.Close)
+        dialog.exec()
+        if dialog.clickedButton() is open_button:
+            QDesktopServices.openUrl(QUrl(RAPIDAPI_SIGNER_DOCS_URL))
+
     def show_error(self, message):
+        if self._rapidapi_error_kind(message):
+            self.show_rapidapi_error(message)
+            return
         QMessageBox.critical(self, "Error", message)
 
     def show_info(self, message):
@@ -3957,6 +4041,12 @@ class StreamKeyGeneratorWindow(QWidget):
             return self.rapidapi_key_edit.text().strip()
         return str(getattr(self, "rapidapi_key", "") or "").strip()
 
+    def ensure_rapidapi_signer(self):
+        if self.get_rapidapi_key():
+            return True
+        self.show_rapidapi_error("RapidAPI signer key is required for request and frame signing.")
+        return False
+
     def set_rapidapi_key(self, key, *, save=True):
         self.rapidapi_key = str(key or "").strip()
         if hasattr(self, "rapidapi_key_edit"):
@@ -4674,6 +4764,9 @@ class StreamKeyGeneratorWindow(QWidget):
         if not self.ensure_device_identifiers(show_popup=True):
             return
 
+        if not self.ensure_rapidapi_signer():
+            return
+
         stream_started = False
         self.go_live_button.setEnabled(False)
         self.pause_live_button.setEnabled(False)
@@ -4877,6 +4970,8 @@ class StreamKeyGeneratorWindow(QWidget):
             return
         if not self.is_paused:
             self.show_error("The stream is not paused.")
+            return
+        if not self.ensure_rapidapi_signer():
             return
 
         stream_resumed = False

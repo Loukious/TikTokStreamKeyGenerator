@@ -105,7 +105,14 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20) -> dict:
     except Exception:
         data = {"success": False, "error": response.text[:500]}
     _log(f"path={path} status={response.status_code} elapsed_ms={elapsed_ms} keys={list(data) if isinstance(data, dict) else type(data).__name__}")
-    response.raise_for_status()
+    if response.status_code >= 400:
+        detail = ""
+        if isinstance(data, dict):
+            detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
+        detail = detail.strip() or response.text[:500].strip()
+        raise RuntimeError(
+            f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
+        )
     if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(str(data.get("error") or data))
     return data
