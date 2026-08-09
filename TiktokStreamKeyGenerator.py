@@ -4305,15 +4305,18 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.local_proxy_active = False
         self.ffmpeg_proxy_watch_timer.stop()
+        details = _safe_log_tail(getattr(self, "ffmpeg_proxy_sei_log_path", ""))
         self.set_stream_state(is_live=False)
         self.clear_output_fields()
         self.set_proxy_status(
             f"Proxy stopped with code {return_code}; forwarding halted because signed metadata is unavailable."
         )
         self.refresh_stream_credentials_display()
+        detail_text = f"\n\nSigner details:\n{details}" if details else ""
         self.show_error(
             "The signed FFmpeg proxy stopped, so forwarding was halted. "
             "The real TikTok URL/key is intentionally not exposed."
+            f"{detail_text}"
         )
 
     def update_stream_controls(self, has_cookies=None):
