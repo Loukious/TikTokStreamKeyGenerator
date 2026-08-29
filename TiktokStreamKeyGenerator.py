@@ -1802,13 +1802,17 @@ class Stream:
             # Dual layout account-level gate (scene=1), the same signal
             # LIVE Studio uses to show/hide the dual layout button.
             "allow_multi_stream_scene1": dual_data.get("allow_multi_stream"),
-            # Sensitive-feature restriction state. dual_layout_unlocked is
-            # the final verdict: eligible AND past the threshold check.
+            # Sensitive-feature restriction state, mirroring LIVE Studio's
+            # logic: the restriction applies only when
+            #   dualEnable = !allowed && !dual_canvas_used
+            # so an account is unlocked when allowed OR dual_canvas_used
+            # (verified live: a never-used dual-layout account returns
+            # allowed=true, days_to_reach=0, dual_canvas_used=false and the
+            # button is fully enabled in LIVE Studio).
             "dual_threshold": threshold,
             "dual_layout_unlocked": bool(
                 dual_data.get("allow_multi_stream")
-                and threshold.get("allowed")
-                and threshold.get("dual_canvas_used")
+                and (threshold.get("allowed") or threshold.get("dual_canvas_used"))
             ),
             "dual_days_to_reach": threshold.get("days_to_reach"),
         }
@@ -4846,9 +4850,9 @@ class StreamKeyGeneratorWindow(QWidget):
 
         # Update the cached dual-layout capability. The account is dual-layout
         # ready only when both server gates pass: allow_multi_stream (scene=1,
-        # the flag LIVE Studio uses to show the button) AND the new-user
-        # threshold check (allowed + dual_canvas_used, i.e. enough 25-minute
-        # LIVE sessions).
+        # the flag LIVE Studio uses to show the button) AND no new-user
+        # sensitive-feature restriction (threshold allowed OR dual_canvas_used,
+        # mirroring LIVE Studio's dualEnable = !allowed && !dual_canvas_used).
         allow_dual = info.get("allow_multi_stream_scene1")
         if allow_dual is not None:
             self.dual_layout_supported = bool(allow_dual and info.get("dual_layout_unlocked"))
