@@ -91,6 +91,23 @@ Then:
 
 OBS should use the local RTMP server/key shown by the app, not the real TikTok URL/key.
 
+## Logging In With Exported Cookies
+
+If browser login is unavailable or keeps failing, you can skip it by importing cookies from a browser where you are already logged in to TikTok:
+
+1. Install the [Export cookie JSON file for Puppeteer](https://chromewebstore.google.com/detail/export-cookie-json-file-f/nmckokihipjgplolmcmjakknndddifde) extension in Chrome.
+2. Log in to TikTok in Chrome and stay on a `tiktok.com` page.
+3. Click the extension icon and export the cookies. It downloads a JSON file containing the session for the site you are on.
+4. In the app, point the **Cookies file** field at the downloaded JSON file (type or paste the path, or edit `cookies_path` in the config), then use **Refresh Account Info**.
+
+The exported file is a JSON array of `{name, value, domain, ...}` cookie objects, which is the format the app reads directly.
+
+Notes:
+
+- Make sure you export while logged in with the account you intend to stream from.
+- Cookie files are live account credentials. Do not share them or commit them to git.
+- Sessions expire; if the app stops authenticating, log in again in the browser and export a fresh file.
+
 ## Dual Layout (Portrait + Landscape)
 
 Check **Dual Layout (Portrait + Landscape)** in the Options before clicking **Go Live** to create a `multi_stream_scene=1` room with two canvases. The app then starts two signed local RTMP listeners:
@@ -137,4 +154,4 @@ Yes. The app cannot give LIVE access to accounts that do not already have permis
 
 ### I get a login error. What should I do?
 
-Try logging in again, restarting the app, or using another available TikTok server/region option. If browser login is blocked, export TikTok cookies from your browser and import them into the app when supported.
+Try logging in again, restarting the app, or using another available TikTok server/region option. If browser login is blocked, you can import cookies exported from your browser instead — see [Logging In With Exported Cookies](#logging-in-with-exported-cookies).
