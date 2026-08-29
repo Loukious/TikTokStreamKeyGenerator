@@ -91,6 +91,22 @@ Then:
 
 OBS should use the local RTMP server/key shown by the app, not the real TikTok URL/key.
 
+## Dual Layout (Portrait + Landscape)
+
+Check **Dual Layout (Portrait + Landscape)** in the Options before clicking **Go Live** to create a `multi_stream_scene=1` room with two canvases. The app then starts two signed local RTMP listeners:
+
+- **Stream URL / Stream Key** (labeled *Landscape* in dual mode) — the existing endpoint, by default `rtmp://127.0.0.1:19350/live/obs`, forwards to the room's **landscape** canvas (`multi_stream_url`). Existing OBS setups keep working unchanged.
+- **Portrait Stream URL / Stream Key** — a second endpoint, by default `rtmp://127.0.0.1:19351/live/portrait`, forwards to the room's **portrait/vertical** canvas (the main `stream_url`).
+
+Feed the portrait endpoint from a second encoder output: an OBS multi-RTMP output plugin, a second OBS instance with a vertical canvas, or an `ffmpeg` push.
+
+Notes:
+
+- The account must be allowed dual layout. If TikTok does not return a second push URL, the app ends the freshly created room and tells you to retry without the checkbox.
+- Resuming an existing room only stays dual when that room has a `multi_stream_url`; otherwise the app continues with the main canvas only.
+- If either proxy process dies, forwarding is halted on both endpoints (signed metadata can no longer be trusted for the room).
+- Both endpoints sign with the same SEI parameters as the single-stream proxy.
+
 ## Output
 
 The app can show:

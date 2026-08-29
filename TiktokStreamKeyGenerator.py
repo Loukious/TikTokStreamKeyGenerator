@@ -154,6 +154,11 @@ LOCAL_PROXY_APP_NAME = "live"
 LOCAL_PROXY_STREAM_KEY = "obs"
 LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS = 120
 LOCAL_PROXY_LOG_NAME = "ffmpeg_proxy.log"
+# Dual layout: second signed listener for the portrait (vertical) canvas.
+LOCAL_PROXY_PORTRAIT_DEFAULT_PORT = 19351
+LOCAL_PROXY_PORTRAIT_APP_NAME = "live"
+LOCAL_PROXY_PORTRAIT_STREAM_KEY = "portrait"
+LOCAL_PROXY_PORTRAIT_LOG_NAME = "ffmpeg_proxy_portrait.log"
 ENABLE_STUDIO_STATS_POLLING = True
 ENABLE_ONLINE_AUDIENCE_POLLING = True
 ENABLE_SAFETY_DETAIL_POLLING = True
@@ -1730,8 +1735,37 @@ class Stream:
             priority_region=priority_region,
         )
 
+        # Scene=1 is what TikTok LIVE Studio queries to decide whether the
+        # dual layout button is shown at all; verified against Charles
+        # captures: accounts with dual access return allow_multi_stream=true
+        # here, accounts without return false.
+        dual_params = dict(common_params)
+        dual_params["scene"] = "1"
+        dual_create_info = self._signed_get_json(
+            base_url + "webcast/game/basic/create_info/",
+            params=dual_params,
+            priority_region=priority_region,
+        )
+
         create_data = create_info.get("data", {}) if isinstance(create_info, dict) else {}
         game_data = game_create_info.get("data", {}) if isinstance(game_create_info, dict) else {}
+        dual_data = dual_create_info.get("data", {}) if isinstance(dual_create_info, dict) else {}
+
+        # New-user sensitive-feature restriction: dual layout stays locked
+        # until the account has gone LIVE enough 25-minute sessions.
+        # /webcast/anchor_tool/threshold/check/ -> {allowed, dual_canvas_used,
+        # days_to_reach}. Trailing slash avoids a 301 redirect.
+        threshold = {}
+        try:
+            threshold_payload = self._signed_get_json(
+                base_url + "webcast/anchor_tool/threshold/check/",
+                params=dict(common_params),
+                priority_region=priority_region,
+            )
+            if isinstance(threshold_payload, dict):
+                threshold = threshold_payload.get("data") or {}
+        except Exception:
+            threshold = {}
 
         ban_status = create_data.get("ban_status") or {}
         advanced_ban_status = create_data.get("advanced_live_ban_status") or {}
@@ -1765,6 +1799,18 @@ class Stream:
             "can_go_live": can_go_live,
             "status": " / ".join(status_parts),
             "allow_multi_stream": game_data.get("allow_multi_stream", False),
+            # Dual layout account-level gate (scene=1), the same signal
+            # LIVE Studio uses to show/hide the dual layout button.
+            "allow_multi_stream_scene1": dual_data.get("allow_multi_stream"),
+            # Sensitive-feature restriction state. dual_layout_unlocked is
+            # the final verdict: eligible AND past the threshold check.
+            "dual_threshold": threshold,
+            "dual_layout_unlocked": bool(
+                dual_data.get("allow_multi_stream")
+                and threshold.get("allowed")
+                and threshold.get("dual_canvas_used")
+            ),
+            "dual_days_to_reach": threshold.get("days_to_reach"),
         }
 
     def uploadThumbnail(self, file_path, base_url, params):
@@ -2467,20 +2513,37 @@ def backup_protocol_registry():
 
 
 def register_temporary_protocol_handler(python_exe, script_path, port):
-    """Register live-studio-app to call this script with --protocol-callback and port."""
+    """Register live-studio-app to call this script with --protocol-callback and port.
+
+    script_path may be None for frozen/compiled builds, where the executable
+    itself handles --protocol-callback.
+    """
     if sys.platform != "win32":
         return False
     try:
+        if script_path:
+            command = f'"{python_exe}" "{script_path}" --protocol-callback {port} "%1"'
+        else:
+            command = f'"{python_exe}" --protocol-callback {port} "%1"'
+
         root_key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\live-studio-app")
         winreg.SetValue(root_key, "", winreg.REG_SZ, "URL:live-studio-app")
         winreg.SetValueEx(root_key, "URL Protocol", 0, winreg.REG_SZ, "")
 
         shell_key = winreg.CreateKey(root_key, r"shell\open\command")
-        command = f'"{python_exe}" "{script_path}" --protocol-callback {port} "%1"'
         winreg.SetValue(shell_key, "", winreg.REG_SZ, command)
 
+        # Verify the write round-tripped before telling the caller it worked —
+        # a silently failed registration means the browser redirect goes
+        # nowhere and login times out.
+        check_key = winreg.OpenKey(shell_key, "", 0, winreg.KEY_READ)
+        written, _ = winreg.QueryValueEx(check_key, "")
+        winreg.CloseKey(check_key)
         winreg.CloseKey(shell_key)
         winreg.CloseKey(root_key)
+        if written != command:
+            print(f"Protocol registration verification mismatch: {written!r} != {command!r}")
+            return False
 
         import ctypes
         ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)
@@ -2529,28 +2592,73 @@ def restore_protocol_registry(backup):
             print(f"Restore error: {e}")
 
 
-def start_callback_server():
-    """Create a listening socket and return (server_thread, port, callback_event, result_container)."""
+def start_callback_server(stop_event=None):
+    """Create a listening socket and return (server_thread, port, callback_event, result_container).
+
+    Keeps accepting connections until one delivers a valid "URL:<...>" payload
+    (starts with live-studio-app: and carries an id_token) or the stop event is
+    set. Stray/partial connections (browser pre-connects, probes, truncated
+    sends) are rejected without consuming the listener, so the real callback
+    can still arrive afterwards.
+    """
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen(1)
+    server_socket.listen(5)
+    server_socket.settimeout(0.5)
     port = server_socket.getsockname()[1]
 
     result = {"url": None}
     event = threading.Event()
+    if stop_event is None:
+        stop_event = threading.Event()
 
     def wait_for_callback():
         try:
-            conn, addr = server_socket.accept()
-            data = conn.recv(4096).decode()
-            if data.startswith("URL:"):
-                result["url"] = data[4:]
-            conn.close()
+            while not stop_event.is_set() and not event.is_set():
+                try:
+                    conn, addr = server_socket.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    # Read until the sender closes or we have the whole URL:
+                    # id_token JWTs are several KB and a single recv() can
+                    # truncate them.
+                    conn.settimeout(5)
+                    chunks = []
+                    while True:
+                        try:
+                            chunk = conn.recv(4096)
+                        except socket.timeout:
+                            break
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if sum(len(c) for c in chunks) > 65536:
+                            break
+                    data = b"".join(chunks).decode("utf-8", "replace")
+                except Exception:
+                    data = ""
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if data.startswith("URL:") and "id_token" in data:
+                    result["url"] = data[4:].strip()
+                    event.set()
+                # Anything else (junk, partial, missing token) is dropped and
+                # we keep listening for the real callback.
         except Exception:
             pass
         finally:
             event.set()
-            server_socket.close()
+            try:
+                server_socket.close()
+            except Exception:
+                pass
 
     thread = threading.Thread(target=wait_for_callback, daemon=True)
     thread.start()
@@ -2582,6 +2690,9 @@ class StreamKeyGeneratorWindow(QWidget):
         self.current_stream_id = ""
         self.stream_priority_region = ""
         self.is_live = False
+        # Cached dual-layout capability probe result for the current account:
+        # None = never probed, True/False = last probe outcome.
+        self.dual_layout_supported = None
         self.is_paused = False
         self.account_can_go_live = None
         self.suppress_donation_reminder = False
@@ -2611,10 +2722,22 @@ class StreamKeyGeneratorWindow(QWidget):
         self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
         self.local_proxy_active = False
         self.local_proxy_starting = False
+        # Dual layout: second signed listener for the portrait canvas.
+        self.dual_layout_active = False
+        self.ffmpeg_proxy_portrait_process = None
+        self.ffmpeg_proxy_portrait_log_file = None
+        self.ffmpeg_proxy_portrait_log_path = ""
+        self.ffmpeg_proxy_portrait_sei_log_path = ""
+        self.local_portrait_proxy_port = LOCAL_PROXY_PORTRAIT_DEFAULT_PORT
+        self.local_portrait_proxy_server_url = ""
+        self.local_portrait_proxy_stream_key = LOCAL_PROXY_PORTRAIT_STREAM_KEY
+        self.local_portrait_proxy_active = False
         self.show_real_stream_credentials = False
         self.real_stream_url = ""
         self.real_base_stream_url = ""
         self.real_stream_key = ""
+        self.real_multi_stream_url = ""
+        self.real_multi_stream_key = ""
         self.real_share_url = ""
         self.active_violation_ids = set()
         self.last_active_violation_count = 0
@@ -2752,6 +2875,19 @@ class StreamKeyGeneratorWindow(QWidget):
         self.close_room_checkbox.setMinimumWidth(0)
         self.close_room_checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         options_grid.addWidget(self.close_room_checkbox, 1, 0, 1, 2)
+
+        self.dual_layout_checkbox = QCheckBox("Dual Layout (Portrait + Landscape)")
+        self.dual_layout_checkbox.setMinimumWidth(0)
+        self.dual_layout_checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.dual_layout_checkbox.setEnabled(False)
+        self.dual_layout_checkbox.setToolTip(
+            "Create a multi_stream_scene=1 room with two canvases. The existing Stream URL/Key "
+            "stays on the landscape canvas and a second portrait endpoint is added for the "
+            "vertical canvas. Only enabled once Refresh Account Info confirms this account "
+            "has dual layout access (Can Dual Layout = True)."
+        )
+        options_grid.addWidget(self.dual_layout_checkbox, 2, 0, 1, 2)
+
         options_grid.setColumnStretch(0, 1)
         options_grid.setColumnStretch(1, 1)
         input_layout.addLayout(options_grid)
@@ -2788,13 +2924,6 @@ class StreamKeyGeneratorWindow(QWidget):
         account_layout.setContentsMargins(12, 16, 12, 12)
         account_layout.setSpacing(6)
         account_layout.setAlignment(Qt.AlignTop)
-
-        def add_account_field(label_text, widget):
-            label = QLabel(label_text)
-            label.setStyleSheet("font-weight: bold;")
-            allow_label_shrink(label)
-            account_layout.addWidget(label)
-            account_layout.addWidget(widget)
 
         session_label = QLabel("Cookies JSON")
         session_label.setStyleSheet("font-weight: bold;")
@@ -2843,41 +2972,48 @@ class StreamKeyGeneratorWindow(QWidget):
 
         account_layout.addLayout(rapidapi_row)
 
-        self.account_username = QLineEdit()
-        self.account_username.setReadOnly(True)
-        self.account_username.setFixedHeight(28)
-        allow_horizontal_shrink(self.account_username)
-        add_account_field("Username", self.account_username)
+        # Read-only account facts, two label/field pairs per row to save
+        # vertical space (QLineEdit has no built-in legend or title).
+        facts_grid = QGridLayout()
+        facts_grid.setHorizontalSpacing(6)
+        facts_grid.setVerticalSpacing(6)
 
-        self.account_user_id = QLineEdit()
-        self.account_user_id.setReadOnly(True)
-        self.account_user_id.setFixedHeight(28)
-        allow_horizontal_shrink(self.account_user_id)
-        add_account_field("User ID", self.account_user_id)
+        def make_fact_field():
+            field = QLineEdit()
+            field.setReadOnly(True)
+            field.setFixedHeight(28)
+            allow_horizontal_shrink(field)
+            return field
 
-        self.can_go_live_output = QLineEdit()
-        self.can_go_live_output.setReadOnly(True)
-        self.can_go_live_output.setFixedHeight(28)
-        allow_horizontal_shrink(self.can_go_live_output)
-        add_account_field("Can Go Live", self.can_go_live_output)
+        def add_account_fact(row, col, label_text, widget, tooltip=None):
+            label = QLabel(label_text)
+            label.setStyleSheet("font-weight: bold;")
+            # Minimum (not Ignored) so the grid can never squeeze the label
+            # to zero width when the fields claim the stretch.
+            label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            if tooltip:
+                label.setToolTip(tooltip)
+                widget.setToolTip(tooltip)
+            facts_grid.addWidget(label, row, col * 2)
+            facts_grid.addWidget(widget, row, col * 2 + 1)
 
-        self.account_status = QLineEdit()
-        self.account_status.setReadOnly(True)
-        self.account_status.setFixedHeight(28)
-        allow_horizontal_shrink(self.account_status)
-        add_account_field("Status", self.account_status)
+        self.account_username = make_fact_field()
+        self.can_go_live_output = make_fact_field()
+        self.dual_layout_output = make_fact_field()
+        self.account_status = make_fact_field()
 
-        self.device_id_display = QLineEdit()
-        self.device_id_display.setReadOnly(True)
-        self.device_id_display.setFixedHeight(28)
-        allow_horizontal_shrink(self.device_id_display)
-        add_account_field("Device ID", self.device_id_display)
-
-        self.install_id_display = QLineEdit()
-        self.install_id_display.setReadOnly(True)
-        self.install_id_display.setFixedHeight(28)
-        allow_horizontal_shrink(self.install_id_display)
-        add_account_field("Install ID", self.install_id_display)
+        dual_layout_tip = (
+            "allow_multi_stream from game/basic/create_info?scene=1 - the same "
+            "account-level flag TikTok LIVE Studio uses to show or hide its dual "
+            "layout button. Updated by Refresh Account Info."
+        )
+        add_account_fact(0, 0, "Username", self.account_username)
+        add_account_fact(0, 1, "Can Go Live", self.can_go_live_output)
+        add_account_fact(1, 0, "Can Dual Layout", self.dual_layout_output, dual_layout_tip)
+        add_account_fact(1, 1, "Status", self.account_status)
+        facts_grid.setColumnStretch(1, 1)
+        facts_grid.setColumnStretch(3, 1)
+        account_layout.addLayout(facts_grid)
 
         self.refresh_account_button = QPushButton("Refresh Account Info")
         self.refresh_account_button.clicked.connect(lambda: self.refresh_account_info())
@@ -2893,6 +3029,7 @@ class StreamKeyGeneratorWindow(QWidget):
         output_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         output_layout = QVBoxLayout(output_group)
         output_layout.setSpacing(5)
+        self.output_layout = output_layout
 
         controls_label = QLabel("Stream Controls")
         controls_label.setStyleSheet("font-weight: bold;")
@@ -2957,17 +3094,24 @@ class StreamKeyGeneratorWindow(QWidget):
         self.share_url_output.setFixedHeight(28)
         allow_horizontal_shrink(self.share_url_output)
 
-        def add_output_row(label_text, output_widget, copy_label):
+        def add_output_row(label_text, output_widget):
+            # A container per row so the label, field and copy button can be
+            # hidden/shown and reordered as one unit.
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(2)
             label = QLabel(label_text)
             label.setStyleSheet("font-weight: bold;")
-            output_layout.addWidget(label)
+            container_layout.addWidget(label)
             row = QHBoxLayout()
             row.setSpacing(5)
             row.addWidget(output_widget)
-            copy_button = QPushButton(copy_label)
-            copy_button.setFixedHeight(28)
-            copy_button.setProperty("copy_default_text", copy_label)
-            allow_button_shrink(copy_button)
+            copy_button = QPushButton("📋")
+            copy_button.setFixedSize(26, 26)
+            copy_button.setToolTip("Copy")
+            copy_button.setStyleSheet("padding: 0; font-size: 13px;")
+            copy_button.setProperty("copy_default_text", "📋")
             copy_button.clicked.connect(
                 lambda checked=False, widget=output_widget, button=copy_button: self.copy_to_clipboard(
                     widget.text(),
@@ -2975,11 +3119,34 @@ class StreamKeyGeneratorWindow(QWidget):
                 )
             )
             row.addWidget(copy_button)
-            output_layout.addLayout(row)
+            container_layout.addLayout(row)
+            output_layout.addWidget(container)
+            return container, label
 
-        add_output_row("Stream URL:", self.url_output, "Copy")
-        add_output_row("Stream Key:", self.key_output, "Copy")
-        add_output_row("Share URL:", self.share_url_output, "Copy")
+        self.stream_url_container, self.stream_url_label = add_output_row("Stream URL:", self.url_output)
+        self.stream_key_container, self.stream_key_label = add_output_row("Stream Key:", self.key_output)
+        self.share_url_container, _share_label = add_output_row("Share URL:", self.share_url_output)
+
+        self.portrait_url_output = QLineEdit()
+        self.portrait_url_output.setReadOnly(True)
+        self.portrait_url_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.portrait_url_output)
+
+        self.portrait_key_output = QLineEdit()
+        self.portrait_key_output.setReadOnly(True)
+        self.portrait_key_output.setFixedHeight(28)
+        allow_horizontal_shrink(self.portrait_key_output)
+
+        self.portrait_url_container, self.portrait_url_label = add_output_row("Portrait Stream URL:", self.portrait_url_output)
+        self.portrait_key_container, self.portrait_key_label = add_output_row("Portrait Stream Key:", self.portrait_key_output)
+        self.portrait_url_container.hide()
+        self.portrait_key_container.hide()
+
+        # Checking/unchecking Dual Layout relabels the primary rows, shows or
+        # hides the portrait rows, and moves the Share URL to the bottom.
+        self.dual_layout_checkbox.toggled.connect(
+            lambda checked: self.refresh_stream_credentials_display()
+        )
 
         proxy_row = QHBoxLayout()
         proxy_row.setSpacing(5)
@@ -3327,7 +3494,7 @@ class StreamKeyGeneratorWindow(QWidget):
 
         original_text = button.property("copy_default_text") or button.text()
         button.setProperty("copy_default_text", original_text)
-        button.setText("Copied!")
+        button.setText("✓")
         button.setEnabled(False)
         QTimer.singleShot(1000, lambda: self.restore_copy_button(button, original_text))
 
@@ -3341,23 +3508,32 @@ class StreamKeyGeneratorWindow(QWidget):
     def clear_output_fields(self):
         self.url_output.clear()
         self.key_output.clear()
+        self.portrait_url_output.clear()
+        self.portrait_key_output.clear()
         self.share_url_output.clear()
         self.clear_realtime_stats_fields()
         self.clear_audience_safety_fields()
         self.real_stream_url = ""
         self.real_base_stream_url = ""
         self.real_stream_key = ""
+        self.real_multi_stream_url = ""
+        self.real_multi_stream_key = ""
         self.real_share_url = ""
         self.active_violation_ids = set()
         self.last_active_violation_count = 0
         self.local_proxy_server_url = ""
         self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
+        self.local_portrait_proxy_server_url = ""
+        self.local_portrait_proxy_stream_key = LOCAL_PROXY_PORTRAIT_STREAM_KEY
+        self.dual_layout_active = False
         self.local_proxy_starting = False
         self.show_real_stream_credentials = False
         self.toggle_stream_credentials_button.setText("Real TikTok URL hidden")
         self.toggle_stream_credentials_button.setEnabled(False)
         if hasattr(self, "proxy_status_output") and not self.local_proxy_active:
             self.proxy_status_output.clear()
+        if hasattr(self, "stream_url_label"):
+            self.refresh_stream_credentials_display()
 
     def clear_realtime_stats_fields(self):
         self.live_status_stats_output.clear()
@@ -3773,7 +3949,7 @@ class StreamKeyGeneratorWindow(QWidget):
         can_fetch_audience = bool(ENABLE_ONLINE_AUDIENCE_POLLING and self.is_live and room_id)
         if not can_fetch_audience:
             room_id = ""
-        anchor_id = self.current_anchor_id or self.account_user_id.text().strip()
+        anchor_id = self.current_anchor_id or getattr(self, "account_user_id_value", "")
         priority_region = self.stream_priority_region or self.region_combo.currentText()
         topic_id = self.get_selected_topic_id() or "5"
 
@@ -3888,8 +4064,9 @@ class StreamKeyGeneratorWindow(QWidget):
             print(f"New active LIVE violation detected: {summary}")
 
     def refresh_device_identifier_fields(self):
-        self.device_id_display.setText(self.device_id)
-        self.install_id_display.setText(self.install_id)
+        # Device/Install IDs are no longer displayed in the UI; kept as a
+        # no-op for existing call sites.
+        pass
 
     def has_device_identifiers(self):
         return bool(self.device_id and self.install_id)
@@ -3985,7 +4162,13 @@ class StreamKeyGeneratorWindow(QWidget):
         return _normalize_configured_path(getattr(self, "cookie_file_path", "") or DEFAULT_COOKIES_PATH)
 
     def set_cookies_path(self, path, *, save=True, refresh=True):
-        self.cookie_file_path = _normalize_configured_path(path or DEFAULT_COOKIES_PATH)
+        new_path = _normalize_configured_path(path or DEFAULT_COOKIES_PATH)
+        if new_path != getattr(self, "cookie_file_path", None):
+            # Account switch: the cached dual-layout capability result no
+            # longer applies to the new cookies file.
+            self.dual_layout_supported = None
+            self.update_dual_layout_status()
+        self.cookie_file_path = new_path
         if hasattr(self, "cookies_path_edit"):
             self.cookies_path_edit.blockSignals(True)
             self.cookies_path_edit.setText(self.cookie_file_path)
@@ -4085,35 +4268,85 @@ class StreamKeyGeneratorWindow(QWidget):
 
     def refresh_stream_credentials_display(self):
         self.share_url_output.setText(self.real_share_url)
+        self.share_url_output.setCursorPosition(0)
         has_local_credentials = bool(self.local_proxy_active and self.local_proxy_server_url)
+        has_portrait_credentials = bool(self.local_portrait_proxy_active and self.local_portrait_proxy_server_url)
         self.show_real_stream_credentials = False
         self.toggle_stream_credentials_button.setEnabled(False)
         self.toggle_stream_credentials_button.setText("Real TikTok URL hidden")
 
+        # Dual rows follow the checkbox (pre-live) as well as the actual
+        # room state (post go-live), so checking the option immediately
+        # reveals the Landscape/Portrait output rows.
+        dual_requested = self.dual_layout_active or (
+            getattr(self, "dual_layout_checkbox", None) is not None
+            and self.dual_layout_checkbox.isChecked()
+        )
+
+        if dual_requested:
+            self.stream_url_label.setText("Landscape Stream URL:")
+            self.stream_key_label.setText("Landscape Stream Key:")
+        else:
+            self.stream_url_label.setText("Stream URL:")
+            self.stream_key_label.setText("Stream Key:")
+
+        if dual_requested:
+            self.portrait_url_container.show()
+            self.portrait_key_container.show()
+        else:
+            self.portrait_url_container.hide()
+            self.portrait_key_container.hide()
+
+        # With dual layout on, the Share URL moves below the portrait rows;
+        # otherwise it sits right below the primary Stream URL/Key rows.
+        layout = self.output_layout
+        share_index = layout.indexOf(self.share_url_container)
+        if dual_requested and share_index < layout.indexOf(self.portrait_key_container):
+            layout.removeWidget(self.share_url_container)
+            layout.insertWidget(layout.indexOf(self.portrait_key_container) + 1, self.share_url_container)
+        elif not dual_requested and share_index > layout.indexOf(self.portrait_url_container):
+            layout.removeWidget(self.share_url_container)
+            layout.insertWidget(layout.indexOf(self.portrait_url_container), self.share_url_container)
+
         if self.local_proxy_starting:
             self.url_output.clear()
             self.key_output.clear()
+            self.portrait_url_output.clear()
+            self.portrait_key_output.clear()
             return
 
         if not has_local_credentials:
             self.url_output.clear()
             self.key_output.clear()
-            return
+        else:
+            self.url_output.setText(self.local_proxy_server_url)
+            self.key_output.setText(self.local_proxy_stream_key)
+            self.url_output.setCursorPosition(0)
+            self.key_output.setCursorPosition(0)
 
-        self.url_output.setText(self.local_proxy_server_url)
-        self.key_output.setText(self.local_proxy_stream_key)
+        if not has_portrait_credentials:
+            self.portrait_url_output.clear()
+            self.portrait_key_output.clear()
+        else:
+            self.portrait_url_output.setText(self.local_portrait_proxy_server_url)
+            self.portrait_key_output.setText(self.local_portrait_proxy_stream_key)
+            self.portrait_url_output.setCursorPosition(0)
+            self.portrait_key_output.setCursorPosition(0)
 
     def ffmpeg_proxy_is_running(self):
         return self.ffmpeg_proxy_process is not None and self.ffmpeg_proxy_process.poll() is None
 
-    def wait_for_ffmpeg_proxy_listener(self, timeout_seconds=25):
+    def wait_for_ffmpeg_proxy_listener(self, timeout_seconds=25, process=None, sei_log_path=None):
         marker = "waiting for OBS/local RTMP connection"
+        if process is None:
+            process = self.ffmpeg_proxy_process
+        if sei_log_path is None:
+            sei_log_path = getattr(self, "ffmpeg_proxy_sei_log_path", "")
         deadline = time.monotonic() + max(1, timeout_seconds)
-        sei_log_path = getattr(self, "ffmpeg_proxy_sei_log_path", "")
         while time.monotonic() < deadline:
-            if self.ffmpeg_proxy_process is None:
+            if process is None:
                 return False
-            return_code = self.ffmpeg_proxy_process.poll()
+            return_code = process.poll()
             if return_code is not None:
                 return False
             if sei_log_path and os.path.exists(sei_log_path):
@@ -4127,7 +4360,9 @@ class StreamKeyGeneratorWindow(QWidget):
             time.sleep(0.1)
         return False
 
-    def build_ffmpeg_proxy_command(self, ffmpeg_path, local_input_url, tiktok_output_url):
+    def build_ffmpeg_proxy_command(self, ffmpeg_path, local_input_url, tiktok_output_url, log_path=""):
+        if not log_path:
+            log_path = getattr(self, "ffmpeg_proxy_sei_log_path", "")
         proxy_args = [
             "--ffmpeg",
             ffmpeg_path,
@@ -4150,7 +4385,7 @@ class StreamKeyGeneratorWindow(QWidget):
             "--timeout",
             str(LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS),
             "--log",
-            self.ffmpeg_proxy_sei_log_path,
+            log_path,
         ]
 
         if _is_packaged_app():
@@ -4185,6 +4420,50 @@ class StreamKeyGeneratorWindow(QWidget):
             tiktok_output_url,
         ]
 
+    def _launch_sei_proxy(self, command, log_file, log_path, sei_log_path, process_attribute):
+        # process_attribute: "ffmpeg_proxy_process" or "ffmpeg_proxy_portrait_process"
+        log_file.write(
+            "[proxy] command: "
+            + " ".join(_mask_stream_url(str(part)) for part in command)
+            + "\n"
+        )
+        log_file.flush()
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        setattr(self, process_attribute, subprocess.Popen(
+            command,
+            cwd=_runtime_base_dir(),
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        ))
+
+        time.sleep(0.35)
+        process = getattr(self, process_attribute)
+        return_code = process.poll()
+        if return_code is not None:
+            tail = _safe_log_tail(log_path)
+            self.stop_ffmpeg_proxy(clear_status=False)
+            details = f"\n\nFFmpeg log tail:\n{tail}" if tail else ""
+            raise RuntimeError(f"FFmpeg proxy exited early with code {return_code}.{details}")
+
+        self.set_proxy_status("Preparing local FFmpeg proxy signatures...")
+        if not self.wait_for_ffmpeg_proxy_listener(
+            timeout_seconds=25,
+            process=process,
+            sei_log_path=sei_log_path,
+        ):
+            return_code = process.poll() if process is not None else None
+            tail = _safe_log_tail(sei_log_path)
+            self.stop_ffmpeg_proxy(clear_status=False)
+            details = f"\n\nSEI proxy log tail:\n{tail}" if tail else ""
+            if return_code is not None:
+                raise RuntimeError(f"FFmpeg proxy exited before the local listener was ready with code {return_code}.{details}")
+            raise RuntimeError(f"FFmpeg proxy did not open the local listener in time.{details}")
+
     def start_ffmpeg_proxy(self, tiktok_output_url):
         self.stop_ffmpeg_proxy(clear_status=False)
         if not tiktok_output_url:
@@ -4213,42 +4492,13 @@ class StreamKeyGeneratorWindow(QWidget):
             self.ffmpeg_proxy_log_file = open(self.ffmpeg_proxy_log_path, "w", encoding="utf-8", errors="replace")
 
             command = self.build_ffmpeg_proxy_command(ffmpeg_path, local_input_url, tiktok_output_url)
-            self.ffmpeg_proxy_log_file.write(
-                "[proxy] command: "
-                + " ".join(_mask_stream_url(str(part)) for part in command)
-                + "\n"
-            )
-            self.ffmpeg_proxy_log_file.flush()
-            creationflags = 0
-            if os.name == "nt":
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-                creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            self.ffmpeg_proxy_process = subprocess.Popen(
+            self._launch_sei_proxy(
                 command,
-                cwd=_runtime_base_dir(),
-                stdin=subprocess.DEVNULL,
-                stdout=self.ffmpeg_proxy_log_file,
-                stderr=subprocess.STDOUT,
-                creationflags=creationflags,
+                self.ffmpeg_proxy_log_file,
+                self.ffmpeg_proxy_log_path,
+                self.ffmpeg_proxy_sei_log_path,
+                "ffmpeg_proxy_process",
             )
-
-            time.sleep(0.35)
-            return_code = self.ffmpeg_proxy_process.poll()
-            if return_code is not None:
-                tail = _safe_log_tail(self.ffmpeg_proxy_log_path)
-                self.stop_ffmpeg_proxy(clear_status=False)
-                details = f"\n\nFFmpeg log tail:\n{tail}" if tail else ""
-                raise RuntimeError(f"FFmpeg proxy exited early with code {return_code}.{details}")
-
-            self.set_proxy_status("Preparing local FFmpeg proxy signatures...")
-            if not self.wait_for_ffmpeg_proxy_listener(timeout_seconds=25):
-                return_code = self.ffmpeg_proxy_process.poll() if self.ffmpeg_proxy_process is not None else None
-                tail = _safe_log_tail(getattr(self, "ffmpeg_proxy_sei_log_path", ""))
-                self.stop_ffmpeg_proxy(clear_status=False)
-                details = f"\n\nSEI proxy log tail:\n{tail}" if tail else ""
-                if return_code is not None:
-                    raise RuntimeError(f"FFmpeg proxy exited before the local listener was ready with code {return_code}.{details}")
-                raise RuntimeError(f"FFmpeg proxy did not open the local listener in time.{details}")
 
             self.local_proxy_active = True
             self.local_proxy_starting = False
@@ -4261,25 +4511,69 @@ class StreamKeyGeneratorWindow(QWidget):
             self.local_proxy_starting = False
             progress.close()
 
+    def start_portrait_ffmpeg_proxy(self, tiktok_output_url):
+        # Dual layout: second signed listener forwarding to the portrait
+        # (main stream_url) canvas. Signing args are identical to the primary.
+        if not tiktok_output_url:
+            raise RuntimeError("Missing TikTok RTMP URL for the portrait FFmpeg proxy.")
+
+        ffmpeg_path = _bundled_ffmpeg_path()
+        self.local_portrait_proxy_port = _pick_local_proxy_port(LOCAL_PROXY_PORTRAIT_DEFAULT_PORT)
+        if self.local_portrait_proxy_port == self.local_proxy_port:
+            # Never share a port with the primary listener.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                self.local_portrait_proxy_port = int(sock.getsockname()[1])
+        self.local_portrait_proxy_stream_key = LOCAL_PROXY_PORTRAIT_STREAM_KEY
+        self.local_portrait_proxy_server_url = f"rtmp://127.0.0.1:{self.local_portrait_proxy_port}/{LOCAL_PROXY_PORTRAIT_APP_NAME}"
+        portrait_input_url = f"{self.local_portrait_proxy_server_url}/{self.local_portrait_proxy_stream_key}"
+        self.ffmpeg_proxy_portrait_log_path = os.path.join(_runtime_logs_dir(), LOCAL_PROXY_PORTRAIT_LOG_NAME)
+        self.ffmpeg_proxy_portrait_sei_log_path = os.path.join(_runtime_logs_dir(), "ffmpeg_proxy_portrait_sei.log")
+        self.ffmpeg_proxy_portrait_log_file = open(self.ffmpeg_proxy_portrait_log_path, "w", encoding="utf-8", errors="replace")
+
+        command = self.build_ffmpeg_proxy_command(
+            ffmpeg_path,
+            portrait_input_url,
+            tiktok_output_url,
+            log_path=self.ffmpeg_proxy_portrait_sei_log_path,
+        )
+        self._launch_sei_proxy(
+            command,
+            self.ffmpeg_proxy_portrait_log_file,
+            self.ffmpeg_proxy_portrait_log_path,
+            self.ffmpeg_proxy_portrait_sei_log_path,
+            "ffmpeg_proxy_portrait_process",
+        )
+
+        self.local_portrait_proxy_active = True
+        self.set_proxy_status("Dual proxies ready. Start streaming in OBS.")
+        return True
+
     def stop_ffmpeg_proxy(self, clear_status=True):
-        process = self.ffmpeg_proxy_process
+        processes = (
+            (self.ffmpeg_proxy_process, self.ffmpeg_proxy_log_file),
+            (self.ffmpeg_proxy_portrait_process, self.ffmpeg_proxy_portrait_log_file),
+        )
         self.ffmpeg_proxy_process = None
+        self.ffmpeg_proxy_portrait_process = None
         self.local_proxy_active = False
+        self.local_portrait_proxy_active = False
         self.local_proxy_starting = False
 
-        if process is not None and process.poll() is None:
-            try:
-                if os.name == "nt":
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    process.terminate()
-                process.wait(timeout=5)
-            except Exception:
+        for process, _ in processes:
+            if process is not None and process.poll() is None:
                 try:
-                    process.kill()
+                    if os.name == "nt":
+                        process.send_signal(signal.CTRL_BREAK_EVENT)
+                    else:
+                        process.terminate()
                     process.wait(timeout=5)
                 except Exception:
-                    pass
+                    try:
+                        process.kill()
+                        process.wait(timeout=5)
+                    except Exception:
+                        pass
 
         if self.ffmpeg_proxy_log_file is not None:
             try:
@@ -4288,6 +4582,13 @@ class StreamKeyGeneratorWindow(QWidget):
                 pass
             self.ffmpeg_proxy_log_file = None
 
+        if self.ffmpeg_proxy_portrait_log_file is not None:
+            try:
+                self.ffmpeg_proxy_portrait_log_file.close()
+            except Exception:
+                pass
+            self.ffmpeg_proxy_portrait_log_file = None
+
         if clear_status:
             self.set_proxy_status("")
         if hasattr(self, "ffmpeg_proxy_watch_timer"):
@@ -4295,29 +4596,39 @@ class StreamKeyGeneratorWindow(QWidget):
         self.refresh_stream_credentials_display()
 
     def check_ffmpeg_proxy_health(self):
-        if not self.local_proxy_active or self.ffmpeg_proxy_process is None:
+        if not self.local_proxy_active and not self.local_portrait_proxy_active:
             self.ffmpeg_proxy_watch_timer.stop()
             return
 
-        return_code = self.ffmpeg_proxy_process.poll()
-        if return_code is None:
-            return
+        primary_name = "landscape" if self.dual_layout_active else "primary"
+        checks = (
+            (primary_name, self.ffmpeg_proxy_process, getattr(self, "ffmpeg_proxy_sei_log_path", "")),
+            ("portrait", self.ffmpeg_proxy_portrait_process, getattr(self, "ffmpeg_proxy_portrait_sei_log_path", "")),
+        )
+        for endpoint_name, process, sei_log_path in checks:
+            if process is None:
+                continue
+            return_code = process.poll()
+            if return_code is None:
+                continue
 
-        self.local_proxy_active = False
-        self.ffmpeg_proxy_watch_timer.stop()
-        details = _safe_log_tail(getattr(self, "ffmpeg_proxy_sei_log_path", ""))
-        self.set_stream_state(is_live=False)
-        self.clear_output_fields()
-        self.set_proxy_status(
-            f"Proxy stopped with code {return_code}; forwarding halted because signed metadata is unavailable."
-        )
-        self.refresh_stream_credentials_display()
-        detail_text = f"\n\nSigner details:\n{details}" if details else ""
-        self.show_error(
-            "The signed FFmpeg proxy stopped, so forwarding was halted. "
-            "The real TikTok URL/key is intentionally not exposed."
-            f"{detail_text}"
-        )
+            self.local_proxy_active = False
+            self.local_portrait_proxy_active = False
+            self.ffmpeg_proxy_watch_timer.stop()
+            details = _safe_log_tail(sei_log_path)
+            self.set_stream_state(is_live=False)
+            self.clear_output_fields()
+            self.set_proxy_status(
+                f"{endpoint_name.capitalize()} proxy stopped with code {return_code}; forwarding halted because signed metadata is unavailable."
+            )
+            self.refresh_stream_credentials_display()
+            detail_text = f"\n\nSigner details:\n{details}" if details else ""
+            self.show_error(
+                f"The signed {endpoint_name} FFmpeg proxy stopped, so forwarding was halted. "
+                "The real TikTok URL/key is intentionally not exposed."
+                f"{detail_text}"
+            )
+            return
 
     def update_stream_controls(self, has_cookies=None):
         if has_cookies is None:
@@ -4335,11 +4646,15 @@ class StreamKeyGeneratorWindow(QWidget):
         if hasattr(self, "toggle_stream_credentials_button"):
             self.toggle_stream_credentials_button.setEnabled(False)
 
-    def apply_stream_outputs(self, stream, priority_region="", start_proxy=True):
+    def apply_stream_outputs(self, stream, priority_region="", start_proxy=True, dual_layout=False):
         self.clear_output_fields()
+        # Set after clear_output_fields, which resets dual_layout_active.
+        self.dual_layout_active = bool(dual_layout and getattr(stream, "multiStreamUrl", ""))
         self.real_stream_url = getattr(stream, "streamUrl", "")
         self.real_base_stream_url = getattr(stream, "baseStreamUrl", "")
         self.real_stream_key = getattr(stream, "streamKey", "")
+        self.real_multi_stream_url = getattr(stream, "multiStreamUrl", "")
+        self.real_multi_stream_key = getattr(stream, "multiStreamKey", "")
         self.real_share_url = getattr(stream, "streamShareUrl", "")
         self.current_room_id = getattr(stream, "roomId", "")
         self.current_stream_id = getattr(stream, "streamId", "")
@@ -4351,9 +4666,15 @@ class StreamKeyGeneratorWindow(QWidget):
         self.share_url_output.setText(self.real_share_url)
         self.refresh_stream_credentials_display()
 
-        if start_proxy and self.real_stream_url:
+        if start_proxy and (self.real_stream_url or self.real_multi_stream_url):
             try:
-                self.start_ffmpeg_proxy(self.real_stream_url)
+                # Dual layout: the primary (existing) endpoint forwards to
+                # multi_stream_url (landscape canvas) and the portrait
+                # endpoint forwards to the main stream_url (portrait canvas).
+                primary_target = self.real_multi_stream_url if self.dual_layout_active else self.real_stream_url
+                self.start_ffmpeg_proxy(primary_target)
+                if self.dual_layout_active:
+                    self.start_portrait_ffmpeg_proxy(self.real_stream_url)
             except Exception as exc:
                 self.set_stream_state(is_live=False)
                 self.clear_output_fields()
@@ -4514,10 +4835,40 @@ class StreamKeyGeneratorWindow(QWidget):
         user_id = account.get("user_id_str") or str(account.get("user_id") or "")
 
         self.account_username.setText(username)
-        self.account_user_id.setText(user_id)
+        # Keep the beginning of the text visible when it overflows the field.
+        self.account_username.setCursorPosition(0)
+        # Kept as a plain attribute (no longer shown in the UI) for callers
+        # that need the anchor id, e.g. realtime stats.
+        self.account_user_id_value = user_id
         self.account_status.setText(info.get("status", "Unknown"))
         self.account_can_go_live = bool(info.get("can_go_live", False))
         self.can_go_live_output.setText(str(self.account_can_go_live))
+
+        # Update the cached dual-layout capability. The account is dual-layout
+        # ready only when both server gates pass: allow_multi_stream (scene=1,
+        # the flag LIVE Studio uses to show the button) AND the new-user
+        # threshold check (allowed + dual_canvas_used, i.e. enough 25-minute
+        # LIVE sessions).
+        allow_dual = info.get("allow_multi_stream_scene1")
+        if allow_dual is not None:
+            self.dual_layout_supported = bool(allow_dual and info.get("dual_layout_unlocked"))
+            if not self.dual_layout_supported:
+                self.dual_layout_checkbox.setChecked(False)
+                days_to_reach = info.get("dual_days_to_reach")
+                if allow_dual and days_to_reach:
+                    self.dual_layout_output.setToolTip(
+                        "This account has dual layout access, but it is still locked by the "
+                        f"new-user restriction: go LIVE {days_to_reach} more time(s) for 25 "
+                        "minutes each on LIVE Studio to unlock it (validation may take up to "
+                        "48 hours)."
+                    )
+                else:
+                    self.dual_layout_output.setToolTip(
+                        "allow_multi_stream from game/basic/create_info?scene=1 - the same "
+                        "account-level flag TikTok LIVE Studio uses to show or hide its dual "
+                        "layout button. Updated by Refresh Account Info."
+                    )
+            self.update_dual_layout_status()
 
         self.update_stream_controls()
 
@@ -4544,6 +4895,7 @@ class StreamKeyGeneratorWindow(QWidget):
             "cookies_path": self.get_cookies_path() if hasattr(self, "get_cookies_path") else _configured_cookies_path(),
             "rapidapi_key": self.get_rapidapi_key() if hasattr(self, "get_rapidapi_key") else _configured_rapidapi_key(),
             "suppress_donation_reminder": self.suppress_donation_reminder,
+            "dual_layout_supported": self.dual_layout_supported,
         }
 
         with open("config.json", "w", encoding="utf-8") as file:
@@ -4561,6 +4913,8 @@ class StreamKeyGeneratorWindow(QWidget):
             self.install_id = ""
             self.cookie_file_path = _normalize_configured_path(DEFAULT_COOKIES_PATH)
             self.rapidapi_key = ""
+            self.dual_layout_supported = None
+            self.update_dual_layout_status()
             if hasattr(self, "cookies_path_edit"):
                 self.cookies_path_edit.blockSignals(True)
                 self.cookies_path_edit.setText(self.cookie_file_path)
@@ -4587,6 +4941,8 @@ class StreamKeyGeneratorWindow(QWidget):
             self.rapidapi_key_edit.setText(self.rapidapi_key)
             self.rapidapi_key_edit.blockSignals(False)
         self.suppress_donation_reminder = data.get("suppress_donation_reminder", False)
+        self.dual_layout_supported = data.get("dual_layout_supported", None)
+        self.update_dual_layout_status()
 
         if self.device_id == "0":
             self.device_id = ""
@@ -4691,20 +5047,32 @@ class StreamKeyGeneratorWindow(QWidget):
 
         # 1. Backup existing protocol registration
         backup = backup_protocol_registry()
+        stop_listening = threading.Event()
 
         # 2. Start local callback server
-        server_thread, port, callback_event, result = start_callback_server()
+        server_thread, port, callback_event, result = start_callback_server(stop_event=stop_listening)
         if not server_thread:
             self.show_error("Could not start local callback server.")
+            restore_protocol_registry(backup)
             self.login_button.setEnabled(True)
             progress.close()
             return
 
-        # 3. Register temporary protocol handler
+        # 3. Register temporary protocol handler. In a frozen/compiled build
+        #    (PyInstaller/Nuitka) there is no script file to run — the
+        #    executable itself handles --protocol-callback.
         python_exe = sys.executable
-        script_path = os.path.abspath(__file__)
+        if getattr(sys, "frozen", False):
+            script_path = None
+        else:
+            script_path = os.path.abspath(__file__)
         if not register_temporary_protocol_handler(python_exe, script_path, port):
-            self.show_error("Failed to register temporary protocol handler. Try running as administrator?")
+            stop_listening.set()
+            self.show_error(
+                "Failed to register the temporary protocol handler.\n"
+                "Try running the app as the same user you log in with, and check that "
+                "antivirus software is not blocking registry writes."
+            )
             restore_protocol_registry(backup)
             self.login_button.setEnabled(True)
             progress.close()
@@ -4720,10 +5088,18 @@ class StreamKeyGeneratorWindow(QWidget):
             QApplication.processEvents()
             callback_received = callback_event.wait(timeout=180)
             if not callback_received or not result["url"]:
-                raise RuntimeError("Timeout or no callback received. Login aborted.")
+                raise RuntimeError(
+                    "No login callback was received within 3 minutes. Possible causes:\n"
+                    "- The browser blocked the live-studio-app:// redirect (look for a "
+                    "confirmation popup in the browser or taskbar and allow it).\n"
+                    "- Windows or antivirus prevented the temporary protocol handler "
+                    "from launching.\n"
+                    "- The login page was closed before completing the flow.\n"
+                    "Nothing was modified on your account; you can try again."
+                )
 
             # Parse callback URL (query or fragment)
-            print(f"[DEBUG] Received callback URL: {result['url']}")
+            print(f"[DEBUG] Received callback URL ({len(result['url'])} chars)")
             parsed = urllib.parse.urlparse(result["url"])
             query_string = parsed.query
             if not query_string and parsed.fragment:
@@ -4734,7 +5110,10 @@ class StreamKeyGeneratorWindow(QWidget):
             state_from_callback = query_params.get("state", [None])[0]
 
             if not id_token or not state_from_callback:
-                raise RuntimeError(f"Invalid callback URL: missing id_token or state. URL={result['url']}")
+                raise RuntimeError(
+                    "Invalid callback URL: missing id_token or state. "
+                    f"Received {len(result['url'])} chars."
+                )
 
             client.exchange_login(id_token, state_from_callback, ticket)
             client.save_cookies(self.get_cookies_path())
@@ -4745,10 +5124,27 @@ class StreamKeyGeneratorWindow(QWidget):
         except Exception as exc:
             self.show_error(f"Login failed: {exc}")
         finally:
+            stop_listening.set()
             client.close()
             restore_protocol_registry(backup)
             progress.close()
             self.login_button.setEnabled(True)
+
+    def update_dual_layout_status(self):
+        field = getattr(self, "dual_layout_output", None)
+        if field is not None:
+            supported = getattr(self, "dual_layout_supported", None)
+            # Plain True/False text, matching the "Can Go Live" field format.
+            field.setText("Unknown" if supported is None else str(bool(supported)))
+            field.setCursorPosition(0)
+        checkbox = getattr(self, "dual_layout_checkbox", None)
+        if checkbox is not None:
+            # The option only becomes selectable once the account is
+            # confirmed to have dual layout access.
+            enabled = getattr(self, "dual_layout_supported", None) is True
+            checkbox.setEnabled(enabled)
+            if not enabled:
+                checkbox.setChecked(False)
 
     def generate_stream(self):
         topic_id = self.get_selected_topic_id()
@@ -4848,7 +5244,17 @@ class StreamKeyGeneratorWindow(QWidget):
                             room_id=room_id,
                             stream_id=stream_id,
                         )
-                        self.apply_stream_outputs(stream, priority_region=effective_region)
+                        resume_dual = bool(self.dual_layout_checkbox.isChecked() and stream.multiStreamUrl)
+                        if self.dual_layout_checkbox.isChecked() and not resume_dual:
+                            self.show_info(
+                                "Dual Layout was requested, but the resumed room has no landscape "
+                                "(multi_stream_url) push URL. Continuing with the main canvas only."
+                            )
+                        self.apply_stream_outputs(
+                            stream,
+                            priority_region=effective_region,
+                            dual_layout=resume_dual,
+                        )
                         stream_started = True
                         self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                         self.set_stream_state(is_live=True, is_paused=False)
@@ -4893,6 +5299,8 @@ class StreamKeyGeneratorWindow(QWidget):
                     self.show_error("\n".join(hint_parts))
                     return
 
+                dual_layout_requested = self.dual_layout_checkbox.isChecked()
+
                 created = stream.createStream(
                     self.title_edit.text(),
                     topic_id,
@@ -4904,10 +5312,38 @@ class StreamKeyGeneratorWindow(QWidget):
                     self.thumbnail_edit.text(),
                     self.device_id,
                     self.install_id,
+                    multi_stream_scene=dual_layout_requested,
                 )
 
+                if dual_layout_requested and created and not stream.multiStreamUrl:
+                    # The room exists but has no second canvas; end it so the
+                    # user is not left with a half-configured live room.
+                    try:
+                        stream.endStream(
+                            device_id=self.device_id,
+                            install_id=self.install_id,
+                            priority_region=selected_region,
+                            room_id=stream.roomId,
+                            stream_id=stream.streamId,
+                        )
+                    except Exception:
+                        pass
+                    self.set_stream_state(is_live=False)
+                    self.clear_output_fields()
+                    self.show_error(
+                        "Dual Layout was requested but TikTok did not return a landscape "
+                        "(multi_stream_url) push URL, so this account/room is not allowed "
+                        "dual layout. The created room was ended; retry with Dual Layout "
+                        "unchecked."
+                    )
+                    return
+
                 if created:
-                    self.apply_stream_outputs(stream, priority_region=selected_region)
+                    self.apply_stream_outputs(
+                        stream,
+                        priority_region=selected_region,
+                        dual_layout=dual_layout_requested,
+                    )
                     stream_started = True
                     self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                     self.set_stream_state(is_live=True, is_paused=False)
@@ -5200,13 +5636,32 @@ class LoginDialog(QDialog):
 
 def handle_protocol_callback(port, url):
     """Send the received URL to the main process via TCP socket."""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect(("127.0.0.1", int(port)))
-        sock.sendall(f"URL:{url}".encode())
-        sock.close()
-    except Exception as e:
-        print(f"Failed to send callback to main process: {e}")
+    payload = f"URL:{url}".encode()
+    last_error = None
+    # The main app's listener keeps running after a junk connection, so retry
+    # briefly rather than failing on the first refused/failed send.
+    for _ in range(3):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(("127.0.0.1", int(port)))
+            sock.sendall(payload)
+            # Give the listener a moment to drain the payload before closing.
+            try:
+                sock.shutdown(socket.SHUT_WR)
+                sock.recv(64)
+            except Exception:
+                pass
+            sock.close()
+            return
+        except Exception as e:
+            last_error = e
+            try:
+                sock.close()
+            except Exception:
+                pass
+            time.sleep(0.3)
+    print(f"Failed to send callback to main process: {last_error}")
 
 
 def main():
