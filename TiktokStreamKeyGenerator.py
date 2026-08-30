@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QHeaderView,
@@ -69,6 +70,11 @@ from Libs.device_gen import (
     register_desktop_device_identifiers,
 )
 from Libs.signers import TikTokSigners
+from Libs.rapidapi_quota import (
+    quota_reset_at,
+    quota_updated_at,
+    read_quota,
+)
 from Updater import VersionChecker
 
 
@@ -3006,6 +3012,31 @@ class StreamKeyGeneratorWindow(QWidget):
         self.dual_layout_output = make_fact_field()
         self.account_status = make_fact_field()
 
+        # Quota meter: a progress bar that drains as the monthly RapidAPI
+        # allowance is spent (full bar = full quota left). Styled explicitly
+        # because the native Windows 11 style renders the chunk as a 3px
+        # hairline that reads as plain text; palette() roles keep it
+        # theme-aware.
+        self.rapidapi_quota_bar = QProgressBar()
+        self.rapidapi_quota_bar.setTextVisible(True)
+        self.rapidapi_quota_bar.setFixedHeight(20)
+        self.rapidapi_quota_bar.setRange(0, 1)
+        self.rapidapi_quota_bar.setValue(0)
+        self.rapidapi_quota_bar.setFormat("Unknown")
+        self.rapidapi_quota_bar.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid palette(mid);"
+            " border-radius: 4px;"
+            " background: palette(window);"
+            " text-align: center;"
+            " color: palette(text);"
+            "}"
+            "QProgressBar::chunk {"
+            " border-radius: 3px;"
+            " background: palette(highlight);"
+            "}"
+        )
+
         dual_layout_tip = (
             "allow_multi_stream from game/basic/create_info?scene=1 - the same "
             "account-level flag TikTok LIVE Studio uses to show or hide its dual "
@@ -3015,9 +3046,32 @@ class StreamKeyGeneratorWindow(QWidget):
         add_account_fact(0, 1, "Can Go Live", self.can_go_live_output)
         add_account_fact(1, 0, "Can Dual Layout", self.dual_layout_output, dual_layout_tip)
         add_account_fact(1, 1, "Status", self.account_status)
+        quota_tip = (
+            "Remaining monthly RapidAPI signer requests, taken from the quota "
+            "headers of the signer calls this app already makes (no extra "
+            "requests are spent). The bar empties as the allowance is used; "
+            "hover shows the reset date and when it was last updated."
+        )
+        quota_label = QLabel("RapidAPI Quota")
+        quota_label.setStyleSheet("font-weight: bold;")
+        quota_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        quota_label.setToolTip(quota_tip)
+        self.rapidapi_quota_bar.setToolTip(quota_tip)
+        facts_grid.addWidget(quota_label, 2, 0)
+        # Span both field columns (and the second pair's label column) so the
+        # meter gets the full row width instead of a single column.
+        facts_grid.addWidget(self.rapidapi_quota_bar, 2, 1, 1, 3)
         facts_grid.setColumnStretch(1, 1)
         facts_grid.setColumnStretch(3, 1)
         account_layout.addLayout(facts_grid)
+
+        # Re-read the persisted quota snapshot every minute; signer calls in
+        # this or the proxy child processes refresh the underlying file.
+        self.rapidapi_quota_timer = QTimer(self)
+        self.rapidapi_quota_timer.setInterval(60_000)
+        self.rapidapi_quota_timer.timeout.connect(self.update_rapidapi_quota_display)
+        self.rapidapi_quota_timer.start()
+        self.update_rapidapi_quota_display()
 
         self.refresh_account_button = QPushButton("Refresh Account Info")
         self.refresh_account_button.clicked.connect(lambda: self.refresh_account_info())
@@ -4364,7 +4418,14 @@ class StreamKeyGeneratorWindow(QWidget):
             time.sleep(0.1)
         return False
 
-    def build_ffmpeg_proxy_command(self, ffmpeg_path, local_input_url, tiktok_output_url, log_path=""):
+    def build_ffmpeg_proxy_command(
+        self,
+        ffmpeg_path,
+        local_input_url,
+        tiktok_output_url,
+        log_path="",
+        resolution="1920x1080",
+    ):
         if not log_path:
             log_path = getattr(self, "ffmpeg_proxy_sei_log_path", "")
         proxy_args = [
@@ -4385,7 +4446,7 @@ class StreamKeyGeneratorWindow(QWidget):
             "--fps",
             "60",
             "--resolution",
-            "1920x1080",
+            resolution,
             "--timeout",
             str(LOCAL_PROXY_LISTEN_TIMEOUT_SECONDS),
             "--log",
@@ -4468,7 +4529,11 @@ class StreamKeyGeneratorWindow(QWidget):
                 raise RuntimeError(f"FFmpeg proxy exited before the local listener was ready with code {return_code}.{details}")
             raise RuntimeError(f"FFmpeg proxy did not open the local listener in time.{details}")
 
-    def start_ffmpeg_proxy(self, tiktok_output_url):
+    def start_ffmpeg_proxy(self, tiktok_output_url, defer_display=False):
+        # defer_display: dual layout suppresses the reveal of the landscape
+        # URL/key fields here so they appear at the same moment as the
+        # portrait fields (the portrait proxy's start performs the single
+        # combined refresh once both listeners are up).
         self.stop_ffmpeg_proxy(clear_status=False)
         if not tiktok_output_url:
             raise RuntimeError("Missing TikTok RTMP URL for local FFmpeg proxy.")
@@ -4507,9 +4572,10 @@ class StreamKeyGeneratorWindow(QWidget):
             self.local_proxy_active = True
             self.local_proxy_starting = False
             self.show_real_stream_credentials = False
-            self.set_proxy_status("Proxy ready. Start streaming in OBS.")
             self.ffmpeg_proxy_watch_timer.start()
-            self.refresh_stream_credentials_display()
+            if not defer_display:
+                self.set_proxy_status("Proxy ready. Start streaming in OBS.")
+                self.refresh_stream_credentials_display()
             return True
         finally:
             self.local_proxy_starting = False
@@ -4540,6 +4606,10 @@ class StreamKeyGeneratorWindow(QWidget):
             portrait_input_url,
             tiktok_output_url,
             log_path=self.ffmpeg_proxy_portrait_sei_log_path,
+            # Portrait canvas is vertical; the SEI declares the push
+            # dimensions, so report 1080x1920 rather than the landscape
+            # default.
+            resolution="1080x1920",
         )
         self._launch_sei_proxy(
             command,
@@ -4551,6 +4621,11 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.local_portrait_proxy_active = True
         self.set_proxy_status("Dual proxies ready. Start streaming in OBS.")
+        # The landscape proxy deferred its display refresh, so this single
+        # refresh is what reveals BOTH endpoints' URL/key fields — they
+        # populate at the same moment instead of trickling in one after
+        # the other.
+        self.refresh_stream_credentials_display()
         return True
 
     def stop_ffmpeg_proxy(self, clear_status=True):
@@ -4676,7 +4751,10 @@ class StreamKeyGeneratorWindow(QWidget):
                 # multi_stream_url (landscape canvas) and the portrait
                 # endpoint forwards to the main stream_url (portrait canvas).
                 primary_target = self.real_multi_stream_url if self.dual_layout_active else self.real_stream_url
-                self.start_ffmpeg_proxy(primary_target)
+                # Dual layout: the landscape start defers its display
+                # refresh; the portrait start's final refresh reveals both
+                # endpoints at the same time.
+                self.start_ffmpeg_proxy(primary_target, defer_display=self.dual_layout_active)
                 if self.dual_layout_active:
                     self.start_portrait_ffmpeg_proxy(self.real_stream_url)
             except Exception as exc:
@@ -4874,6 +4952,10 @@ class StreamKeyGeneratorWindow(QWidget):
                     )
             self.update_dual_layout_status()
 
+        # The account refresh just made several signed requests, so the
+        # quota snapshot on disk is fresh; reflect it immediately instead
+        # of waiting for the minute timer.
+        self.update_rapidapi_quota_display()
         self.update_stream_controls()
 
     def handle_account_info_error(self, message):
@@ -5133,6 +5215,65 @@ class StreamKeyGeneratorWindow(QWidget):
             restore_protocol_registry(backup)
             progress.close()
             self.login_button.setEnabled(True)
+
+    def update_rapidapi_quota_display(self):
+        bar = getattr(self, "rapidapi_quota_bar", None)
+        if bar is None:
+            return
+        snapshot = read_quota()
+
+        def to_int(value):
+            try:
+                return int(str(value).strip())
+            except (TypeError, ValueError):
+                return None
+
+        limit = to_int(snapshot.get("limit"))
+        remaining = to_int(snapshot.get("remaining"))
+
+        low_quota = False
+        if limit and remaining is not None:
+            remaining = max(0, min(remaining, limit))
+            bar.setRange(0, limit)
+            bar.setValue(remaining)
+            bar.setFormat(f"{remaining:,} / {limit:,} left")
+            low_quota = remaining / limit <= 0.1
+        elif remaining is not None:
+            # Limit unknown: nothing to measure a bar against.
+            bar.setRange(0, 1)
+            bar.setValue(1)
+            bar.setFormat(f"{remaining:,} left")
+        else:
+            bar.setRange(0, 1)
+            bar.setValue(0)
+            bar.setFormat("Unknown")
+
+        # Full stylesheet both ways: a chunk-only override would lose the
+        # groove/border and render as a hairline again.
+        chunk_color = "#d9534f" if low_quota else "palette(highlight)"
+        bar.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid palette(mid);"
+            " border-radius: 4px;"
+            " background: palette(window);"
+            " text-align: center;"
+            " color: palette(text);"
+            "}"
+            "QProgressBar::chunk {"
+            " border-radius: 3px;"
+            f" background: {chunk_color};"
+            "}"
+        )
+
+        tooltip_parts = [
+            part
+            for part in (
+                quota_reset_at(snapshot),
+                quota_updated_at(snapshot),
+            )
+            if part
+        ]
+        bar.setToolTip("\n".join(tooltip_parts) or "No RapidAPI usage recorded yet.")
 
     def update_dual_layout_status(self):
         field = getattr(self, "dual_layout_output", None)

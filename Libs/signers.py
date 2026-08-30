@@ -6,6 +6,13 @@ from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
 
+try:
+    from Libs.rapidapi_quota import update_from_headers as _update_quota_headers
+except Exception:
+    try:
+        from rapidapi_quota import update_from_headers as _update_quota_headers
+    except Exception:
+        _update_quota_headers = None
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAPIDAPI_URL = "https://tiktok-live-studio-api-signer1.p.rapidapi.com/"
@@ -126,6 +133,11 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
         impersonate="chrome",
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if _update_quota_headers is not None:
+        try:
+            _update_quota_headers(response.headers)
+        except Exception:
+            pass
     try:
         data = response.json()
     except Exception:

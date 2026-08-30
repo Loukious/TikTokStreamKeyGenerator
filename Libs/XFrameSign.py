@@ -7,6 +7,14 @@ from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
 
+try:
+    from Libs.rapidapi_quota import update_from_headers as _update_quota_headers
+except Exception:
+    try:
+        from rapidapi_quota import update_from_headers as _update_quota_headers
+    except Exception:
+        _update_quota_headers = None
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAPIDAPI_URL = "https://tiktok-live-studio-api-signer1.p.rapidapi.com/"
 DEFAULT_RAPIDAPI_HOST = "tiktok-live-studio-api-signer1.p.rapidapi.com"
@@ -17,6 +25,12 @@ FRAME_SIGN_BATCH_STEP_SECONDS = 1
 FRAME_SIGN_NEAREST_TOLERANCE_SECONDS = 1
 _CACHE_LOCK = threading.Lock()
 _CACHE = {}
+# The batch cache is shared across proxy processes via a disk file so the two
+# listeners of a dual-layout room reuse one set of signatures instead of each
+# paying its own RapidAPI batch calls. Both proxies share the same cache key
+# (aid/uid/did/roomid/frametype); the signature does not cover canvas
+# identity, so the results are interchangeable.
+_CACHE_PATH = APP_ROOT / "logs" / "frame_sign_cache.json"
 
 
 def _read_config() -> dict:
@@ -100,6 +114,11 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20) -> dict:
         impersonate="chrome",
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if _update_quota_headers is not None:
+        try:
+            _update_quota_headers(response.headers)
+        except Exception:
+            pass
     try:
         data = response.json()
     except Exception:
@@ -225,6 +244,75 @@ def _cache_key(payload: dict) -> tuple:
     )
 
 
+def _cache_key_str(key: tuple) -> str:
+    return "|".join(key)
+
+
+def _load_disk_cache(key: tuple) -> None:
+    """Merge another process's batch cache into memory, if present and fresh."""
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return
+    entry = data.get(_cache_key_str(key)) or {}
+    items = entry.get("items") or {}
+    until = int(entry.get("until") or 0)
+    now = int(time.time())
+    fresh_items = {}
+    for ts, result in items.items():
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            continue
+        if ts >= now - FRAME_SIGN_CACHE_SECONDS:
+            fresh_items[ts] = result
+    if not fresh_items and not until:
+        return
+    with _CACHE_LOCK:
+        state = _CACHE.setdefault(key, {"items": {}, "until": 0, "refreshing": False})
+        for ts, result in fresh_items.items():
+            state["items"].setdefault(ts, result)
+        state["until"] = max(int(state.get("until", 0)), until)
+
+
+def _persist_cache(key: tuple) -> None:
+    """Write this process's cache entry to the shared disk cache (atomic replace).
+
+    A concurrent writer can lose the other process's merge; the worst case is
+    one extra batch fetch, never a bad signature.
+    """
+    with _CACHE_LOCK:
+        state = _CACHE.get(key) or {}
+        items = dict(state.get("items") or {})
+        until = int(state.get("until") or 0)
+    now = int(time.time())
+    items = {
+        str(ts): result
+        for ts, result in items.items()
+        if int(ts) >= now - 2 * FRAME_SIGN_CACHE_SECONDS
+    }
+    if not items:
+        return
+    existing = {}
+    try:
+        with open(_CACHE_PATH, "r", encoding="utf-8") as fh:
+            existing = json.load(fh)
+            if not isinstance(existing, dict):
+                existing = {}
+    except Exception:
+        existing = {}
+    existing[_cache_key_str(key)] = {"items": items, "until": until}
+    try:
+        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _CACHE_PATH.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh)
+        os.replace(tmp_path, _CACHE_PATH)
+    except Exception as exc:
+        _log(f"batch-cache persist failed: {exc}")
+
+
 def _store_cache(key: tuple, items: list[dict]) -> int:
     stored = {}
     max_ts = 0
@@ -244,6 +332,7 @@ def _store_cache(key: tuple, items: list[dict]) -> int:
         current["items"].update(stored)
         current["until"] = max(int(current.get("until", 0)), max_ts)
         current["refreshing"] = False
+    _persist_cache(key)
     return len(stored)
 
 
@@ -329,6 +418,13 @@ def _frame_sign_from_cache(payload: dict) -> dict:
     key = _cache_key(payload)
 
     result = _cached_result(key, target_timestamp)
+    if result is None:
+        # In-memory miss: another proxy process may already hold a batch for
+        # this same key (dual layout shares one signing identity).
+        _load_disk_cache(key)
+        result = _cached_result(key, target_timestamp)
+        if result is not None:
+            _log(f"batch-cache disk-hit target_ts={target_timestamp} until={_cache_until(key)}")
     if result is not None:
         if _cache_until(key) - target_timestamp <= FRAME_SIGN_CACHE_REFRESH_MARGIN_SECONDS:
             _refresh_cache_background(payload, _cache_until(key) + 1)
