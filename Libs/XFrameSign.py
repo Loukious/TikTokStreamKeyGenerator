@@ -30,6 +30,15 @@ FRAME_SIGN_CACHE_SECONDS = 300
 FRAME_SIGN_CACHE_REFRESH_MARGIN_SECONDS = 60
 FRAME_SIGN_BATCH_STEP_SECONDS = 1
 FRAME_SIGN_NEAREST_TOLERANCE_SECONDS = 1
+# How long frame_sign() blocks waiting for an in-flight batch refresh. The
+# refresh itself may take up to FRAME_SIGN_BATCH_TIMEOUT_SECONDS, so giving
+# up earlier kills the proxy while the fetch could still land.
+FRAME_SIGN_PENDING_WAIT_SECONDS = 30
+FRAME_SIGN_BATCH_TIMEOUT_SECONDS = 30
+# A batch fetch is retried on 429/5xx and network errors so a transient
+# RapidAPI rejection does not starve the SEI signature cache mid-stream.
+FRAME_SIGN_BATCH_RETRIES = 2
+FRAME_SIGN_BATCH_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 _CACHE_LOCK = threading.Lock()
 _CACHE = {}
 
@@ -124,38 +133,86 @@ def _headers(base_url: str) -> dict:
     return headers
 
 
-def _post_json(path: str, payload: dict, *, timeout: int = 20) -> dict:
+def _retryable_status(status: int) -> bool:
+    # 429 = RapidAPI rate/quota rejection, 5xx = gateway/upstream errors.
+    # Both are frequently transient; one failure must not starve the
+    # signature cache of a live stream.
+    return status == 429 or status >= 500
+
+
+def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0) -> dict:
     base_url = _api_base_url()
-    started = time.perf_counter()
-    response = requests.post(
-        urljoin(base_url, path.lstrip("/")),
-        headers=_headers(base_url),
-        data=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
-        timeout=timeout,
-        impersonate="chrome",
-    )
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-    if _update_quota_headers is not None:
+    attempt = 0
+    while True:
+        started = time.perf_counter()
+        response = None
+        network_error = None
         try:
-            _update_quota_headers(response.headers)
-        except Exception:
-            pass
-    try:
-        data = response.json()
-    except Exception:
-        data = {"success": False, "error": response.text[:500]}
-    _log(f"path={path} status={response.status_code} elapsed_ms={elapsed_ms} keys={list(data) if isinstance(data, dict) else type(data).__name__}")
-    if response.status_code >= 400:
+            response = requests.post(
+                urljoin(base_url, path.lstrip("/")),
+                headers=_headers(base_url),
+                data=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                timeout=timeout,
+                impersonate="chrome",
+            )
+        except Exception as exc:
+            network_error = exc
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if response is not None and _update_quota_headers is not None:
+            try:
+                _update_quota_headers(response.headers)
+            except Exception:
+                pass
+
+        data = None
         detail = ""
-        if isinstance(data, dict):
-            detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
-        detail = detail.strip() or response.text[:500].strip()
-        raise RuntimeError(
-            f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
-        )
-    if isinstance(data, dict) and data.get("success") is False:
-        raise RuntimeError(str(data.get("error") or data))
-    return data
+        if response is None:
+            detail = f"network error: {network_error}"
+        else:
+            try:
+                data = response.json()
+            except Exception:
+                data = {"success": False, "error": response.text[:500]}
+            if isinstance(data, dict):
+                detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
+            detail = detail.strip() or response.text[:500].strip()
+
+        status = response.status_code if response is not None else 0
+        retryable = (response is None or _retryable_status(status)) and attempt < retries
+        # Log the response body on failures: it is the only place RapidAPI
+        # explains why a call was rejected (quota vs subscription vs gateway).
+        log_parts = [
+            f"path={path}",
+            f"status={status if response is not None else 'network'}",
+            f"elapsed_ms={elapsed_ms}",
+        ]
+        if attempt:
+            log_parts.append(f"attempt={attempt + 1}")
+        if detail and (response is None or status >= 400):
+            log_parts.append(f"error={detail[:300]}")
+        elif data is not None:
+            log_parts.append(f"keys={list(data) if isinstance(data, dict) else type(data).__name__}")
+        _log(" ".join(log_parts))
+        if retryable:
+            delay = FRAME_SIGN_BATCH_RETRY_DELAYS_SECONDS[
+                min(attempt, len(FRAME_SIGN_BATCH_RETRY_DELAYS_SECONDS) - 1)
+            ]
+            _log(f"path={path} retry attempt={attempt + 2} in {delay}s")
+            time.sleep(delay)
+            attempt += 1
+            continue
+
+        if response is None:
+            raise RuntimeError(
+                f"RapidAPI signer request failed after {attempt + 1} attempt(s): {network_error}"
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
+            )
+        if isinstance(data, dict) and data.get("success") is False:
+            raise RuntimeError(str(data.get("error") or data))
+        return data
 
 
 def _normalize_sign_result(value, template=None) -> dict:
@@ -405,7 +462,8 @@ def _fetch_batch_cache(payload: dict, start_timestamp: int) -> int:
             "duration_seconds": FRAME_SIGN_CACHE_SECONDS,
             "step_seconds": FRAME_SIGN_BATCH_STEP_SECONDS,
         },
-        timeout=30,
+        timeout=FRAME_SIGN_BATCH_TIMEOUT_SECONDS,
+        retries=FRAME_SIGN_BATCH_RETRIES,
     )
     items = _extract_batch_items(data, request_payload)
     stored = _store_cache(key, items)
@@ -453,7 +511,7 @@ def _frame_sign_from_cache(payload: dict) -> dict:
         return result
 
     if not _begin_refresh(key):
-        deadline = time.time() + 3
+        deadline = time.time() + FRAME_SIGN_PENDING_WAIT_SECONDS
         while time.time() < deadline:
             time.sleep(0.05)
             result = _cached_result(key, target_timestamp)
@@ -524,7 +582,12 @@ def frame_sign_batch(
         "include_startup": bool(include_startup),
     }
     try:
-        data = _post_json("/framesign/batch", payload, timeout=30)
+        data = _post_json(
+            "/framesign/batch",
+            payload,
+            timeout=FRAME_SIGN_BATCH_TIMEOUT_SECONDS,
+            retries=FRAME_SIGN_BATCH_RETRIES,
+        )
         items = _extract_batch_items(data, template)
         if items:
             _log(f"batch ok requested={count} got={len(items)} first_ts={items[0]['timestamp']} last_ts={items[-1]['timestamp']}")

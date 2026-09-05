@@ -5041,9 +5041,16 @@ class StreamKeyGeneratorWindow(QWidget):
 
         # CONFIG_PATH is absolute (app data dir); a CWD-relative "config.json"
         # would resolve to "/" for Finder-launched macOS .app bundles.
+        # The write is atomic (temp file + os.replace): the SEI proxy child
+        # reads config.json from disk on every signing call, and a plain
+        # truncate-and-write leaves a window where the child sees a partial
+        # file, loses the RapidAPI key, and kills the live proxies.
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as file:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            tmp_path = CONFIG_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as file:
                 json.dump(data, file, indent=2)
+            os.replace(tmp_path, CONFIG_PATH)
         except OSError as exc:
             if show_message:
                 self.show_error(f"Could not save settings to {CONFIG_PATH}: {exc}")

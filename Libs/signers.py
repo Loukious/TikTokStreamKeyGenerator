@@ -168,6 +168,12 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
         if isinstance(data, dict):
             detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
         detail = detail.strip() or response.text[:500].strip()
+        # Log the response body: it is the only place RapidAPI explains why
+        # a call was rejected (quota vs subscription vs gateway).
+        _log(
+            f"path=/signatures status={response.status_code} "
+            f"elapsed_ms={elapsed_ms} error={detail[:300]}"
+        )
         raise RuntimeError(
             f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
         )
