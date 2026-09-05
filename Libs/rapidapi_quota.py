@@ -108,6 +108,23 @@ def _to_int(value):
         return None
 
 
+def _reset_epoch(snapshot):
+    """Resolve the reset header to an absolute timestamp.
+
+    RapidAPI's x-ratelimit-requests-reset is seconds-until-reset, not a
+    Unix timestamp (it visibly counts down across consecutive responses),
+    so it must be added to the snapshot time. Very large values are treated
+    as already-absolute timestamps just in case the format ever changes.
+    """
+    reset = _to_int((snapshot or {}).get("reset"))
+    if not reset:
+        return None
+    if reset > 100_000_000:
+        return reset
+    updated = _to_int((snapshot or {}).get("updated")) or int(time.time())
+    return updated + reset
+
+
 def format_quota(snapshot) -> str:
     """Human-readable one-liner for the UI, e.g. '9,437 / 10,000 left · resets Sep 01'."""
     if not isinstance(snapshot, dict) or not snapshot:
@@ -126,7 +143,7 @@ def format_quota(snapshot) -> str:
     elif limit is not None:
         parts.append(f"monthly limit {limit:,}")
 
-    reset = _to_int(snapshot.get("reset"))
+    reset = _reset_epoch(snapshot)
     if reset:
         try:
             parts.append("resets " + time.strftime("%b %d", time.localtime(reset)))
@@ -149,7 +166,7 @@ def quota_updated_at(snapshot) -> str:
 
 def quota_reset_at(snapshot) -> str:
     """Reset date string for tooltips, e.g. 'Resets Sep 01' ('' if unknown)."""
-    reset = _to_int((snapshot or {}).get("reset"))
+    reset = _reset_epoch(snapshot)
     if not reset:
         return ""
     try:
