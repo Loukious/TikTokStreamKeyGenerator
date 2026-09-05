@@ -13,8 +13,28 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from Libs.app_paths import logs_dir as _app_logs_dir
+except Exception:
+    try:
+        from app_paths import logs_dir as _app_logs_dir
+    except Exception:
+        _app_logs_dir = None
+
 APP_ROOT = Path(__file__).resolve().parents[1]
-QUOTA_PATH = APP_ROOT / "logs" / "rapidapi_quota.json"
+
+
+def _logs_dir() -> Path:
+    # macOS .app bundles must keep logs outside the bundle; see app_paths.
+    if _app_logs_dir is not None:
+        try:
+            return Path(_app_logs_dir())
+        except Exception:
+            pass
+    return APP_ROOT / "logs"
+
+
+QUOTA_PATH = _logs_dir() / "rapidapi_quota.json"
 _LOCK = threading.Lock()
 
 # RapidAPI uses x-ratelimit-requests-* on most APIs and x-quota-* on some

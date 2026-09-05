@@ -14,10 +14,30 @@ except Exception:
     except Exception:
         _update_quota_headers = None
 
+try:
+    from Libs.app_paths import logs_dir as _app_logs_dir
+except Exception:
+    try:
+        from app_paths import logs_dir as _app_logs_dir
+    except Exception:
+        _app_logs_dir = None
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAPIDAPI_URL = "https://tiktok-live-studio-api-signer1.p.rapidapi.com/"
 DEFAULT_RAPIDAPI_HOST = "tiktok-live-studio-api-signer1.p.rapidapi.com"
-LOG_PATH = APP_ROOT / "logs" / "signature_api.log"
+
+
+def _logs_dir() -> Path:
+    # macOS .app bundles must keep logs outside the bundle; see app_paths.
+    if _app_logs_dir is not None:
+        try:
+            return Path(_app_logs_dir())
+        except Exception:
+            pass
+    return APP_ROOT / "logs"
+
+
+LOG_PATH = _logs_dir() / "signature_api.log"
 
 
 def _read_config() -> dict:

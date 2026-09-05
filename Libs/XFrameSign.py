@@ -15,22 +15,43 @@ except Exception:
     except Exception:
         _update_quota_headers = None
 
+try:
+    from Libs.app_paths import logs_dir as _app_logs_dir
+except Exception:
+    try:
+        from app_paths import logs_dir as _app_logs_dir
+    except Exception:
+        _app_logs_dir = None
+
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAPIDAPI_URL = "https://tiktok-live-studio-api-signer1.p.rapidapi.com/"
 DEFAULT_RAPIDAPI_HOST = "tiktok-live-studio-api-signer1.p.rapidapi.com"
-LOG_PATH = APP_ROOT / "logs" / "frame_sign_api.log"
 FRAME_SIGN_CACHE_SECONDS = 300
 FRAME_SIGN_CACHE_REFRESH_MARGIN_SECONDS = 60
 FRAME_SIGN_BATCH_STEP_SECONDS = 1
 FRAME_SIGN_NEAREST_TOLERANCE_SECONDS = 1
 _CACHE_LOCK = threading.Lock()
 _CACHE = {}
+
+
+def _logs_dir() -> Path:
+    # macOS .app bundles must keep logs/caches outside the bundle; see
+    # app_paths. Falls back to the source-tree logs dir.
+    if _app_logs_dir is not None:
+        try:
+            return Path(_app_logs_dir())
+        except Exception:
+            pass
+    return APP_ROOT / "logs"
+
+
+LOG_PATH = _logs_dir() / "frame_sign_api.log"
 # The batch cache is shared across proxy processes via a disk file so the two
 # listeners of a dual-layout room reuse one set of signatures instead of each
 # paying its own RapidAPI batch calls. Both proxies share the same cache key
 # (aid/uid/did/roomid/frametype); the signature does not cover canvas
 # identity, so the results are interchangeable.
-_CACHE_PATH = APP_ROOT / "logs" / "frame_sign_cache.json"
+_CACHE_PATH = _logs_dir() / "frame_sign_cache.json"
 
 
 def _read_config() -> dict:

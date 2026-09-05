@@ -170,14 +170,45 @@ ENABLE_ONLINE_AUDIENCE_POLLING = True
 ENABLE_SAFETY_DETAIL_POLLING = True
 
 
+def _is_frozen_build():
+    return bool(getattr(sys, "frozen", False) or globals().get("__compiled__"))
+
+
 def _application_dir():
-    if getattr(sys, "frozen", False):
+    if _is_frozen_build():
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
-DEFAULT_COOKIES_PATH = os.path.join(_application_dir(), "cookies.json")
-CONFIG_PATH = os.path.join(_application_dir(), "config.json")
+def _is_macos_app_bundle():
+    # Nuitka --macos-create-app-bundle puts the executable inside
+    # <App>.app/Contents/MacOS. That is not a place for user data: the
+    # bundle is replaced on every app update and can be read-only (App
+    # Translocation, /Applications installs owned by another admin).
+    return sys.platform == "darwin" and _is_frozen_build()
+
+
+def _user_data_dir():
+    # Config, the default cookies file, and logs live next to the
+    # executable on Windows/Linux (portable style). macOS .app bundles use
+    # the standard per-user Application Support folder instead.
+    if _is_macos_app_bundle():
+        base = os.path.join(
+            os.path.expanduser("~"),
+            "Library",
+            "Application Support",
+            "TiktokStreamKeyGenerator",
+        )
+        try:
+            os.makedirs(base, exist_ok=True)
+            return base
+        except OSError:
+            pass
+    return _application_dir()
+
+
+DEFAULT_COOKIES_PATH = os.path.join(_user_data_dir(), "cookies.json")
+CONFIG_PATH = os.path.join(_user_data_dir(), "config.json")
 RAPIDAPI_SIGNER_DOCS_URL = "https://rapidapi.com/Loukious/api/tiktok-live-studio-api-signer1"
 
 
@@ -185,7 +216,13 @@ def _normalize_configured_path(path, default=DEFAULT_COOKIES_PATH):
     value = str(path or "").strip()
     if not value:
         value = default
-    return os.path.abspath(os.path.expanduser(value))
+    value = os.path.expanduser(value)
+    if not os.path.isabs(value):
+        # Resolve relative paths against the app's data directory, not the
+        # process CWD — a Finder-launched macOS .app has CWD "/", where
+        # neither reading nor writing makes sense.
+        value = os.path.join(os.path.dirname(default), value)
+    return os.path.abspath(value)
 
 
 def _load_config_file():
@@ -2418,7 +2455,7 @@ def _runtime_base_dir():
 
 
 def _is_packaged_app():
-    return bool(getattr(sys, "frozen", False) or globals().get("__compiled__"))
+    return _is_frozen_build()
 
 
 def _app_executable_path():
@@ -2435,12 +2472,15 @@ def _app_executable_path():
 
 
 def _runtime_logs_dir():
-    preferred = os.path.join(_runtime_base_dir(), "logs")
+    # macOS .app bundles keep logs with the other user data; the bundle
+    # itself is not a durable, writable location.
+    base = _user_data_dir() if _is_macos_app_bundle() else _runtime_base_dir()
+    preferred = os.path.join(base, "logs")
     try:
         os.makedirs(preferred, exist_ok=True)
         return preferred
     except OSError:
-        fallback = os.path.join(os.getcwd(), "logs")
+        fallback = os.path.join(os.path.expanduser("~"), "TiktokStreamKeyGenerator-logs")
         os.makedirs(fallback, exist_ok=True)
         return fallback
 
@@ -3669,7 +3709,7 @@ class StreamKeyGeneratorWindow(QWidget):
 
         def worker():
             try:
-                with Stream() as stream:
+                with Stream(cookies_path=self.get_cookies_path()) as stream:
                     stats = stream.getRealtimeStats(
                         device_id=self.device_id,
                         install_id=self.install_id,
@@ -4497,6 +4537,16 @@ class StreamKeyGeneratorWindow(QWidget):
         if os.name == "nt":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
             creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # Hand the RapidAPI key to the proxy child through its environment.
+        # Without this the child re-reads config.json from disk on every
+        # signing call, which fails when the config lives outside the app
+        # dir (macOS .app bundles keep it in ~/Library/Application Support)
+        # or while save_config is mid-rewrite. _config_value checks the
+        # environment first, so the child never needs the file for the key.
+        child_env = os.environ.copy()
+        rapidapi_key = self.get_rapidapi_key()
+        if rapidapi_key:
+            child_env["RAPIDAPI_KEY"] = rapidapi_key
         setattr(self, process_attribute, subprocess.Popen(
             command,
             cwd=_runtime_base_dir(),
@@ -4504,6 +4554,7 @@ class StreamKeyGeneratorWindow(QWidget):
             stdout=log_file,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
+            env=child_env,
         ))
 
         time.sleep(0.35)
@@ -4891,7 +4942,11 @@ class StreamKeyGeneratorWindow(QWidget):
 
         def worker():
             try:
-                with Stream() as stream:
+                # Pass the GUI's cookies path explicitly: re-resolving it
+                # from config.json inside Stream.__init__ loses the file the
+                # user picked whenever the config could not be saved (e.g.
+                # macOS .app bundles, where the bundle dir is not writable).
+                with Stream(cookies_path=self.get_cookies_path()) as stream:
                     info = stream.getAccountInfo(
                         device_id=self.device_id,
                         install_id=self.install_id,
@@ -4984,15 +5039,22 @@ class StreamKeyGeneratorWindow(QWidget):
             "dual_layout_supported": self.dual_layout_supported,
         }
 
-        with open("config.json", "w", encoding="utf-8") as file:
-            json.dump(data, file)
+        # CONFIG_PATH is absolute (app data dir); a CWD-relative "config.json"
+        # would resolve to "/" for Finder-launched macOS .app bundles.
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as file:
+                json.dump(data, file, indent=2)
+        except OSError as exc:
+            if show_message:
+                self.show_error(f"Could not save settings to {CONFIG_PATH}: {exc}")
+            return
 
         if show_message:
             self.show_info("Settings saved.")
 
     def load_config(self):
         try:
-            with open("config.json", "r", encoding="utf-8") as file:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as file:
                 data = json.load(file)
         except FileNotFoundError:
             self.device_id = ""

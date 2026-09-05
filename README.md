@@ -107,6 +107,7 @@ Notes:
 - Make sure you export while logged in with the account you intend to stream from.
 - Cookie files are live account credentials. Do not share them or commit them to git.
 - Sessions expire; if the app stops authenticating, log in again in the browser and export a fresh file.
+- On macOS, the app keeps its settings (`config.json`), the default `cookies.json`, and its logs in `~/Library/Application Support/TiktokStreamKeyGenerator/`, not inside the `.app` bundle. The easiest way to import cookies is the **Browse** button next to the Cookies file field — it accepts the exported file from anywhere, such as your Downloads folder.
 
 ## Dual Layout (Portrait + Landscape)
 
