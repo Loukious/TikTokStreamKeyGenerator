@@ -9,6 +9,10 @@ on:
       changelog:
         description: "The changelog for this version"
         required: true
+      prerelease:
+        description: "Mark this release as a pre-release"
+        type: boolean
+        default: false
 
 env:
   FORCE_COLOR: true
@@ -300,4 +304,5 @@ jobs:
         with:
           tag_name: "v${{ github.event.inputs.version }}"
           body: ${{ github.event.inputs.changelog }}
+          prerelease: ${{ github.event.inputs.prerelease }}
           files: "artifacts/**/*.zip"
