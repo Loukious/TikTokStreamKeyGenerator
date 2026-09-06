@@ -243,9 +243,30 @@ class LocalSeiSigner:
         }
         return b"JSON" + json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
+    def begin_session(self):
+        """A new local RTMP session (OBS just connected) is starting.
+
+        The cached signature and its refresh schedule can be arbitrarily
+        old after an idle wait or a reconnect. Clear any stale failure
+        marker from a previous session so the new one gets a fresh signing
+        attempt, force the next signed payload to refresh, and kick a
+        background refresh right away so fresh signatures land within a
+        second or two.
+        """
+        with self._sign_lock:
+            self._sign_failure_ms = 0
+            self._next_refresh_flv_ts = 0
+        self._refresh_sign_result_background(int(time.time() * 1000))
+
     def reused_signed_payload(self):
         _, signed_ms = self._current_sign_result()
-        return self.signed_payload(now_ms=signed_ms or int(time.time() * 1000), refresh_signature=False)
+        now_ms = int(time.time() * 1000)
+        # The payload repeats the signature but its timestamps must stay
+        # current: after an idle wait the last signature time can be
+        # minutes in the past, which reads as a stale SEI to TikTok.
+        if not signed_ms or (now_ms - signed_ms) > 10_000:
+            signed_ms = now_ms
+        return self.signed_payload(now_ms=signed_ms, refresh_signature=False)
 
     def small_payload(self, now_ms=None):
         if now_ms is None:
@@ -412,16 +433,26 @@ class TeeOutput:
                 self.dump_file = None
 
 
-def inject_stream(src, dst, signer, fps, log):
+def inject_stream(src, output_factory, signer, fps, log):
     pacer = StudioSeiPacer()
     video_tags = 0
     injected = 0
     signed = 0
     small = 0
+    dst = None
 
     header = src.read(9)
+    if len(header) == 0:
+        # No client ever connected (listen timed out) or the client sent
+        # nothing. Not an error: the relay loop just reopens the listener.
+        log.write("[proxy] no FLV input (no client or listen timed out); reopening listener\n")
+        log.flush()
+        return
     if len(header) < 9:
-        raise RuntimeError("No FLV header from local RTMP input.")
+        raise RuntimeError("Truncated FLV header from local RTMP input.")
+    # New OBS session: reset the signer's session state before forwarding.
+    signer.begin_session()
+    dst = output_factory()
     try:
         dst.write(header)
     except (BrokenPipeError, OSError) as exc:
@@ -538,17 +569,22 @@ def _relay_once(args, signer, log):
         )
         input_stream = listen_proc.stdout
 
-    push_proc = subprocess.Popen(
-        ffmpeg_push_cmd(args.ffmpeg, args.output_url),
-        stdin=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=_subprocess_creationflags(),
-    )
-    if listen_proc is not None:
-        threading.Thread(target=pump_stderr, args=("listen", listen_proc, log), daemon=True).start()
-    threading.Thread(target=pump_stderr, args=("push", push_proc, log), daemon=True).start()
+    # The TikTok push process is created lazily, on first actual FLV data
+    # from OBS: during the idle wait (OBS not connected or reconnecting)
+    # an eager push would sit connected to TikTok with no data, get torn
+    # down server-side, and leave the first real video writing into a
+    # dead pipe.
+    push_proc = None
 
-    try:
+    def output_factory():
+        nonlocal push_proc, dump_file
+        push_proc = subprocess.Popen(
+            ffmpeg_push_cmd(args.ffmpeg, args.output_url),
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=_subprocess_creationflags(),
+        )
+        threading.Thread(target=pump_stderr, args=("push", push_proc, log), daemon=True).start()
         output_stream = push_proc.stdin
         if args.dump_output_flv:
             dump_path = _unique_dump_path(args.dump_output_flv)
@@ -557,7 +593,13 @@ def _relay_once(args, signer, log):
             log.write(f"[dump] writing post-SEI outbound FLV to {dump_path}\n")
             log.flush()
             output_stream = TeeOutput(output_stream, dump_file, log)
-        inject_stream(input_stream, output_stream, signer, args.fps, log)
+        return output_stream
+
+    if listen_proc is not None:
+        threading.Thread(target=pump_stderr, args=("listen", listen_proc, log), daemon=True).start()
+
+    try:
+        inject_stream(input_stream, output_factory, signer, args.fps, log)
     finally:
         if dump_file is not None:
             try:
@@ -568,7 +610,7 @@ def _relay_once(args, signer, log):
         _terminate_process(push_proc)
 
     listen_code = listen_proc.wait() if listen_proc is not None else 0
-    push_code = push_proc.wait()
+    push_code = push_proc.wait() if push_proc is not None else 0
     return push_code or listen_code or 0
 
 
@@ -623,9 +665,17 @@ def main():
             attempt += 1
             log.write(f"[proxy] waiting for OBS/local RTMP connection attempt={attempt}\n")
             log.flush()
-            code = _relay_once(args, signer, log)
-            log.write(f"[proxy] local RTMP session ended code={code}; reopening listener\n")
-            log.flush()
+            try:
+                code = _relay_once(args, signer, log)
+                log.write(f"[proxy] local RTMP session ended code={code}; reopening listener\n")
+                log.flush()
+            except Exception as exc:
+                # A dead session (OBS disconnected mid-stream, TikTok reset
+                # the push, a signer call failing after a long idle) must
+                # crash neither the proxy child nor the stream: log it and
+                # reopen the listener so OBS can reconnect.
+                log.write(f"[proxy] session error: {type(exc).__name__}: {exc}; reopening listener\n")
+                log.flush()
             time.sleep(1)
     finally:
         if log is not sys.stderr:
