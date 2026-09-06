@@ -25,7 +25,7 @@ except Exception:
     curl_requests = None
     curl_exceptions = None
 from packaging import version
-from PySide6.QtCore import Qt, QTimer, Signal, QUrl
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -168,6 +168,13 @@ LOCAL_PROXY_PORTRAIT_LOG_NAME = "ffmpeg_proxy_portrait.log"
 ENABLE_STUDIO_STATS_POLLING = True
 ENABLE_ONLINE_AUDIENCE_POLLING = True
 ENABLE_SAFETY_DETAIL_POLLING = True
+# Polling while unfocused: every webcast call costs one RapidAPI /signatures
+# request (~2,660/hour focused while live, which trips the provider-side
+# hourly rate limit and burns the daily quota). When the window is not the
+# active one, display-only pollers stop; the violation monitor keeps
+# running, slower. The anchor heartbeat always runs: pausing it mid-stream
+# risks TikTok tearing the room down server-side.
+UNFOCUSED_VIOLATION_POLL_SECONDS = 60
 
 
 def _is_frozen_build():
@@ -1573,11 +1580,21 @@ class Stream:
             "raw": payload,
         }
 
-    def getViolationStatus(self, device_id="", install_id="", priority_region="", room_id="", last_time_hashtag_id="5"):
+    def getViolationStatus(
+        self,
+        device_id="",
+        install_id="",
+        priority_region="",
+        room_id="",
+        last_time_hashtag_id="5",
+        include_details=True,
+    ):
         room_id = str(room_id or self.roomId or "").strip()
         errors = []
         create_data = {}
-        if ENABLE_SAFETY_DETAIL_POLLING:
+        # include_details=False (app unfocused) skips create_info/room_info;
+        # the violation lists below are what the safety feature needs.
+        if ENABLE_SAFETY_DETAIL_POLLING and include_details:
             try:
                 create_info = self.getCreateRoomInfo(
                     device_id=device_id,
@@ -1590,7 +1607,7 @@ class Stream:
                 errors.append(f"create_info: {exc}")
 
         room_info = {"room": {}, "perception_info": {}, "room_auth": {}}
-        if ENABLE_SAFETY_DETAIL_POLLING and room_id:
+        if ENABLE_SAFETY_DETAIL_POLLING and include_details and room_id:
             try:
                 room_info = self.getRoomInfo(
                     device_id=device_id,
@@ -2749,6 +2766,9 @@ class StreamKeyGeneratorWindow(QWidget):
         self.anchor_heartbeat_in_flight = False
         self.anchor_heartbeat_error_count = 0
         self.anchor_ping_status = ANCHOR_STATUS_DEFAULT
+        # Focus tracking for polling throttling (True until first
+        # changeEvent says otherwise, so startup behaves like focused).
+        self.app_in_focus = True
         self.anchor_heartbeat_timer = QTimer(self)
         self.anchor_heartbeat_timer.setInterval(5000)
         self.anchor_heartbeat_timer.timeout.connect(self.send_anchor_heartbeat)
@@ -3662,7 +3682,10 @@ class StreamKeyGeneratorWindow(QWidget):
             return str(value)
 
     def sync_realtime_stats_timer(self):
-        if ENABLE_STUDIO_STATS_POLLING:
+        # Focus gating: the stats/trends endpoints are display-only; while
+        # the window is unfocused the timer stays stopped so no RapidAPI
+        # /signatures calls are spent on numbers nobody is looking at.
+        if ENABLE_STUDIO_STATS_POLLING and self.app_in_focus:
             should_run = bool(self.is_live and self.current_room_id)
             if should_run:
                 if not self.realtime_stats_timer.isActive():
@@ -3697,6 +3720,10 @@ class StreamKeyGeneratorWindow(QWidget):
             self.sync_realtime_stats_timer()
             return
         if not self.get_cookie_file_status()[0]:
+            return
+        # Unfocused and not user-forced: no stats refresh; sync_polling_focus
+        # re-fires this with the timer restarted on refocus.
+        if not self.app_in_focus and not force:
             return
 
         self.realtime_stats_in_flight = True
@@ -4044,12 +4071,20 @@ class StreamKeyGeneratorWindow(QWidget):
             self.refresh_audience_safety_button.setText("Refreshing...")
 
         room_id = self.current_room_id
-        can_fetch_audience = bool(ENABLE_ONLINE_AUDIENCE_POLLING and self.is_live and room_id)
+        # Focus gating: while the window is unfocused, skip the display-only
+        # audience fetch — the violation checks below still run.
+        can_fetch_audience = bool(
+            ENABLE_ONLINE_AUDIENCE_POLLING
+            and self.is_live
+            and room_id
+            and self.app_in_focus
+        )
         if not can_fetch_audience:
             room_id = ""
         anchor_id = self.current_anchor_id or getattr(self, "account_user_id_value", "")
         priority_region = self.stream_priority_region or self.region_combo.currentText()
         topic_id = self.get_selected_topic_id() or "5"
+        fetch_safety_details = bool(ENABLE_SAFETY_DETAIL_POLLING and self.app_in_focus)
 
         def worker():
             try:
@@ -4067,7 +4102,11 @@ class StreamKeyGeneratorWindow(QWidget):
                             "total": None,
                             "preview_count": None,
                             "ranks": [],
-                            "bottom_notice": "Not live. Audience data is unavailable.",
+                            "bottom_notice": (
+                                "Not live. Audience data is unavailable."
+                                if not self.is_live
+                                else "Audience panel paused (app not focused). Violations are still monitored."
+                            ),
                         }
                     safety = stream.getViolationStatus(
                         device_id=self.device_id,
@@ -4075,6 +4114,7 @@ class StreamKeyGeneratorWindow(QWidget):
                         priority_region=priority_region,
                         room_id=room_id,
                         last_time_hashtag_id=topic_id,
+                        include_details=fetch_safety_details,
                     )
                 self.audience_safety_loaded.emit({"audience": audience, "safety": safety})
             except Exception as exc:
@@ -4820,6 +4860,48 @@ class StreamKeyGeneratorWindow(QWidget):
                 )
 
         self.sync_realtime_stats_timer()
+        self.sync_audience_safety_timer()
+
+    def changeEvent(self, event):
+        # Track activation/minimize to throttle display-only polling. Both
+        # event types must be watched: clicking another window fires
+        # ActivationChange, minimizing fires WindowStateChange (with no
+        # activation event on the way down on some platforms).
+        if event.type() in (QEvent.ActivationChange, QEvent.WindowStateChange):
+            focused = self.isActiveWindow() and not self.isMinimized()
+            if focused != self.app_in_focus:
+                self.app_in_focus = focused
+                self.sync_polling_focus()
+        super().changeEvent(event)
+
+    def sync_polling_focus(self):
+        """Re-evaluate poller states after a focus change.
+
+        Unfocused: stats/audience/safety-detail pollers stop, the violation
+        monitor slows to UNFOCUSED_VIOLATION_POLL_SECONDS. Refocused: normal
+        cadence resumes and one immediate catch-up refresh updates the
+        display-only panels so the numbers are current the moment the user
+        looks at the app again.
+        """
+        if self.app_in_focus:
+            if self.realtime_stats_timer.isActive():
+                self.realtime_stats_timer.setInterval(5000)
+            elif ENABLE_STUDIO_STATS_POLLING and self.is_live and self.current_room_id:
+                self.sync_realtime_stats_timer()
+            self.audience_safety_timer.setInterval(15000)
+            if not self.audience_safety_timer.isActive():
+                self.sync_audience_safety_timer()
+            if self.is_live:
+                # Catch-up: refresh the now-visible panels right away
+                # instead of waiting out the next (long) interval.
+                self.refresh_realtime_stats()
+                self.refresh_audience_safety()
+        else:
+            if self.realtime_stats_timer.isActive():
+                self.realtime_stats_timer.stop()
+            self.audience_safety_timer.setInterval(UNFOCUSED_VIOLATION_POLL_SECONDS)
+        # The audience-safety worker reads app_in_focus when it runs, to
+        # skip the audience/ranklist and create_info/room_info detail calls.
         self.sync_audience_safety_timer()
 
     def sync_anchor_heartbeat_timer(self):
