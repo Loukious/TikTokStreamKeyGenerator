@@ -37,6 +37,40 @@ def _logs_dir() -> Path:
 QUOTA_PATH = _logs_dir() / "rapidapi_quota.json"
 _LOCK = threading.Lock()
 
+# --- Rate-limit circuit breaker -----------------------------------------
+# A 429 means the plan's rate limit is exhausted for now (per-second burst
+# or the provider's hourly cap). Pollers keep their cadence and would keep
+# hammering the endpoint — one user's evening produced 12,000+ rejected
+# calls in a few hours. Both signer call sites trip this breaker so the
+# whole process stops sending for a cooldown window; each fresh 429 while
+# probing re-arms it, so a fully exhausted hourly limit costs one probe
+# per minute instead of hundreds.
+RATE_LIMIT_COOLDOWN_SECONDS = 60.0
+_BREAKER_LOCK = threading.Lock()
+_rate_limited_until = 0.0
+
+
+def note_rate_limited(seconds=None) -> None:
+    """Arm the breaker for `seconds` (default RATE_LIMIT_COOLDOWN_SECONDS)."""
+    global _rate_limited_until
+    if seconds is None:
+        seconds = RATE_LIMIT_COOLDOWN_SECONDS
+    with _BREAKER_LOCK:
+        _rate_limited_until = max(_rate_limited_until, time.time() + float(seconds))
+
+
+def rate_limit_wait_seconds() -> float:
+    """Seconds remaining in the cooldown (0.0 when clear)."""
+    with _BREAKER_LOCK:
+        return max(0.0, _rate_limited_until - time.time())
+
+
+def clear_rate_limit() -> None:
+    """Disarm the breaker after a successful request."""
+    global _rate_limited_until
+    with _BREAKER_LOCK:
+        _rate_limited_until = 0.0
+
 # RapidAPI uses x-ratelimit-requests-* on most APIs and x-quota-* on some
 # older/proxied products; accept either.
 _HEADER_NAMES = {

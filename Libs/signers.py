@@ -15,6 +15,24 @@ except Exception:
         _update_quota_headers = None
 
 try:
+    from Libs.rapidapi_quota import (
+        clear_rate_limit as _clear_rate_limit,
+        note_rate_limited as _note_rate_limited,
+        rate_limit_wait_seconds as _rate_limit_wait_seconds,
+    )
+except Exception:
+    try:
+        from rapidapi_quota import (
+            clear_rate_limit as _clear_rate_limit,
+            note_rate_limited as _note_rate_limited,
+            rate_limit_wait_seconds as _rate_limit_wait_seconds,
+        )
+    except Exception:
+        _clear_rate_limit = None
+        _note_rate_limited = None
+        _rate_limit_wait_seconds = None
+
+try:
     from Libs.app_paths import logs_dir as _app_logs_dir
 except Exception:
     try:
@@ -143,6 +161,14 @@ def _fallback_khronos(timestamp=None) -> str:
 
 
 def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
+    # Circuit breaker: while a recent 429 has the plan rate-limited, fail
+    # fast instead of sending requests that are guaranteed to be rejected.
+    if _rate_limit_wait_seconds is not None:
+        wait = _rate_limit_wait_seconds()
+        if wait > 0:
+            raise RuntimeError(
+                f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s"
+            )
     base_url = _api_base_url()
     started = time.perf_counter()
     response = requests.post(
@@ -153,6 +179,11 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
         impersonate="chrome",
     )
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+    if response.status_code == 429:
+        if _note_rate_limited is not None:
+            _note_rate_limited()
+    elif response.status_code < 400 and _clear_rate_limit is not None:
+        _clear_rate_limit()
     if _update_quota_headers is not None:
         try:
             _update_quota_headers(response.headers)

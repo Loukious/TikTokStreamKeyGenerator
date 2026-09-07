@@ -4899,7 +4899,11 @@ class StreamKeyGeneratorWindow(QWidget):
         else:
             if self.realtime_stats_timer.isActive():
                 self.realtime_stats_timer.stop()
-            self.audience_safety_timer.setInterval(UNFOCUSED_VIOLATION_POLL_SECONDS)
+            # QTimer intervals are milliseconds — without the * 1000 this
+            # becomes a 60ms timer that, gated only by the in-flight flag,
+            # polls violation_list back-to-back (~35 refreshes/min) and
+            # burns the RapidAPI hourly rate limit in minutes.
+            self.audience_safety_timer.setInterval(UNFOCUSED_VIOLATION_POLL_SECONDS * 1000)
         # The audience-safety worker reads app_in_focus when it runs, to
         # skip the audience/ranklist and create_info/room_info detail calls.
         self.sync_audience_safety_timer()

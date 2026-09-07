@@ -16,6 +16,24 @@ except Exception:
         _update_quota_headers = None
 
 try:
+    from Libs.rapidapi_quota import (
+        clear_rate_limit as _clear_rate_limit,
+        note_rate_limited as _note_rate_limited,
+        rate_limit_wait_seconds as _rate_limit_wait_seconds,
+    )
+except Exception:
+    try:
+        from rapidapi_quota import (
+            clear_rate_limit as _clear_rate_limit,
+            note_rate_limited as _note_rate_limited,
+            rate_limit_wait_seconds as _rate_limit_wait_seconds,
+        )
+    except Exception:
+        _clear_rate_limit = None
+        _note_rate_limited = None
+        _rate_limit_wait_seconds = None
+
+try:
     from Libs.app_paths import logs_dir as _app_logs_dir
 except Exception:
     try:
@@ -144,6 +162,15 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0)
     base_url = _api_base_url()
     attempt = 0
     while True:
+        # Circuit breaker: while a recent 429 has the plan rate-limited,
+        # fail fast instead of sending requests that are guaranteed to be
+        # rejected (and re-arming the provider's limit window).
+        if _rate_limit_wait_seconds is not None:
+            wait = _rate_limit_wait_seconds()
+            if wait > 0:
+                raise RuntimeError(
+                    f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s"
+                )
         started = time.perf_counter()
         response = None
         network_error = None
@@ -178,6 +205,10 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0)
             detail = detail.strip() or response.text[:500].strip()
 
         status = response.status_code if response is not None else 0
+        if status == 429 and _note_rate_limited is not None:
+            _note_rate_limited()
+        elif response is not None and status < 400 and _clear_rate_limit is not None:
+            _clear_rate_limit()
         retryable = (response is None or _retryable_status(status)) and attempt < retries
         # Log the response body on failures: it is the only place RapidAPI
         # explains why a call was rejected (quota vs subscription vs gateway).
