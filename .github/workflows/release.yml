@@ -4,305 +4,228 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "The new version number (e.g., 1.1)"
+        description: Numeric app version (e.g. 2.2.0)
         required: true
-      changelog:
-        description: "The changelog for this version"
-        required: true
-      prerelease:
-        description: "Mark this release as a pre-release"
+        type: string
+      signing_policy:
+        description: Windows signing policy (release-signing uses release_certificate_2026)
+        type: choice
+        options: [release-signing, test-signing, unsigned]
+        default: release-signing
+      publish:
+        description: Publish on the public repository after all five packages pass
         type: boolean
         default: false
+      prerelease:
+        description: Mark the published release as a pre-release
+        type: boolean
+        default: false
+      changelog:
+        description: Release notes (only used when publishing)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  FORCE_COLOR: true
+  PYTHONUTF8: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
 jobs:
-  create-tag:
-    runs-on: ubuntu-22.04
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.inputs.outputs.matrix }}
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-      - name: Create Git Tag
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Validate inputs and signing configuration
+        id: inputs
+        env:
+          APP_VERSION: ${{ inputs.version }}
+          SIGNING_POLICY: ${{ inputs.signing_policy }}
+          PUBLISH: ${{ inputs.publish }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v${{ github.event.inputs.version }}" || echo "Tag creation failed (possibly already exists)."
-          git push origin "v${{ github.event.inputs.version }}" || echo "Tag push failed (possibly already exists)."
+          python - <<'PY'
+          import json, os
+          from scripts.release_config import native_build_matrix, validate_release_request
+          validate_release_request(
+              version=os.environ['APP_VERSION'],
+              signing_policy=os.environ['SIGNING_POLICY'],
+              publish=os.environ['PUBLISH'] == 'true',
+              repository=os.environ['GITHUB_REPOSITORY'],
+              has_signpath_token=bool(os.environ['SIGNPATH_API_TOKEN']),
+          )
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps(native_build_matrix()) + '\n')
+          PY
 
-  build_windows:
-    runs-on: windows-latest
-    needs: create-tag
+  test:
+    runs-on: windows-2025
+    needs: validate
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: python -m pip install -r requirements-test.txt
+      - name: Run offline regression suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+          TIKTOK_SIGNER_MODE: api
+        run: python scripts/run_tests.py
+
+  build:
+    runs-on: ${{ matrix.os }}
+    needs: [validate, test]
+    timeout-minutes: 90
+    env:
+      NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
+      CLCACHE_DIR: ${{ github.workspace }}/.nuitka-cache/clcache
+    permissions:
+      contents: read
+      actions: read
     strategy:
-      matrix:
-        build_type: [Release, Debug]
-
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set Release variable
-        run: |
-          echo "RELEASE=${{ matrix.build_type }}" >> $env:GITHUB_ENV
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.13"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if (Test-Path requirements.txt) {
-            pip install -r requirements.txt
-          }
-          "__version__ = '${{ github.event.inputs.version }}'" | Out-File -FilePath _version.py -Encoding utf8
-
-      - name: Build Executable
-        run: |
-          Write-Host "Release variable is set to: $env:Release"
-          if ($env:Release -eq 'Release') {
-            nuitka `
-            --assume-yes-for-downloads `
-            --show-scons `
-            --clang `
-            --lto=yes `
-            --jobs=4 `
-            --static-libpython=no `
-            --standalone `
-            --enable-plugin=anti-bloat `
-            --show-modules `
-            --show-anti-bloat-changes `
-            --follow-stdlib `
-            --follow-imports `
-            --nofollow-import-to="*.tests" `
-            --nofollow-import-to="pydoc" `
-            --nofollow-import-to="test" `
-            --nofollow-import-to="DevTools" `
-            --prefer-source-code `
-            --include-module=unittest `
-            --include-module=Libs.ffmpeg_sei_proxy `
-            --include-module=Libs.XFrameSign `
-            --include-module=Libs.signers `
-            --windows-console-mode=disable `
-            --plugin-enable=pyside6 `
-            --windows-company-name="Loukious" `
-            --windows-product-name="TikTok Stream Key Generator" `
-            --windows-file-version="${{ github.event.inputs.version }}" `
-            --windows-product-version="${{ github.event.inputs.version }}" `
-            --windows-file-description="TikTok Stream Key Generator" `
-            --copyright="Copyright (C) 2026 Loukious" `
-            TiktokStreamKeyGenerator.py
-          } else {
-            nuitka `
-            --assume-yes-for-downloads `
-            --show-scons `
-            --clang `
-            --lto=yes `
-            --jobs=4 `
-            --static-libpython=no `
-            --standalone `
-            --enable-plugin=anti-bloat `
-            --show-modules `
-            --show-anti-bloat-changes `
-            --follow-stdlib `
-            --follow-imports `
-            --nofollow-import-to="*.tests" `
-            --nofollow-import-to="pydoc" `
-            --nofollow-import-to="test" `
-            --nofollow-import-to="DevTools" `
-            --prefer-source-code `
-            --include-module=unittest `
-            --include-module=Libs.ffmpeg_sei_proxy `
-            --include-module=Libs.XFrameSign `
-            --include-module=Libs.signers `
-            --plugin-enable=pyside6 `
-            TiktokStreamKeyGenerator.py
-          }
-
-      - name: Download FFmpeg
-        shell: pwsh
-        run: |
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
-          New-Item -ItemType Directory -Force -Path ffmpeg_extract | Out-Null
-          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_extract -Force
-          New-Item -ItemType Directory -Force -Path TiktokStreamKeyGenerator.dist\bin | Out-Null
-          $ffmpeg = Get-ChildItem ffmpeg_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
-          if (-not $ffmpeg) {
-            throw "ffmpeg.exe was not found in downloaded archive."
-          }
-          Copy-Item $ffmpeg.FullName TiktokStreamKeyGenerator.dist\bin\ffmpeg.exe -Force
-          TiktokStreamKeyGenerator.dist\bin\ffmpeg.exe -version
-
-      - name: Compress Executable
-        run: Compress-Archive -Path TiktokStreamKeyGenerator.dist\* -DestinationPath TiktokStreamKeyGenerator${{ matrix.build_type }}-win-${{ github.event.inputs.version }}.zip -CompressionLevel Optimal
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-${{ matrix.build_type }}
-          path: |
-            TiktokStreamKeyGenerator*.zip
-
-  build_macos:
-    runs-on: macos-latest
-    needs: create-tag
-    strategy:
-      matrix:
-        architecture: [x86_64, arm64]
-        build_type: [Release]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v3
-        with:
-          python-version: "3.13"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          echo "__version__ = '${{ github.event.inputs.version }}'" > _version.py
-
-      - name: Build Executable
-        run: |
-          arch -${{ matrix.architecture }} nuitka \
-          --assume-yes-for-downloads \
-          --show-scons \
-          --clang \
-          --lto=yes \
-          --jobs=4 \
-          --static-libpython=no \
-          --standalone \
-          --enable-plugin=anti-bloat \
-          --enable-plugin=pyside6 \
-          --nofollow-import-to=DevTools \
-          --prefer-source-code \
-          --include-module=Libs.ffmpeg_sei_proxy \
-          --include-module=Libs.XFrameSign \
-          --include-module=Libs.signers \
-          --macos-target-arch=${{ matrix.architecture }} \
-          --macos-create-app-bundle \
-          --macos-app-version="${{ github.event.inputs.version }}" \
-          --macos-app-name="TikTok Stream Key Generator" \
-          TiktokStreamKeyGenerator.py
-
-      - name: Download FFmpeg
-        run: |
-          if [ "${{ matrix.architecture }}" = "arm64" ]; then
-            url="https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/snapshot/ffmpeg.zip"
-          else
-            url="https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/snapshot/ffmpeg.zip"
-          fi
-          curl -L "$url" -o ffmpeg.zip
-          mkdir -p ffmpeg_extract
-          unzip -q ffmpeg.zip -d ffmpeg_extract
-          mkdir -p TiktokStreamKeyGenerator.app/Contents/MacOS/bin
-          ffmpeg_path="$(find ffmpeg_extract -type f -name ffmpeg | head -n 1)"
-          if [ -z "$ffmpeg_path" ]; then
-            echo "ffmpeg was not found in downloaded archive."
-            exit 1
-          fi
-          cp "$ffmpeg_path" TiktokStreamKeyGenerator.app/Contents/MacOS/bin/ffmpeg
-          chmod +x TiktokStreamKeyGenerator.app/Contents/MacOS/bin/ffmpeg
-          TiktokStreamKeyGenerator.app/Contents/MacOS/bin/ffmpeg -version
-
-      - name: Compress Executable
-        run: zip -9 -r TiktokStreamKeyGenerator-${{ matrix.architecture }}-macos-${{ github.event.inputs.version }}.zip TiktokStreamKeyGenerator.app
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.architecture }}
-          path: |
-            TiktokStreamKeyGenerator*.zip
-
-  build_linux:
-    runs-on: ubuntu-22.04
-    needs: create-tag
-    strategy:
-      matrix:
-        build_type: [Release]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
+          python-version: '3.13'
+          architecture: ${{ matrix.arch == 'x86_64' && 'x64' || 'arm64' }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install Linux build and Qt runtime libraries
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache python3-pip zip python3-distutils
-          python3 -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
-          echo "__version__ = '${{ github.event.inputs.version }}'" > _version.py
-
-      - name: Build Executable
+          sudo apt-get install -y patchelf ccache zip libegl1 libopengl0 libxkbcommon0 libxcb-cursor0 libnss3 libasound2t64
+      - name: Install build dependencies
         run: |
-          nuitka \
-          --assume-yes-for-downloads \
-          --show-scons \
-          --clang \
-          --lto=yes \
-          --jobs=4 \
-          --static-libpython=no \
-          --standalone \
-          --enable-plugin=anti-bloat \
-          --enable-plugin=pyside6 \
-          --show-modules \
-          --show-anti-bloat-changes \
-          --follow-stdlib \
-          --follow-imports \
-          --nofollow-import-to=DevTools \
-          --prefer-source-code \
-          --include-module=Libs.ffmpeg_sei_proxy \
-          --include-module=Libs.XFrameSign \
-          --include-module=Libs.signers \
-          TiktokStreamKeyGenerator.py
-
-      - name: Download FFmpeg
-        run: |
-          curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-lgpl.tar.xz" -o ffmpeg.tar.xz
-          mkdir -p ffmpeg_extract TiktokStreamKeyGenerator.dist/bin
-          tar -xf ffmpeg.tar.xz -C ffmpeg_extract
-          ffmpeg_path="$(find ffmpeg_extract -type f -name ffmpeg | head -n 1)"
-          if [ -z "$ffmpeg_path" ]; then
-            echo "ffmpeg was not found in downloaded archive."
-            exit 1
-          fi
-          cp "$ffmpeg_path" TiktokStreamKeyGenerator.dist/bin/ffmpeg
-          chmod +x TiktokStreamKeyGenerator.dist/bin/ffmpeg
-          TiktokStreamKeyGenerator.dist/bin/ffmpeg -version
-
-      - name: Compress Executable
-        run: zip -9 -r TiktokStreamKeyGenerator-linux-${{ github.event.inputs.version }}.zip TiktokStreamKeyGenerator.dist/*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+      - name: Restore compiler cache
+        id: compiler-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          name: linux
+          path: .nuitka-cache
+          key: nuitka-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build_type }}-${{ hashFiles('requirements*.txt') }}-${{ github.sha }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-${{ runner.arch }}-${{ matrix.build_type }}-${{ hashFiles('requirements*.txt') }}-
+      - name: Build and smoke-test the native bundle
+        env:
+          APP_VERSION: ${{ inputs.version }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+        run: python scripts/build_release.py --version "$APP_VERSION" --build-type "$BUILD_TYPE"
+      # upload-artifact creates the ZIP expected by .signpath/windows-exe.xml.
+      # Upload only our EXE: third-party DLLs and FFmpeg are not re-signed.
+      - name: Upload unsigned EXE for SignPath
+        if: runner.os == 'Windows' && inputs.signing_policy != 'unsigned'
+        id: unsigned
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signpath-input-${{ matrix.build_type }}
+          path: build/TiktokStreamKeyGenerator.dist/TiktokStreamKeyGenerator.exe
+          if-no-files-found: error
+          retention-days: 7
+      # In SignPath, release-signing selects release_certificate_2026.
+      - name: Sign Windows EXE
+        if: runner.os == 'Windows' && inputs.signing_policy != 'unsigned'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: 6f972417-ec42-48a3-8f85-2ed3dfe07fb7
+          project-slug: TikTokStreamKeyGenerator
+          signing-policy-slug: ${{ inputs.signing_policy }}
+          artifact-configuration-slug: windows-exe
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: build/signed
+      - name: Check signature verification rejects modified executables
+        timeout-minutes: 3
+        if: runner.os == 'Windows' && inputs.signing_policy != 'unsigned'
+        shell: pwsh
+        env:
+          SIGNING_POLICY: ${{ inputs.signing_policy }}
+        run: ./scripts/test_windows_signature.ps1 -SignedDirectory build/signed -Policy $env:SIGNING_POLICY
+      - name: Verify and install the signed EXE
+        timeout-minutes: 2
+        if: runner.os == 'Windows' && inputs.signing_policy != 'unsigned'
+        shell: pwsh
+        env:
+          SIGNING_POLICY: ${{ inputs.signing_policy }}
+        run: ./scripts/verify_windows_signature.ps1 -SignedDirectory build/signed -Policy $env:SIGNING_POLICY
+      - name: Package final application
+        env:
+          APP_VERSION: ${{ inputs.version }}
+          BUILD_TYPE: ${{ matrix.build_type }}
+          SIGNING_POLICY: ${{ inputs.signing_policy }}
+        run: python scripts/build_release.py --package-only --version "$APP_VERSION" --build-type "$BUILD_TYPE" --signing "$SIGNING_POLICY"
+      - name: Upload final download
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.build_type }}
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload compilation report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: report-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.build_type }}
           path: |
-            TiktokStreamKeyGenerator*.zip
+            build/compilation-report.xml
+            build/smoke-test.log
+          retention-days: 7
+      - name: Preserve a failed runtime bundle for diagnosis
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: failed-runtime-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.build_type }}
+          path: |
+            build/TiktokStreamKeyGenerator.dist
+            build/TiktokStreamKeyGenerator.app
+          if-no-files-found: ignore
+          retention-days: 3
+      - name: Save compiler cache, including failed smoke checks
+        if: always() && steps.compiler-cache.outcome == 'success' && steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .nuitka-cache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
   release:
-    runs-on: ubuntu-latest
-    needs: [build_linux, build_windows, build_macos]
-
+    if: inputs.publish && github.repository == 'Loukious/TikTokStreamKeyGenerator'
+    runs-on: ubuntu-24.04
+    needs: [validate, test, build]
+    permissions:
+      contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: artifacts/
-
-      - name: Create the release
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          pattern: package-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish completed packages
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: "v${{ github.event.inputs.version }}"
-          body: ${{ github.event.inputs.changelog }}
-          prerelease: ${{ github.event.inputs.prerelease }}
-          files: "artifacts/**/*.zip"
+          target_commitish: ${{ github.sha }}
+          tag_name: v${{ inputs.version }}
+          body: ${{ inputs.changelog }}
+          prerelease: ${{ inputs.prerelease }}
+          fail_on_unmatched_files: true
+          files: artifacts/*.zip

@@ -1,0 +1,8 @@
+-r requirements.txt
+# 4.3 corrupts compiled PySide6 callbacks (upstream Nuitka issue #4081).
+# Keep the stable PyPI version that predates that regression.
+Nuitka==4.2.2
+ordered-set>=4.1
+zstandard>=0.23
+Pillow>=11
+imageio>=2.37; sys_platform == "darwin"
