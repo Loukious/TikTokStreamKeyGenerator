@@ -477,13 +477,13 @@ The [Release workflow](.github/workflows/release.yml) builds native standalone b
 
 Run **Actions → Release → Run workflow** and enter the numeric version and release notes. Every run builds all five packages: Windows x86_64 Release and Debug, Linux x86_64, macOS Intel, and macOS Apple Silicon. There is no partial-platform release option. All builds run an offline packaged-runtime check before signing.
 
-The default `signing_policy: release-signing` selects SignPath's `release_certificate_2026`. That certificate currently has **CSR PENDING** status; this workflow is prepared for it, but no production build or signing request has been started. Wait for SignPath to issue the certificate and validate the policy before using production signing. For an explicitly requested test run, select `test-signing` and leave `publish: false`.
+The default `signing_policy: release-signing` selects SignPath's `release_certificate_2026`. Production signing requires an issued certificate and a valid SignPath policy. For a test build, select `test-signing` and leave `publish: false`.
 
-The private `Loukious/TestTikTok` repository only produces workflow artifacts and cannot publish releases. Once the configuration is ready on the public repository, select `publish: true` to publish all completed packages together. Both stable releases and pre-releases require production Windows signing; unsigned and test-signed packages remain workflow artifacts only.
+Select `publish: true` on `Loukious/TikTokStreamKeyGenerator` to publish all completed packages together. Other repositories only produce workflow artifacts and cannot publish releases. Both stable releases and pre-releases require production Windows signing; unsigned and test-signed packages remain workflow artifacts only.
 
 Windows signing uploads only `TiktokStreamKeyGenerator.exe` as a GitHub artifact ZIP, submits its artifact ID to SignPath, downloads and verifies the signed EXE, then replaces the unsigned EXE before creating the final downloadable ZIP. Bundled third-party DLLs and FFmpeg retain their original signatures. A signing or verification error fails the build; it never silently ships an unsigned replacement.
 
-See [SignPath setup and rollout](docs/signpath.md) for the organization/project settings, artifact XML, CI secret and production certificate checklist. Test-signed Windows packages are labeled `-test-signed`; their self-signed certificate is not publicly trusted and will not remove SmartScreen warnings. The production certificate is still pending. Publication requires the `release-signing` policy; macOS signing/notarization is a separate setup.
+See [SignPath setup](docs/signpath.md) for the organization/project settings, artifact XML, CI secret and production certificate requirements. Test-signed Windows packages are labeled `-test-signed`; their self-signed certificate is not publicly trusted and will not remove SmartScreen warnings. Publication requires the `release-signing` policy; macOS signing/notarization is a separate setup.
 
 To run the shareable offline checks:
 
@@ -491,18 +491,3 @@ To run the shareable offline checks:
 python -m pip install -r requirements-test.txt
 python scripts/run_tests.py
 ```
-
-To reproduce the README previews without reading real account data:
-
-```bash
-python scripts/capture_screenshots.py
-```
-
-On Windows, include the native title bars as in the README images:
-
-```powershell
-python scripts/capture_screenshots.py --native-window
-```
-
-This captures only the demo application's windows, using temporary settings and
-no real account data. The default offscreen mode remains available on all platforms.
