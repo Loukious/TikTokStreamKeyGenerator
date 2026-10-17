@@ -497,3 +497,12 @@ To reproduce the README previews without reading real account data:
 ```bash
 python scripts/capture_screenshots.py
 ```
+
+On Windows, include the native title bars as in the README images:
+
+```powershell
+python scripts/capture_screenshots.py --native-window
+```
+
+This captures only the demo application's windows, using temporary settings and
+no real account data. The default offscreen mode remains available on all platforms.
