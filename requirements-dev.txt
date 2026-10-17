@@ -1,0 +1,5 @@
+-r requirements.txt
+cryptography
+unicorn>=2.1,<3
+pyelftools>=0.33
+tzdata; sys_platform == "win32"

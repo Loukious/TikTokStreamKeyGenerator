@@ -1,11 +1,11 @@
 requests>=2.31.0
+websockets>=15,<17
 curl_cffi>=0.15.0
-PySide6>=6.7.2
-nuitka>=2.6.9
-clang>=20.1.0
-setuptools>=75.2.0
+PySide6>=6.12,<6.13
+PySide6-Fluent-Widgets>=1.11.3,<2
 pytz>=2024.1
 pycryptodome>=3.20.0
 python-dotenv>=1.0.1
 packaging>=26.0
 truststore
+tzdata

@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
+from Libs.error_reporting import HostedSignerError, SignerFailureKind
 
 try:
     from Libs.rapidapi_quota import update_from_headers as _update_quota_headers
@@ -168,8 +169,8 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0)
         if _rate_limit_wait_seconds is not None:
             wait = _rate_limit_wait_seconds()
             if wait > 0:
-                raise RuntimeError(
-                    f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s"
+                raise HostedSignerError(
+                    f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s", kind=SignerFailureKind.QUOTA
                 )
         started = time.perf_counter()
         response = None
@@ -182,7 +183,7 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0)
                 timeout=timeout,
                 impersonate="chrome",
             )
-        except Exception as exc:
+        except requests.exceptions.RequestException as exc:
             network_error = exc
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         if response is not None and _update_quota_headers is not None:
@@ -198,7 +199,7 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0)
         else:
             try:
                 data = response.json()
-            except Exception:
+            except ValueError:
                 data = {"success": False, "error": response.text[:500]}
             if isinstance(data, dict):
                 detail = str(data.get("error") or data.get("message") or data.get("detail") or "")
@@ -234,15 +235,15 @@ def _post_json(path: str, payload: dict, *, timeout: int = 20, retries: int = 0)
             continue
 
         if response is None:
-            raise RuntimeError(
+            raise HostedSignerError(
                 f"RapidAPI signer request failed after {attempt + 1} attempt(s): {network_error}"
-            )
+            ) from network_error
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
+            raise HostedSignerError.from_http(
+                response.status_code, f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
             )
         if isinstance(data, dict) and data.get("success") is False:
-            raise RuntimeError(str(data.get("error") or data))
+            raise HostedSignerError(str(data.get("error") or data))
         return data
 
 
@@ -504,7 +505,7 @@ def _fetch_batch_cache(payload: dict, start_timestamp: int) -> int:
         f"until={_cache_until(key)}"
     )
     if not stored:
-        raise ValueError("frameSign batch returned no usable items")
+        raise HostedSignerError("frameSign batch returned no usable items")
     return stored
 
 
@@ -566,17 +567,37 @@ def _frame_sign_from_cache(payload: dict) -> dict:
 
 def _frame_sign_from_api(payload: dict) -> dict:
     data = _post_json("/framesign", {"payload": payload}, timeout=20)
-    result = _normalize_sign_result(data, payload)
+    try:
+        result = _normalize_sign_result(data, payload)
+    except ValueError as exc:
+        raise HostedSignerError(str(exc)) from exc
     _log(f"direct ok target_ts={_payload_timestamp(payload)}")
     return result
 
 
-def frame_sign(input_json, **kwargs) -> dict:
+def frame_sign(input_json, *, implementation='pc', sdk_context=None, **kwargs) -> dict:
+    if implementation not in ('pc', 'mobile'):
+        raise ValueError('implementation must be pc or mobile')
+    if implementation == 'mobile':
+        from Libs.signers import mobile_api_ready
+        mobile_api_ready()
+        if kwargs:
+            raise ValueError('Hosted signing does not accept local entropy options')
+        payload = _json_payload(input_json)
+        data = _post_json('/framesign', {'payload': payload, 'implementation': 'mobile',
+                                       'sdk_context': sdk_context or {}}, timeout=20)
+        try:
+            result = _normalize_sign_result(data, payload)
+        except ValueError as exc:
+            raise HostedSignerError(str(exc)) from exc
+        if str(result.get('signversion')) != '2.0':
+            raise HostedSignerError('Hosted API does not return Android frameSign 2.0 yet.')
+        return result
     payload = _json_payload(input_json)
     if kwargs:
         raise RuntimeError("API frame signing does not accept local signer options")
     if not _should_use_api():
-        raise RuntimeError("RapidAPI frame-signing key is required")
+        raise HostedSignerError("RapidAPI frame-signing key is required", kind=SignerFailureKind.SUBSCRIPTION)
     try:
         return _frame_sign_from_cache(payload)
     except Exception as exc:
@@ -603,7 +624,7 @@ def frame_sign_batch(
     if kwargs:
         raise RuntimeError("API frame-signing does not accept local signer options")
     if not _should_use_api():
-        raise RuntimeError("RapidAPI frame-signing key is required")
+        raise HostedSignerError("RapidAPI frame-signing key is required", kind=SignerFailureKind.SUBSCRIPTION)
 
     payload = {
         "payload": template,
@@ -623,7 +644,7 @@ def frame_sign_batch(
         if items:
             _log(f"batch ok requested={count} got={len(items)} first_ts={items[0]['timestamp']} last_ts={items[-1]['timestamp']}")
             return items
-        raise ValueError(f"no usable batch items in response keys={list(data) if isinstance(data, dict) else type(data).__name__}")
+        raise HostedSignerError(f"no usable batch items in response keys={list(data) if isinstance(data, dict) else type(data).__name__}")
     except Exception as exc:
         _log(f"batch api failed; no local fallback in production mode: {exc}")
         raise

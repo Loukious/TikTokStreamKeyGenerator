@@ -1,6 +1,21 @@
+import sys
+
+# Enable native crash traces before importing Qt or any other extension during
+# the offline packaged-runtime check. Normal launches never create this file.
+_release_smoke_log = None
+if '--smoke-test' in sys.argv:
+    import faulthandler
+    import os
+    if os.environ.get('TIKTOK_SMOKE_REPORT'):
+        _release_smoke_log = open(os.environ['TIKTOK_SMOKE_REPORT'], 'w', encoding='utf-8')
+        faulthandler.enable(file=_release_smoke_log, all_threads=True)
+        print('Starting packaged module imports', file=_release_smoke_log, flush=True)
+
 import truststore
-truststore.inject_into_ssl()
 import hashlib
+import copy
+from collections import OrderedDict
+from datetime import datetime
 import json
 import os
 import sys
@@ -8,11 +23,11 @@ import time
 import webbrowser
 import socket
 import threading
+import tempfile
 import urllib.parse
 import base64
 import mimetypes
 import secrets
-import signal
 import shutil
 import subprocess
 from urllib.parse import urlencode
@@ -26,7 +41,7 @@ except Exception:
     curl_exceptions = None
 from packaging import version
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal, QUrl
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QPixmap
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -40,10 +55,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QProgressBar,
-    QProgressDialog,
+    QPlainTextEdit,
     QPushButton,
     QHeaderView,
     QSizePolicy,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -53,6 +69,20 @@ from PySide6.QtWidgets import (
 
 if sys.platform == "win32":
     import winreg
+
+truststore.inject_into_ssl()
+
+from Libs.fluent_ui import (
+    CheckBox as QCheckBox, ComboBox as QComboBox, EditableComboBox, LineEdit as QLineEdit,
+    PlainTextEdit as QPlainTextEdit,
+    PushButton as QPushButton, TableWidget as QTableWidget, PrimaryPushButton, ScrollArea,
+    TitleLabel, CaptionLabel, FluentIcon, ToolButton, Action, CheckableMenu, DropDownPushButton,
+    Pivot, RoundMenu, LiveStatusBadge, AccentWindow, AccentDialog as QDialog, AccentMessageBox as QMessageBox,
+    configure_fluent_theme, install_font_diagnostics, section, style_controls,
+)
+from Libs.gui_tasks import BackgroundTask, Work, foreground, reap_processes, single_shot, wait_for_login_callback
+from Libs.region_context import country_code, session_key, cached_context, remember_context
+from Libs.device_profiles import has_registered_ids, prepare_device_profiles
 
 from Libs.domain_routing import (
     attach_webcast_ntp_t0,
@@ -68,8 +98,16 @@ from Libs.device_gen import (
     build_live_studio_browser_version,
     fetch_live_studio_latest_version,
     register_desktop_device_identifiers,
+    register_mobile_device_identifiers,
 )
-from Libs.signers import TikTokSigners
+from Libs.signing_backend import signature_headers, is_development
+from Libs.client_profiles import ClientImplementation, device_records, mobile_record_defaults, normalize_device_type
+from Libs.mobile_requests import create_room_form, MOBILE_BROADCAST_MODES, MOBILE_ORIENTATIONS
+from Libs.mobile_dual_layout import dual_layout_info, dual_create_params, distinct_push_urls, secondary_stream_id
+from Libs.campaigns import CampaignFormatError, center_params, normalize_campaigns, visit_request
+from Libs.campaign_ui import CampaignsDialog
+from Libs.live_chat import GiftMessage, LiveChatClient
+from Libs.error_reporting import OperationError, hosted_signer_failure, read_proxy_error
 from Libs.rapidapi_quota import (
     quota_reset_at,
     quota_updated_at,
@@ -155,6 +193,7 @@ PING_ANCHOR_TIMEOUT_SECONDS = 2.5
 ROOM_HAS_FINISHED_CODES = {"30003", "30003001"}
 ROOM_IS_LIVING_CODE = "4003150"
 PERCEPTION_VIOLATION_SCENES = (7, 10, 16)
+ACCOUNT_INFO_TIMEOUT_MS = 60000
 LOCAL_PROXY_DEFAULT_PORT = 19350
 LOCAL_PROXY_APP_NAME = "live"
 LOCAL_PROXY_STREAM_KEY = "obs"
@@ -185,6 +224,15 @@ def _application_dir():
     if _is_frozen_build():
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _application_icon():
+    # Bundled assets follow __file__, including onefile extraction directories;
+    # they are separate from the writable config directory beside the executable.
+    assets = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+    icon = QIcon(os.path.join(assets, 'app-icon.ico'))
+    icon.addFile(os.path.join(assets, 'app-icon.png'))
+    return icon
 
 
 def _is_macos_app_bundle():
@@ -349,8 +397,11 @@ def _param_value(params, name, default=None):
 
 
 def _build_signature_headers(timestamp, aid="8311", params=None, x_ss_stub=None):
+    # Android signs the final URL, cookies and body immediately before transport.
+    if _param_value(params, 'device_platform') == 'android':
+        return {}
     device_id = _param_value(params, "device_id")
-    return TikTokSigners.signature_headers(
+    return signature_headers(
         timestamp,
         aid,
         params=params,
@@ -458,9 +509,22 @@ def _encode_multipart_form_data(fields, files, boundary=None):
 
 
 class Stream:
-    def __init__(self, cookies_path=None):
+    def __init__(self, cookies_path=None, *, device_type=None, device_profile=None):
+        config = _load_config_file()
+        kind = normalize_device_type(device_type or config.get('device_type', 'pc'))
+        record = device_profile if device_profile is not None else device_records(config).get(kind, {})
+        if kind == 'mobile':
+            record = mobile_record_defaults(record)
+        self.client = ClientImplementation(kind, record)
         self.s = _new_http_session()
         self.s.headers.update(build_common_headers(self.s))
+        if self.client.kind == 'mobile':
+            self.s._tiktok_tnc_params = {key: value for key, value in self.client.mobile_params(
+                device_id=self.client.record.get('device_id', ''),
+                install_id=self.client.record.get('install_id', '')).items()
+                if key in ('aid', 'device_id', 'iid', 'device_platform', 'version_code', 'version_name',
+                           'ttnet_version', 'cronet_version')}
+            self._apply_live_studio_headers()
         self.roomId = ""
         self.streamId = ""
         self._cached_live_studio_version = None
@@ -472,6 +536,9 @@ class Stream:
         for cookie in cookies_file:
             cookies[cookie["name"]] = cookie["value"]
         self.s.cookies.update(cookies)
+        self._region_context_key = session_key(self.cookies_path, self.client.kind, self._cookie_value)
+        self._account_region = ''
+        self._region_lookup_attempted = False
 
     def __enter__(self):
         return self
@@ -531,8 +598,17 @@ class Stream:
         path = _normalize_configured_path(path or getattr(self, "cookies_path", "") or _configured_cookies_path())
         cookies = _export_cookie_jar(self.s.cookies)
         if cookies:
-            with open(path, "w", encoding="utf-8") as file:
-                json.dump(cookies, file, indent=2)
+            temporary = None
+            try:
+                # Other profile loads may read this file while it is updated.
+                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                        dir=os.path.dirname(path), prefix='.cookies-', suffix='.tmp', delete=False) as file:
+                    temporary = file.name
+                    json.dump(cookies, file, indent=2)
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None and os.path.exists(temporary):
+                    os.remove(temporary)
         return cookies
 
     def getLiveStudioLatestVersion(self):
@@ -547,30 +623,75 @@ class Stream:
             return default
 
     def _effective_priority_region(self, priority_region=""):
-        region = str(priority_region or "").strip().lower()
-        if region:
+        explicit = str(priority_region or '').strip()
+        if explicit:
+            region = country_code(explicit)
+            if not region:
+                raise ValueError('Region must be a two-letter country code, such as tw, or blank for Auto.')
             return region
+        context = cached_context(self._region_context_key)
+        if context:
+            return context.priority_region
+        # A captured Android priority is a fallback when discovery is unavailable;
+        # the account/store country is not an environment priority for either client.
+        if self.client.kind == 'mobile':
+            return country_code(self.client.record.get('request_params', {}).get('priority_region'))
+        # Studio's account/store country is not its environment priority region.
+        # Bootstrap with an empty priority until region_check provides one.
+        return ''
 
-        cookie_region = str(self._cookie_value("store-country-code", "") or "").strip().lower()
-        if len(cookie_region) == 2:
-            return cookie_region
+    def _store_region_headers(self):
+        context = cached_context(self._region_context_key)
+        region = (country_code(self._account_region)
+                  or (context.store_region if context else '')
+                  or country_code(self._cookie_value('store-country-code')))
+        return {'x-tt-store-region': region} if region else {}
 
-        return ""
+    def _refresh_region_context(self, *, device_id='', install_id='', account_region=''):
+        self._region_lookup_attempted = True
+        self._account_region = country_code(account_region) or self._account_region
+        params = self._studio_params(device_id=device_id, install_id=install_id)
+        payload = self._signed_get_json(
+            self.getServerUrl() + 'webcast/game/basic/region_check/',
+            params=params, timeout=12)
+        _raise_for_webcast_error(payload, 'LIVE Studio region check')
+        data = payload.get('data') if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or not country_code(data.get('priority_region')):
+            raise ValueError('LIVE Studio region check did not return a valid priority_region.')
+        return remember_context(self._region_context_key, data['priority_region'],
+                                self._account_region or data.get('store_region')
+                                or self._cookie_value('store-country-code'))
+
+    def _ensure_region_context(self, priority_region='', *, device_id='', install_id='', refresh=False):
+        if not refresh and (priority_region or self._region_lookup_attempted
+                            or cached_context(self._region_context_key)):
+            return
+        # Region discovery is part of authenticated account/room setup. Avoid
+        # extra discovery traffic when no login session has been loaded.
+        if not any(self._cookie_value(name) for name in ('sessionid', 'sessionid_ss', 'sid_guard', 'sid_tt')):
+            return
+        try:
+            self._refresh_region_context(device_id=device_id, install_id=install_id)
+        except Exception:
+            cancel = getattr(self, 'account_info_cancel', None)
+            if cancel is not None and cancel.is_set():
+                raise
 
     def _priority_region_candidates(self, priority_region=""):
         candidates = []
-        for candidate in (
-            priority_region,
-            self._effective_priority_region(priority_region),
-            self._cookie_value("store-country-code", ""),
-            "",
-        ):
-            candidate = str(candidate or "").strip().lower()
+        for candidate in (priority_region, self._effective_priority_region(), ''):
+            candidate = str(candidate or '').strip().lower()
             if candidate not in candidates:
                 candidates.append(candidate)
         return candidates
 
     def _apply_live_studio_headers(self):
+        if self.client.kind == 'mobile':
+            for key in list(self.s.headers):
+                if key.lower().startswith(('sec-ch-', 'sec-fetch-')):
+                    self.s.headers.pop(key, None)
+            self.s.headers.update(self.client.mobile_headers())
+            return self.client.record['app_version'], ''
         version = self.getLiveStudioLatestVersion()
         browser_version = build_live_studio_browser_version(version)
         self.s.headers.update(
@@ -593,9 +714,15 @@ class Stream:
         return version, browser_version
 
     def _studio_params(self, *, device_id="", install_id="", priority_region=""):
+        if self.client.kind == 'mobile':
+            params = self.client.mobile_params(device_id=device_id, install_id=install_id,
+                                               priority_region=self._effective_priority_region(priority_region))
+            self.priority_region_used = params.get('priority_region', '')
+            return params
         version = self.getLiveStudioLatestVersion()
         browser_version = build_live_studio_browser_version(version)
         priority_region = self._effective_priority_region(priority_region)
+        self.priority_region_used = priority_region
         return {
             "aid": "8311",
             "app_name": "tiktok_live_studio",
@@ -604,9 +731,9 @@ class Stream:
             "channel": "studio",
             "version_code": version,
             "device_platform": "windows",
-            "timezone_name": "Africa/Tunis",
-            "screen_width": "1920",
-            "screen_height": "1080",
+            "timezone_name": str(self.client.record.get('fingerprint', {}).get('timezone_name', 'Africa/Tunis')),
+            "screen_width": str(self.client.record.get('fingerprint', {}).get('screen_width', '1920')),
+            "screen_height": str(self.client.record.get('fingerprint', {}).get('screen_height', '1080')),
             "browser_language": "en-US",
             "browser_platform": "Win32",
             "browser_name": "Mozilla",
@@ -665,7 +792,7 @@ class Stream:
             return exc.status_code is None
         return False
 
-    def _signed_get_json(self, url, *, params, priority_region=""):
+    def _signed_get_json(self, url, *, params, priority_region="", extra_headers=None, timeout=None):
         self._apply_live_studio_headers()
         timestamp = get_synced_unix_seconds()
         headers = {
@@ -678,12 +805,11 @@ class Stream:
                 x_ss_stub=None,
             ),
         }
-        region = params.get("priority_region") or self._effective_priority_region(priority_region)
-        if region:
-            headers["x-tt-store-region"] = region
-        return self._request_json_with_webcast_fallback("GET", url, params=params, headers=headers)
+        headers.update(self._store_region_headers())
+        headers.update(extra_headers or {})
+        return self._request_json_with_webcast_fallback("GET", url, params=params, headers=headers, timeout=timeout)
 
-    def _signed_post_json(self, url, *, params, payload, priority_region="", timeout=20):
+    def _signed_post_json(self, url, *, params, payload, priority_region="", timeout=20, retry=True):
         self._apply_live_studio_headers()
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         x_ss_stub = _make_x_ss_stub(body)
@@ -700,17 +826,92 @@ class Stream:
                 x_ss_stub=x_ss_stub,
             ),
         }
-        region = params.get("priority_region") or self._effective_priority_region(priority_region)
-        if region:
-            headers["x-tt-store-region"] = region
-        return self._request_json_with_webcast_fallback(
+        headers.update(self._store_region_headers())
+        request = self._request_json_with_webcast_fallback if retry else self._request_json
+        return request(
             "POST",
             url,
             params=params,
             data=body,
             headers=headers,
             timeout=timeout,
+            **({"allow_redirects": False} if not retry else {}),
         )
+
+    def _cookie_account_info(self, priority_region=""):
+        """Resolve the current cookie account, never a cached GUI account ID."""
+        if self.client.kind == 'pc':
+            params = _apply_passport_sdk_signature({
+                'device_id': str(self.client.record.get('device_id') or '0'),
+                'aid': self.client.aid, 'account_sdk_source': 'web',
+                'sdk_version': PASSPORT_WEB_SDK_VERSION,
+                'verifyFp': 'verify_' + str(self.client.record.get('device_id') or '0'),
+            })
+        else:
+            params = self._studio_params(device_id=self.client.record.get('device_id', ''),
+                                         install_id=self.client.record.get('install_id', ''),
+                                         priority_region=priority_region)
+        payload = self._signed_get_json(
+            build_endpoint('api.tiktokv.com', 'passport/account/info/v2/', self.s),
+            params=params, priority_region=priority_region, timeout=20)
+        _raise_for_webcast_error(payload, 'Account info')
+        data = payload.get('data') or {}
+        if not isinstance(data, dict) or data.get('error_code') not in (None, 0, '0'):
+            raise RuntimeError('Cannot identify the signed-in account. Check the selected cookies file.')
+        user_id = str(data.get('user_id_str') or data.get('user_id') or '')
+        if not user_id.isascii() or not user_id.isdigit() or int(user_id) == 0:
+            raise RuntimeError('Cannot identify the signed-in account. Check the selected cookies file.')
+        return data
+
+    def _campaign_account_id(self, priority_region=""):
+        data = self._cookie_account_info(priority_region)
+        return str(data.get('user_id_str') or data['user_id'])
+
+    def getCampaigns(self, *, priority_region=""):
+        user_id = self._campaign_account_id(priority_region)
+        params = self._studio_params(device_id=self.client.record.get('device_id', ''),
+                                     install_id=self.client.record.get('install_id', ''),
+                                     priority_region=priority_region)
+        params.update(center_params(self.client.aid, user_id))
+        prefix = 'ls/' if self.client.kind == 'pc' else ''
+        base = self.getServerUrl()
+        try:
+            payload = self._signed_get_json(
+                base + 'webcast/activity/resource_exposure/' + prefix + 'get_campaign_center_page_data/',
+                params=params, priority_region=priority_region,
+                extra_headers={'campaign-center-lang': 'en'}, timeout=20)
+            _raise_for_webcast_error(payload, 'Campaign list')
+            campaigns = normalize_campaigns(payload, now=get_synced_unix_seconds())
+        except (CampaignFormatError, WebcastError) as exc:
+            # Legacy Studio has a captured list endpoint. Authentication and
+            # server errors must remain visible rather than look like no cards.
+            if self.client.kind != 'pc' or (isinstance(exc, WebcastError) and exc.status_code != 404):
+                raise
+            legacy_params = {k: v for k, v in params.items() if k not in ('UserBase', 'EnterFromScene')}
+            payload = self._signed_get_json(base + 'webcast/activity/resource_exposure/ls/pack_data/',
+                                            params=legacy_params, priority_region=priority_region, timeout=20)
+            _raise_for_webcast_error(payload, 'Campaign list')
+            campaigns = normalize_campaigns(payload, now=get_synced_unix_seconds())
+        return {'user_id': user_id, 'campaigns': campaigns}
+
+    def reportCampaignView(self, activity_id, *, expected_user_id, priority_region=""):
+        user_id = self._campaign_account_id(priority_region)
+        if user_id != str(expected_user_id):
+            raise RuntimeError('The cookies now belong to a different account. Refresh the campaign list first.')
+        event_params, payload = visit_request(activity_id, user_id, get_synced_unix_seconds(), self.client.aid)
+        params = self._studio_params(device_id=self.client.record.get('device_id', ''),
+                                     install_id=self.client.record.get('install_id', ''),
+                                     priority_region=priority_region)
+        params.update(event_params)
+        response = self._signed_post_json(self.getServerUrl() + 'webcast/activity/event/',
+                                         params=params, payload=payload, priority_region=priority_region,
+                                         timeout=20, retry=False)
+        if not isinstance(response, dict) or 'status_code' not in response:
+            raise RuntimeError('The view request returned an unrecognized response; receipt is unconfirmed.')
+        _raise_for_webcast_error(response, 'Campaign view')
+        if response['status_code'] not in (0, '0'):
+            raise RuntimeError('TikTok did not confirm the campaign view event.')
+        return response
 
     def _signed_post_form(self, url, *, params, data, priority_region="", timeout=20):
         self._apply_live_studio_headers()
@@ -729,9 +930,7 @@ class Stream:
                 x_ss_stub=x_ss_stub,
             ),
         }
-        region = params.get("priority_region") or self._effective_priority_region(priority_region)
-        if region:
-            headers["x-tt-store-region"] = region
+        headers.update(self._store_region_headers())
         return self._request_json_with_webcast_fallback(
             "POST",
             url,
@@ -752,11 +951,63 @@ class Stream:
         verify=True,
         timeout=None,
         headers=None,
+        allow_redirects=None,
     ):
+        cancel = getattr(self, 'account_info_cancel', None)
+        if cancel is not None and cancel.is_set():
+            raise TimeoutError('Account refresh was superseded.')
         request_headers = dict(headers or {})
         t0_ms = attach_webcast_ntp_t0(request_headers)
 
+        mobile = self.client.kind == 'mobile'
+        if mobile:
+            common = self.client.mobile_params(device_id=self.client.record.get('device_id', ''),
+                                               install_id=self.client.record.get('install_id', ''))
+            params = {**common, **(params or {})}
+            # Version metadata must remain tied to the selected Android app,
+            # including callers carrying old PC/build-code query values.
+            for key in ('version_name', 'version_code', 'manifest_version_code', 'update_version_code'):
+                params[key] = common[key]
+            params.update(aid=self.client.aid, device_id=self.client.record.get('device_id', ''),
+                          iid=self.client.record.get('install_id', ''), device_platform='android')
+            for key in ('install_id', 'live_studio', 'multi_stream_scene', 'multi_stream_source'):
+                params.pop(key, None)
+            if urllib.parse.urlsplit(url).path.endswith('/webcast/room/create/') and str(params.get('live_mode')) == '6':
+                params = dual_create_params(params)
+            self._apply_live_studio_headers()
+            request_headers = dict(requests.structures.CaseInsensitiveDict(
+                {**dict(self.s.headers), **request_headers}))
+            # Strip any signatures/stubs from earlier requests before serializing.
+            for key in list(request_headers):
+                if key.lower() in ('x-argus', 'x-gorgon', 'x-khronos', 'x-ladon', 'x-ss-stub'):
+                    request_headers.pop(key)
+            prepared = requests.Request(method, url, params=params, data=data, files=files,
+                                        headers=request_headers).prepare()
+            jar = getattr(self.s.cookies, 'jar', self.s.cookies)
+            cookie = requests.cookies.get_cookie_header(jar, prepared)
+            if cookie and 'Cookie' not in prepared.headers:
+                prepared.headers['Cookie'] = cookie
+            exact_body = prepared.body
+            if isinstance(exact_body, str):
+                exact_body = exact_body.encode('utf-8')
+            elif exact_body is not None and not isinstance(exact_body, bytes):
+                raise TypeError('Mobile signing requires serialized request bytes')
+            prepared.headers.update(self.client.signature_headers(
+                get_synced_unix_seconds(), url=prepared.url,
+                headers=dict(prepared.headers), body=exact_body))
+            url, params, data, files = prepared.url, None, exact_body, None
+            request_headers = dict(prepared.headers)
+
+        deadline = getattr(self, 'account_info_deadline', None)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Account refresh timed out.')
+            timeout = min(20 if timeout is None else timeout, remaining)
+
         response = self.s.request(
+            **({'allow_redirects': False} if mobile else
+               {'allow_redirects': allow_redirects} if allow_redirects is not None else {}),
             method=method,
             url=url,
             params=params,
@@ -766,6 +1017,8 @@ class Stream:
             verify=verify,
             timeout=timeout,
         )
+        if cancel is not None and cancel.is_set():
+            raise TimeoutError('Account refresh was superseded.')
         update_ntp_from_response(t0_ms, response)
         _audit_webcast_request(method, url, params, request_headers, response.status_code)
         try:
@@ -832,6 +1085,11 @@ class Stream:
         multi_stream_scene=False,
         multi_stream_source=1,
     ):
+        mobile_dual = self.client.kind == 'mobile' and bool(multi_stream_scene)
+        previous_room_id = self.roomId
+        if mobile_dual and self.client.record.get('broadcast_type', 'video') != 'video':
+            raise ValueError('Android Dual Layout requires Camera LIVE; screen capture uses a single canvas.')
+        self._ensure_region_context(priority_region, device_id=device_id, install_id=install_id)
         base_url = self.getServerUrl()
         self._apply_live_studio_headers()
 
@@ -865,12 +1123,22 @@ class Stream:
             "rtc_net_enabled": "false",
         }
 
+        if self.client.kind == 'mobile':
+            data = create_room_form(self.client.record, title=title, hashtag_id=hashtag_id,
+                                    game_tag_id=game_tag_id, gen_replay=gen_replay,
+                                    age_restricted=age_restricted, multi_stream_scene=multi_stream_scene,
+                                    multi_stream_source=multi_stream_source)
+            if mobile_dual and not self._get_dual_layout_info(params)['dual_layout_unlocked']:
+                raise RuntimeError('Dual Layout is not unlocked for this account, or its eligibility check failed. No room was created.')
         if age_restricted:
             data["age_restricted"] = "4"
 
         if thumbnail_path:
             uri = self.uploadThumbnail(thumbnail_path, base_url, params)
             data["cover_uri"] = uri
+
+        if mobile_dual:
+            params = dual_create_params(params)
 
         timestamp = get_synced_unix_seconds()
         body_encoded = _encode_form_body(data)
@@ -885,8 +1153,7 @@ class Stream:
                 x_ss_stub=x_ss_stub,
             ),
         }
-        if params.get("priority_region"):
-            request_headers["x-tt-store-region"] = params["priority_region"]
+        request_headers.update(self._store_region_headers())
 
         streamInfo = self._request_json(
             "POST",
@@ -896,6 +1163,27 @@ class Stream:
             headers=request_headers,
         )
         self.lastCreateStreamResponse = streamInfo
+        if mobile_dual:
+            _raise_for_webcast_error(streamInfo, 'Create Android dual stream')
+            if not isinstance(streamInfo, dict) or str(streamInfo.get('status_code')) != '0':
+                raise RuntimeError('Android dual creation returned no success status.')
+            room = streamInfo.get('data')
+            if not isinstance(room, dict):
+                raise RuntimeError('Android dual creation returned no room.')
+            ready = self._apply_room_info(room, require_stream_url=True)
+            if not (ready and distinct_push_urls(self.streamUrl, self.multiStreamUrl) and secondary_stream_id(room)):
+                message = 'TikTok did not allocate two distinct push URLs and a secondary stream ID for Android Dual Layout.'
+                if self.roomId and self.streamId and self.roomId != previous_room_id:
+                    try:
+                        self.endStream(device_id=device_id, install_id=install_id,
+                                       priority_region=priority_region,
+                                       room_id=self.roomId, stream_id=self.streamId)
+                    except Exception as exc:
+                        raise RuntimeError(message + ' Cleanup failed; the new room may still be open.') from exc
+                    message += ' The new room was ended before either proxy started.'
+                raise RuntimeError(message)
+            self.multiStreamId = secondary_stream_id(room)
+            return True
 
         try:
             if not self._apply_room_info(streamInfo["data"], require_stream_url=True):
@@ -908,16 +1196,30 @@ class Stream:
             raise RuntimeError(prompt) from exc
 
     def getCreateRoomInfo(self, device_id="", install_id="", priority_region="", last_time_hashtag_id="5"):
+        self._ensure_region_context(priority_region, device_id=device_id, install_id=install_id)
         base_url = self.getServerUrl()
         params = self._studio_params(
             device_id=device_id,
             install_id=install_id,
             priority_region=priority_region,
         )
+        if self.client.kind == 'mobile':
+            record = self.client.record
+            info = {'last_time_hashtag_id': int(last_time_hashtag_id or '5'),
+                    'live_studio': 0, 'screen_shot': int(record.get('broadcast_type') == 'screen_record'),
+                    'live_audio': 0, 'third_party': 0, 'is_teen': False,
+                    'first_open_go_live_page': True, 'has_entered_try_mode': False}
+            info.update(record.get('create_info_params', {}))
+            info['live_studio'] = 0
+            body = json.dumps(info, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+            self._apply_live_studio_headers()
+            return self._request_json_with_webcast_fallback(
+                'POST', base_url + 'webcast/room/create_info/', params=params, data=body,
+                headers={'content-type': 'application/json; charset=UTF-8'})
         params.update(
             {
                 "last_time_hashtag_id": str(last_time_hashtag_id or "5"),
-                "live_studio": "1",
+                **({"live_studio": "1"} if self.client.kind == "pc" else {}),
             }
         )
         return self._signed_get_json(
@@ -937,6 +1239,9 @@ class Stream:
                 install_id=install_id,
                 priority_region=candidate_region,
             )
+            if self.client.kind == 'mobile':
+                params.update(enable_http_dns='0', reconnect_guide_scene='0')
+                params.update(self.client.record.get('continue_params', {}))
             payload = self._signed_get_json(
                 base_url + "webcast/room/continue/",
                 params=params,
@@ -1018,6 +1323,7 @@ class Stream:
         repeat=1,
     ):
         self._apply_live_studio_headers()
+        self._ensure_region_context(priority_region, device_id=device_id, install_id=install_id)
         base_url = self.getServerUrl()
         room_id = str(room_id or self.roomId or "").strip()
         stream_id = str(stream_id or self.streamId or "").strip()
@@ -1050,9 +1356,7 @@ class Stream:
                     x_ss_stub=x_ss_stub,
                 ),
             }
-            region = params.get("priority_region")
-            if region:
-                request_headers["x-tt-store-region"] = region
+            request_headers.update(self._store_region_headers())
 
             try:
                 streamInfo = self._request_json_with_webcast_fallback(
@@ -1529,6 +1833,10 @@ class Stream:
             params["device_id"] = str(device_id)
         if install_id:
             params["iid"] = str(install_id)
+        if self.client.kind == 'mobile':
+            params = {**self._studio_params(device_id=device_id, install_id=install_id,
+                                            priority_region=priority_region),
+                      'violation_list_type': str(violation_list_type)}
         url = self.getServerUrl() + "webcast/eco/violation_list/"
         payload = self._signed_get_json(
             url,
@@ -1731,6 +2039,8 @@ class Stream:
         return resolve_webcast_base_url(self.s)
 
     def getAccountInfo(self, device_id="", install_id="", priority_region="", last_time_hashtag_id="5"):
+        if self.client.kind == 'mobile':
+            return self._get_mobile_account_info(device_id, install_id, priority_region, last_time_hashtag_id)
         base_url = self.getServerUrl()
         version = self.getLiveStudioLatestVersion()
         browser_version = build_live_studio_browser_version(version)
@@ -1768,6 +2078,8 @@ class Stream:
             priority_region=priority_region,
         )
         account_data = account_payload.get("data", {}) if isinstance(account_payload, dict) else {}
+        self._account_region = country_code(account_data.get('region'))
+        self._ensure_region_context(device_id=device_id, install_id=install_id, refresh=True)
         common_params = self._studio_params(
             device_id=device_id,
             install_id=install_id,
@@ -1778,7 +2090,7 @@ class Stream:
         create_params.update(
             {
                 "last_time_hashtag_id": str(last_time_hashtag_id or "5"),
-                "live_studio": "1",
+                **({"live_studio": "1"} if self.client.kind == "pc" else {}),
             }
         )
         create_info = self._signed_get_json(
@@ -1877,6 +2189,41 @@ class Stream:
             "dual_days_to_reach": threshold.get("days_to_reach"),
         }
 
+    def _get_dual_layout_info(self, params):
+        base_url = self.getServerUrl()
+        scene = self._signed_get_json(base_url + 'webcast/game/basic/create_info/',
+                                      params={**params, 'scene': '1'}, timeout=20)
+        threshold = None
+        try:
+            threshold = self._signed_get_json(base_url + 'webcast/anchor_tool/threshold/check/',
+                                              params=dict(params), timeout=20)
+        except Exception:
+            pass
+        return dual_layout_info(scene, threshold)
+
+    def _get_mobile_account_info(self, device_id, install_id, priority_region, hashtag_id):
+        # LIVE create-info describes eligibility and usually has no profile.
+        # Passport resolves the identity authenticated by the selected cookies.
+        user = self._cookie_account_info(priority_region)
+        self._account_region = country_code(user.get('region'))
+        self._ensure_region_context(device_id=device_id, install_id=install_id, refresh=True)
+        payload = self.getCreateRoomInfo(device_id, install_id, priority_region, hashtag_id)
+        _raise_for_webcast_error(payload, 'Mobile create info')
+        data = payload.get('data') or {}
+        banned = bool((data.get('ban_status') or {}).get('is_ban') or
+                      (data.get('advanced_live_ban_status') or {}).get('is_ban'))
+        allowed = not (banned or data.get('golive_locale_restricted') or data.get('block_status') not in (0, '0', None, ''))
+        if 'can_go_live' in data:
+            allowed = allowed and data['can_go_live'] in (True, 1, '1', 'true')
+        try:
+            dual = self._get_dual_layout_info(self._studio_params(
+                device_id=device_id, install_id=install_id, priority_region=priority_region))
+        except Exception:
+            dual = dual_layout_info(None, None)
+        return {'account': user, 'create_info': data, 'can_go_live': allowed,
+                'status': 'Ready' if allowed else 'Restricted', 'device_type': 'mobile',
+                'allow_multi_stream': dual.get('allow_multi_stream_scene1'), **dual}
+
     def uploadThumbnail(self, file_path, base_url, params):
         filename = os.path.basename(file_path)
         content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
@@ -1900,9 +2247,7 @@ class Stream:
             "pragma": "no-cache",
             "cache-control": "no-cache",
         }
-        priority_region = params.get("priority_region")
-        if params.get("priority_region"):
-            request_headers["x-tt-store-region"] = params["priority_region"]
+        request_headers.update(self._store_region_headers())
 
         thumbnailInfo = self._request_json(
             "POST",
@@ -2545,6 +2890,9 @@ def _pick_local_proxy_port(preferred_port=LOCAL_PROXY_DEFAULT_PORT):
 def _safe_log_tail(path, max_lines=30):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - 128 * 1024))
             return "".join(file.readlines()[-max_lines:]).strip()
     except OSError:
         return ""
@@ -2735,25 +3083,107 @@ def start_callback_server(stop_event=None):
 # ----------------------------------------------------------------------
 # Main GUI Window
 # ----------------------------------------------------------------------
-class StreamKeyGeneratorWindow(QWidget):
+class MobileBroadcastOptions(QWidget):
+    changed = Signal()
+
+    def __init__(self, record=None, parent=None):
+        super().__init__(parent)
+        self.updating = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel('Broadcast:'))
+        self.mode_combo = QComboBox()
+        for label, value in MOBILE_BROADCAST_MODES:
+            self.mode_combo.addItem('Mobile gaming' if value == 'screen_record' else label, value)
+        mode_row.addWidget(self.mode_combo, 1)
+        layout.addLayout(mode_row)
+        self.orientation_row = QWidget()
+        orientation_layout = QHBoxLayout(self.orientation_row)
+        orientation_layout.setContentsMargins(0, 0, 0, 0)
+        orientation_layout.setSizeConstraint(QHBoxLayout.SetMinimumSize)
+        orientation_layout.addWidget(QLabel('Orientation:'))
+        self.orientation_combo = QComboBox()
+        orientation_layout.addWidget(self.orientation_combo, 1)
+        layout.addWidget(self.orientation_row)
+        self.set_record(record or {})
+        self.mode_combo.currentIndexChanged.connect(self.on_changed)
+        self.orientation_combo.currentIndexChanged.connect(self.on_changed)
+
+    def set_record(self, record):
+        self.updating = True
+        try:
+            index = self.mode_combo.findData(record.get('broadcast_type', 'video'))
+            self.mode_combo.setCurrentIndex(max(0, index))
+            orientation = str(record.get('orientation', '1'))
+            self.orientation_combo.clear()
+            for label, value in MOBILE_ORIENTATIONS:
+                self.orientation_combo.addItem(label, value)
+            index = self.orientation_combo.findData(orientation)
+            if index < 0:
+                self.orientation_combo.addItem('Saved orientation (' + orientation + ')', orientation)
+                index = self.orientation_combo.count() - 1
+            self.orientation_combo.setCurrentIndex(index)
+            self.orientation_row.setVisible(self.mode_combo.currentData() == 'screen_record')
+        finally:
+            self.updating = False
+
+    def update_record(self, record):
+        record['broadcast_type'] = self.mode_combo.currentData()
+        # Keep the gaming orientation when switching to camera and back.
+        record['orientation'] = self.orientation_combo.currentData()
+
+    def on_changed(self):
+        if self.updating:
+            return
+        self.orientation_row.setVisible(self.mode_combo.currentData() == 'screen_record')
+        self.changed.emit()
+
+
+class StreamKeyGeneratorWindow(AccentWindow):
+    chat_messages_received = Signal(object)
+    chat_status_changed = Signal(object)
     update_checked = Signal(object)
     account_info_loaded = Signal(object)
-    account_info_failed = Signal(str)
+    account_info_failed = Signal(object)
     realtime_stats_loaded = Signal(object)
-    realtime_stats_failed = Signal(str)
+    realtime_stats_failed = Signal(object)
     audience_safety_loaded = Signal(object)
-    audience_safety_failed = Signal(str)
+    audience_safety_failed = Signal(object)
     stream_ended_remotely = Signal(str)
     new_violation_detected = Signal(str)
+    device_registered = Signal(str, object)
+    device_initialization_finished = Signal(object)
 
     def __init__(self):
         super().__init__()
+        configure_fluent_theme()
         self.setWindowTitle("TikTok Stream Key Generator")
+        self.setWindowIcon(_application_icon())
+        self.setMinimumSize(900, 580)
+        self._workspace_restoring = True
+        self.device_initialization_in_flight = False
+        self.device_initialization_attempted = False
+        self.device_initialization_errors = {}
 
-        self.games = fetch_game_tags()
+        self.games = {}
+        self._game_tags_loading = True
+        self._closing = False
+        self._foreground_task = None
+        self._proxy_cleanup_threads = []
         self.device_id = ""
         self.install_id = ""
+        self.device_type = 'pc'
+        self.devices = {'pc': {}, 'mobile': {'device_id': '', 'install_id': ''}}
+        self._config_extra = {}
         self.current_room_id = ""
+        self.chat_client = None
+        self._chat_generation = 0
+        self._chat_identity = None
+        self._chat_display_room = ''
+        self._chat_displayed_gifts = OrderedDict()
+        self._chat_displayed_message_ids = OrderedDict()
         self.current_stream_id = ""
         self.stream_priority_region = ""
         self.is_live = False
@@ -2762,6 +3192,17 @@ class StreamKeyGeneratorWindow(QWidget):
         self.dual_layout_supported = None
         self.is_paused = False
         self.account_can_go_live = None
+        self.account_info_in_flight = False
+        self._account_request_id = 0
+        self._account_request_cancel = None
+        self._account_refresh_show_errors = False
+        self.account_refresh_timeout = QTimer(self)
+        self.account_refresh_timeout.setSingleShot(True)
+        self.account_refresh_timeout.timeout.connect(self.on_account_refresh_timeout)
+        self.account_load_failed = False
+        self.account_refresh_timer = QTimer(self)
+        self.account_refresh_timer.setSingleShot(True)
+        self.account_refresh_timer.timeout.connect(lambda: self.refresh_account_info(show_errors=False))
         self.suppress_donation_reminder = False
         self.anchor_heartbeat_in_flight = False
         self.anchor_heartbeat_error_count = 0
@@ -2787,6 +3228,7 @@ class StreamKeyGeneratorWindow(QWidget):
         self.ffmpeg_proxy_process = None
         self.ffmpeg_proxy_log_file = None
         self.ffmpeg_proxy_log_path = ""
+        self._proxy_error_reports = {}
         self.local_proxy_port = LOCAL_PROXY_DEFAULT_PORT
         self.local_proxy_server_url = ""
         self.local_proxy_stream_key = LOCAL_PROXY_STREAM_KEY
@@ -2815,32 +3257,68 @@ class StreamKeyGeneratorWindow(QWidget):
         self.rapidapi_key = _configured_rapidapi_key()
 
         self._build_ui()
+        self.chat_messages_received.connect(self.on_chat_messages)
+        self.chat_status_changed.connect(self.on_chat_status)
         self.update_checked.connect(self.handle_update_check)
-        self.account_info_loaded.connect(self.apply_account_info)
-        self.account_info_failed.connect(self.handle_account_info_error)
+        self.account_info_loaded.connect(self.on_account_info_loaded)
+        self.account_info_failed.connect(self.on_account_info_failed)
         self.realtime_stats_loaded.connect(self.apply_realtime_stats)
         self.realtime_stats_failed.connect(self.handle_realtime_stats_error)
         self.audience_safety_loaded.connect(self.apply_audience_safety)
         self.audience_safety_failed.connect(self.handle_audience_safety_error)
         self.stream_ended_remotely.connect(self.handle_stream_ended_remotely)
         self.new_violation_detected.connect(self.handle_new_violation_detected)
+        self.device_registered.connect(self.on_device_registered)
+        self.device_initialization_finished.connect(self.on_device_initialization_finished)
         self.load_config()
+        self._workspace_restoring = False
+        self.update_stream_options_summary()
+        self.update_device_mode_controls()
         self.check_cookies()
         self.ensure_device_identifiers(show_popup=True)
         has_startup_cookies, _ = self.get_cookie_file_status()
         if has_startup_cookies:
-            QTimer.singleShot(900, lambda: self.refresh_account_info(show_errors=False))
-        QTimer.singleShot(3000, self.show_donation_reminder)
-        QTimer.singleShot(6000, self.check_updates_on_startup)
+            self.schedule_account_refresh(900)
+        single_shot(self, 0, self.load_game_tags)
+        single_shot(self, 3000, self.show_donation_reminder)
+        single_shot(self, 6000, self.check_updates_on_startup)
 
 
     def _build_ui(self):
-        root_layout = QGridLayout(self)
-        root_layout.setSpacing(8)
-        root_layout.setContentsMargins(10, 8, 10, 8)
-        root_layout.setColumnMinimumWidth(0, 0)
-        root_layout.setColumnMinimumWidth(1, 0)
-        root_layout.setColumnMinimumWidth(2, 0)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(20, 16, 20, 16)
+        outer_layout.setSpacing(10)
+        header = QHBoxLayout()
+        header.addWidget(TitleLabel('TikTok LIVE'))
+        header.addStretch(1)
+        from qfluentwidgets import IndeterminateProgressRing
+        self.activity_spinner = IndeterminateProgressRing(self)
+        self.activity_spinner.setFixedSize(22, 22)
+        self.activity_spinner.hide()
+        self.activity_spinner.setToolTip('Loading…')
+        header.addWidget(self.activity_spinner)
+        self.account_menu_button = DropDownPushButton('Account')
+        self.views_menu_button = DropDownPushButton('Views')
+        self.settings_button = QPushButton(FluentIcon.SETTING, 'Settings')
+        self.settings_button.clicked.connect(lambda: self.open_settings('stream'))
+        header.addWidget(self.account_menu_button)
+        header.addWidget(self.views_menu_button)
+        header.addWidget(self.settings_button)
+        outer_layout.addLayout(header)
+        navigation_row = QHBoxLayout()
+        self.workspace_navigation = Pivot(self)
+        navigation_row.addWidget(self.workspace_navigation)
+        navigation_row.addStretch(1)
+        self.account_summary = QLabel('No account loaded')
+        self.account_summary.setTextFormat(Qt.PlainText)
+        navigation_row.addWidget(self.account_summary)
+        outer_layout.addLayout(navigation_row)
+        self.workspace_stack = QStackedWidget(self)
+        outer_layout.addWidget(self.workspace_stack, 1)
+        self.live_page = QWidget()
+        root_layout = QHBoxLayout(self.live_page)
+        root_layout.setSpacing(12)
+        root_layout.setContentsMargins(0, 0, 0, 0)
 
         def allow_horizontal_shrink(widget, vertical_policy=QSizePolicy.Fixed):
             widget.setMinimumWidth(0)
@@ -2859,46 +3337,45 @@ class StreamKeyGeneratorWindow(QWidget):
             button.setMinimumWidth(minimum_width)
             button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
 
-        input_group = QGroupBox("Stream Setup")
+        input_group, input_layout = section("Stream Setup", grid=True)
         input_group.setMinimumWidth(0)
         input_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        input_layout = QVBoxLayout(input_group)
-        input_layout.setSpacing(5)
+        input_layout.setSpacing(6)
+        input_layout.setColumnStretch(1, 1)
 
         # Title
         title_label = QLabel("Title:")
         title_label.setStyleSheet("font-weight: bold;")
         allow_label_shrink(title_label)
-        input_layout.addWidget(title_label)
+        input_layout.addWidget(title_label, 0, 0)
 
         self.title_edit = QLineEdit()
-        self.title_edit.setFixedHeight(28)
+        self.title_edit.setFixedHeight(36)
         allow_horizontal_shrink(self.title_edit)
-        input_layout.addWidget(self.title_edit)
+        input_layout.addWidget(self.title_edit, 0, 1, 1, 2)
 
         # Topic
         topic_label = QLabel("Topic:")
         topic_label.setStyleSheet("font-weight: bold;")
         allow_label_shrink(topic_label)
-        input_layout.addWidget(topic_label)
+        input_layout.addWidget(topic_label, 1, 0)
 
         self.topic_combo = QComboBox()
         self.topic_combo.addItems([""] + list(TOPICS.values()))
         self.topic_combo.currentTextChanged.connect(self.on_topic_changed)
-        self.topic_combo.setFixedHeight(28)
+        self.topic_combo.setFixedHeight(36)
         allow_horizontal_shrink(self.topic_combo)
-        input_layout.addWidget(self.topic_combo)
+        input_layout.addWidget(self.topic_combo, 1, 1, 1, 2)
 
         # Game
         self.game_label = QLabel("Game:")
         self.game_label.setStyleSheet("font-weight: bold;")
         allow_label_shrink(self.game_label)
-        input_layout.addWidget(self.game_label)
+        input_layout.addWidget(self.game_label, 2, 0)
 
-        self.game_combo = QComboBox()
-        self.game_combo.setEditable(True)
+        self.game_combo = EditableComboBox()
         self.game_combo.addItems([""] + list(self.games.values()))
-        self.game_combo.setFixedHeight(28)
+        self.game_combo.setFixedHeight(36)
         allow_horizontal_shrink(self.game_combo)
 
         game_completer = QCompleter(list(self.games.values()), self)
@@ -2906,26 +3383,64 @@ class StreamKeyGeneratorWindow(QWidget):
         game_completer.setFilterMode(Qt.MatchContains)
         self.game_combo.setCompleter(game_completer)
 
-        input_layout.addWidget(self.game_combo)
+        input_layout.addWidget(self.game_combo, 2, 1, 1, 2)
+
+        mode_row = QHBoxLayout()
+        client_label = QLabel('Client mode:')
+        client_label.setStyleSheet('font-weight: bold;')
+        input_layout.addWidget(client_label, 3, 0)
+        self.device_type_combo = QComboBox()
+        self.device_type_combo.addItem('PC (Studio)', 'pc')
+        self.device_type_combo.addItem('Android', 'mobile')
+        self.device_type_combo.currentIndexChanged.connect(self.on_device_type_changed)
+        mode_row.addWidget(self.device_type_combo, 1)
+        self.device_settings_button = ToolButton(FluentIcon.SETTING)
+        self.device_settings_button.setAccessibleName('Device settings')
+        self.device_settings_button.setToolTip('Device settings')
+        self.device_settings_button.setFixedSize(36, 36)
+        self.device_settings_button.clicked.connect(self.edit_device_settings)
+        mode_row.addWidget(self.device_settings_button)
+        input_layout.addLayout(mode_row, 3, 1, 1, 2)
+        self.device_setup_status = QLabel('')
+        self.device_setup_status.setWordWrap(True)
+        self.device_setup_status.setTextFormat(Qt.PlainText)
+        self.device_setup_status.hide()
+        # Setup feedback stays visible below every workspace view.
+        self.retry_devices_button = QPushButton('Retry device setup')
+        self.retry_devices_button.clicked.connect(self.start_device_initialization)
+        self.retry_devices_button.hide()
+        self.device_setup_details_button = QPushButton('Details')
+        self.device_setup_details_button.clicked.connect(self.show_device_setup_details)
+        self.device_setup_details_button.hide()
+
+        self.mobile_broadcast_options = MobileBroadcastOptions(parent=self)
+        self.mobile_broadcast_options.changed.connect(self.on_mobile_broadcast_changed)
+        input_layout.addWidget(self.mobile_broadcast_options, 4, 0, 1, 3)
 
         # Region
         region_label = QLabel("Region:")
         region_label.setStyleSheet("font-weight: bold;")
         allow_label_shrink(region_label)
-        input_layout.addWidget(region_label)
+        input_layout.addWidget(region_label, 5, 0)
 
-        self.region_combo = QComboBox()
-        self.region_combo.setEditable(True)
+        self.region_combo = EditableComboBox()
         self.region_combo.addItems(REGIONS)
-        self.region_combo.setFixedHeight(28)
+        self.region_combo.setPlaceholderText('Auto (detected region)')
+        self.region_combo.setToolTip('Leave blank to detect the region for the selected client. Enter a two-letter country code to override it; this does not change your account country or server.')
+        self.region_combo.setFixedHeight(36)
         allow_horizontal_shrink(self.region_combo)
-        input_layout.addWidget(self.region_combo)
+        input_layout.addWidget(self.region_combo, 5, 1, 1, 2)
+        self.stream_options_summary = QLabel('')
+        self.stream_options_summary.setWordWrap(True)
+        input_layout.addWidget(self.stream_options_summary, 6, 0, 1, 3)
+        input_layout.setRowStretch(7, 1)
+        self.stream_options_panel, options_layout = section('Stream preferences')
 
         # Options
         options_label = QLabel("Options:")
         options_label.setStyleSheet("font-weight: bold;")
         allow_label_shrink(options_label)
-        input_layout.addWidget(options_label)
+        options_layout.addWidget(options_label)
 
         options_grid = QGridLayout()
         options_grid.setHorizontalSpacing(8)
@@ -2958,39 +3473,47 @@ class StreamKeyGeneratorWindow(QWidget):
         )
         options_grid.addWidget(self.dual_layout_checkbox, 2, 0, 1, 2)
 
+        self.chat_sound_checkbox = QCheckBox('Chat notification sound')
+        self.chat_sound_checkbox.setChecked(False)
+        self.chat_sound_checkbox.setToolTip('Play the system notification sound for new comments and gifts. Off by default.')
+        options_grid.addWidget(self.chat_sound_checkbox, 3, 0, 1, 2)
+
         options_grid.setColumnStretch(0, 1)
         options_grid.setColumnStretch(1, 1)
-        input_layout.addLayout(options_grid)
+        options_layout.addLayout(options_grid)
 
         # Thumbnail
         thumbnail_label = QLabel("Selected Thumbnail:")
         thumbnail_label.setStyleSheet("font-weight: bold;")
         allow_label_shrink(thumbnail_label)
-        input_layout.addWidget(thumbnail_label)
+        options_layout.addWidget(thumbnail_label)
 
         thumbnail_row = QHBoxLayout()
         thumbnail_row.setSpacing(5)
 
         self.thumbnail_edit = QLineEdit()
         self.thumbnail_edit.setReadOnly(True)
-        self.thumbnail_edit.setFixedHeight(28)
+        self.thumbnail_edit.setFixedHeight(36)
         allow_horizontal_shrink(self.thumbnail_edit)
         thumbnail_row.addWidget(self.thumbnail_edit)
 
         browse_button = QPushButton("Browse")
-        browse_button.setFixedHeight(28)
+        browse_button.setFixedHeight(36)
         keep_button_visible(browse_button)
         browse_button.clicked.connect(self.browse_image)
         thumbnail_row.addWidget(browse_button)
 
-        input_layout.addLayout(thumbnail_row)
+        options_layout.addLayout(thumbnail_row)
+        options_layout.addStretch(1)
+        for checkbox in (self.replay_checkbox, self.age_restricted_checkbox,
+                         self.close_room_checkbox, self.dual_layout_checkbox):
+            checkbox.toggled.connect(self.update_stream_options_summary)
 
-        root_layout.addWidget(input_group, 0, 0)
+        root_layout.addWidget(input_group, 1)
 
-        account_group = QGroupBox("Account")
+        account_group, account_layout = section("Account")
         account_group.setMinimumWidth(0)
         account_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        account_layout = QVBoxLayout(account_group)
         account_layout.setContentsMargins(12, 16, 12, 12)
         account_layout.setSpacing(6)
         account_layout.setAlignment(Qt.AlignTop)
@@ -3004,18 +3527,23 @@ class StreamKeyGeneratorWindow(QWidget):
         cookies_row.setSpacing(6)
 
         self.cookies_path_edit = QLineEdit()
-        self.cookies_path_edit.setFixedHeight(28)
+        self.cookies_path_edit.setFixedHeight(36)
         self.cookies_path_edit.setPlaceholderText("cookies.json")
         self.cookies_path_edit.editingFinished.connect(self.apply_cookies_path_from_input)
         allow_horizontal_shrink(self.cookies_path_edit)
         cookies_row.addWidget(self.cookies_path_edit, 1)
 
         self.browse_cookies_button = QPushButton("Browse")
-        self.browse_cookies_button.setFixedHeight(28)
+        self.browse_cookies_button.setFixedHeight(36)
         keep_button_visible(self.browse_cookies_button)
         self.browse_cookies_button.clicked.connect(self.browse_cookies_file)
         cookies_row.addWidget(self.browse_cookies_button)
         account_layout.addLayout(cookies_row)
+        self.studio_import_button = None
+        if sys.platform == 'win32':
+            self.studio_import_button = QPushButton('Import from LIVE Studio…', self)
+            self.studio_import_button.clicked.connect(self.import_studio_cookies)
+            self.studio_import_button.hide()
 
         rapidapi_label = QLabel("RapidAPI Key")
         rapidapi_label.setStyleSheet("font-weight: bold;")
@@ -3026,7 +3554,7 @@ class StreamKeyGeneratorWindow(QWidget):
         rapidapi_row.setSpacing(6)
 
         self.rapidapi_key_edit = QLineEdit()
-        self.rapidapi_key_edit.setFixedHeight(28)
+        self.rapidapi_key_edit.setFixedHeight(36)
         self.rapidapi_key_edit.setEchoMode(QLineEdit.Password)
         self.rapidapi_key_edit.setPlaceholderText("Paste your RapidAPI key")
         self.rapidapi_key_edit.editingFinished.connect(self.apply_rapidapi_key_from_input)
@@ -3034,13 +3562,16 @@ class StreamKeyGeneratorWindow(QWidget):
         rapidapi_row.addWidget(self.rapidapi_key_edit, 1)
 
         self.rapidapi_help_button = QPushButton("?")
-        self.rapidapi_help_button.setFixedHeight(28)
+        self.rapidapi_help_button.setFixedHeight(36)
         self.rapidapi_help_button.setToolTip("Open RapidAPI signer page")
         keep_button_visible(self.rapidapi_help_button, minimum_width=32)
         self.rapidapi_help_button.clicked.connect(self.open_rapidapi_signer_page)
         rapidapi_row.addWidget(self.rapidapi_help_button)
 
         account_layout.addLayout(rapidapi_row)
+        if is_development():
+            for widget in (rapidapi_label, self.rapidapi_key_edit, self.rapidapi_help_button):
+                widget.hide()
 
         # Read-only account facts, two label/field pairs per row to save
         # vertical space (QLineEdit has no built-in legend or title).
@@ -3051,7 +3582,7 @@ class StreamKeyGeneratorWindow(QWidget):
         def make_fact_field():
             field = QLineEdit()
             field.setReadOnly(True)
-            field.setFixedHeight(28)
+            field.setFixedHeight(36)
             allow_horizontal_shrink(field)
             return field
 
@@ -3121,6 +3652,9 @@ class StreamKeyGeneratorWindow(QWidget):
         # Span both field columns (and the second pair's label column) so the
         # meter gets the full row width instead of a single column.
         facts_grid.addWidget(self.rapidapi_quota_bar, 2, 1, 1, 3)
+        if is_development():
+            quota_label.hide()
+            self.rapidapi_quota_bar.hide()
         facts_grid.setColumnStretch(1, 1)
         facts_grid.setColumnStretch(3, 1)
         account_layout.addLayout(facts_grid)
@@ -3135,41 +3669,43 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.refresh_account_button = QPushButton("Refresh Account Info")
         self.refresh_account_button.clicked.connect(lambda: self.refresh_account_info())
-        self.refresh_account_button.setFixedHeight(30)
+        self.refresh_account_button.setFixedHeight(36)
         allow_button_shrink(self.refresh_account_button)
         account_layout.addWidget(self.refresh_account_button)
 
-        account_layout.addStretch(1)
-        root_layout.addWidget(account_group, 1, 0)
+        self.campaigns_button = QPushButton("LIVE Campaigns")
+        self.campaigns_button.clicked.connect(self.open_campaigns)
+        self.campaigns_button.setFixedHeight(36)
+        allow_button_shrink(self.campaigns_button)
+        self.campaigns_button.setParent(self)
+        self.campaigns_button.hide()
 
-        output_group = QGroupBox("Stream Output and Monitoring")
+        self.account_panel = account_group
+
+        output_group, output_layout = section("Stream Connection")
         output_group.setMinimumWidth(0)
         output_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        output_layout = QVBoxLayout(output_group)
         output_layout.setSpacing(5)
         self.output_layout = output_layout
 
-        controls_label = QLabel("Stream Controls")
-        controls_label.setStyleSheet("font-weight: bold;")
-        allow_label_shrink(controls_label)
-        output_layout.addWidget(controls_label)
-
         primary_controls_row = QHBoxLayout()
-        primary_controls_row.setSpacing(5)
+        primary_controls_row.setSpacing(8)
+        self.main_live_status = LiveStatusBadge()
+        primary_controls_row.addWidget(self.main_live_status, 0, Qt.AlignVCenter)
+        primary_controls_row.addStretch(1)
 
         self.login_button = QPushButton("Login")
         self.login_button.clicked.connect(self.start_login)
-        self.login_button.setFixedHeight(32)
+        self.login_button.setFixedHeight(36)
         allow_button_shrink(self.login_button)
-        primary_controls_row.addWidget(self.login_button)
+        self.login_button.setParent(self)
+        self.login_button.hide()
 
-        self.go_live_button = QPushButton("Go Live")
+        self.go_live_button = PrimaryPushButton("Go Live")
         self.go_live_button.clicked.connect(self.generate_stream)
-        self.go_live_button.setFixedHeight(32)
-        allow_button_shrink(self.go_live_button)
+        self.go_live_button.setFixedHeight(36)
+        keep_button_visible(self.go_live_button)
         primary_controls_row.addWidget(self.go_live_button)
-
-        output_layout.addLayout(primary_controls_row)
 
         live_controls_row = QHBoxLayout()
         live_controls_row.setSpacing(5)
@@ -3177,67 +3713,68 @@ class StreamKeyGeneratorWindow(QWidget):
         self.pause_live_button = QPushButton("Pause")
         self.pause_live_button.setEnabled(False)
         self.pause_live_button.clicked.connect(self.pause_stream)
-        self.pause_live_button.setFixedHeight(32)
-        allow_button_shrink(self.pause_live_button)
+        self.pause_live_button.setFixedHeight(36)
+        keep_button_visible(self.pause_live_button)
         live_controls_row.addWidget(self.pause_live_button)
 
         self.resume_live_button = QPushButton("Resume")
         self.resume_live_button.setEnabled(False)
         self.resume_live_button.clicked.connect(self.resume_stream)
-        self.resume_live_button.setFixedHeight(32)
-        allow_button_shrink(self.resume_live_button)
+        self.resume_live_button.setFixedHeight(36)
+        keep_button_visible(self.resume_live_button)
         live_controls_row.addWidget(self.resume_live_button)
 
         self.end_live_button = QPushButton("End Live")
         self.end_live_button.setEnabled(False)
         self.end_live_button.clicked.connect(self.end_stream)
-        self.end_live_button.setFixedHeight(32)
-        allow_button_shrink(self.end_live_button)
+        self.end_live_button.setFixedHeight(36)
+        keep_button_visible(self.end_live_button)
         live_controls_row.addWidget(self.end_live_button)
 
-        output_layout.addLayout(live_controls_row)
+        primary_controls_row.addLayout(live_controls_row)
 
         self.url_output = QLineEdit()
         self.url_output.setReadOnly(True)
-        self.url_output.setFixedHeight(28)
+        self.url_output.setFixedHeight(36)
         allow_horizontal_shrink(self.url_output)
 
         self.key_output = QLineEdit()
         self.key_output.setReadOnly(True)
-        self.key_output.setFixedHeight(28)
+        self.key_output.setFixedHeight(36)
         allow_horizontal_shrink(self.key_output)
 
         self.share_url_output = QLineEdit()
         self.share_url_output.setReadOnly(True)
-        self.share_url_output.setFixedHeight(28)
+        self.share_url_output.setFixedHeight(36)
         allow_horizontal_shrink(self.share_url_output)
 
         def add_output_row(label_text, output_widget):
             # A container per row so the label, field and copy button can be
             # hidden/shown and reordered as one unit.
             container = QWidget()
-            container_layout = QVBoxLayout(container)
+            container_layout = QHBoxLayout(container)
             container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.setSpacing(2)
+            container_layout.setSpacing(8)
+            container_layout.setSizeConstraint(QHBoxLayout.SetMinimumSize)
             label = QLabel(label_text)
             label.setStyleSheet("font-weight: bold;")
+            label.setWordWrap(True)
+            label.setFixedWidth(round(145 * max(12.0, QApplication.instance().font().pointSizeF()) / 12))
             container_layout.addWidget(label)
-            row = QHBoxLayout()
-            row.setSpacing(5)
-            row.addWidget(output_widget)
-            copy_button = QPushButton("📋")
-            copy_button.setFixedSize(26, 26)
+            output_widget.setMinimumWidth(100)
+            container_layout.addWidget(output_widget, 1)
+            copy_button = ToolButton(FluentIcon.COPY)
+            copy_button.setFixedSize(36, 36)
             copy_button.setToolTip("Copy")
-            copy_button.setStyleSheet("padding: 0; font-size: 13px;")
-            copy_button.setProperty("copy_default_text", "📋")
+            copy_button.setAccessibleName('Copy ' + label_text.rstrip(':'))
+            copy_button.setProperty("copy_icon_button", True)
             copy_button.clicked.connect(
                 lambda checked=False, widget=output_widget, button=copy_button: self.copy_to_clipboard(
                     widget.text(),
                     button,
                 )
             )
-            row.addWidget(copy_button)
-            container_layout.addLayout(row)
+            container_layout.addWidget(copy_button)
             output_layout.addWidget(container)
             return container, label
 
@@ -3247,12 +3784,12 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.portrait_url_output = QLineEdit()
         self.portrait_url_output.setReadOnly(True)
-        self.portrait_url_output.setFixedHeight(28)
+        self.portrait_url_output.setFixedHeight(36)
         allow_horizontal_shrink(self.portrait_url_output)
 
         self.portrait_key_output = QLineEdit()
         self.portrait_key_output.setReadOnly(True)
-        self.portrait_key_output.setFixedHeight(28)
+        self.portrait_key_output.setFixedHeight(36)
         allow_horizontal_shrink(self.portrait_key_output)
 
         self.portrait_url_container, self.portrait_url_label = add_output_row("Portrait Stream URL:", self.portrait_url_output)
@@ -3274,19 +3811,21 @@ class StreamKeyGeneratorWindow(QWidget):
         proxy_row.addWidget(proxy_label)
         self.proxy_status_output = QLineEdit()
         self.proxy_status_output.setReadOnly(True)
-        self.proxy_status_output.setFixedHeight(28)
+        self.proxy_status_output.setFixedHeight(36)
         allow_horizontal_shrink(self.proxy_status_output)
         proxy_row.addWidget(self.proxy_status_output)
         self.toggle_stream_credentials_button = QPushButton("Real TikTok URL hidden")
         self.toggle_stream_credentials_button.setEnabled(False)
-        self.toggle_stream_credentials_button.setFixedHeight(28)
+        self.toggle_stream_credentials_button.setFixedHeight(36)
         allow_button_shrink(self.toggle_stream_credentials_button)
         self.toggle_stream_credentials_button.clicked.connect(self.toggle_stream_credentials_display)
-        proxy_row.addWidget(self.toggle_stream_credentials_button)
+        # Retain this compatibility control for stream-state code; the GUI
+        # exposes only the local connection fields and never the real endpoint.
+        self.toggle_stream_credentials_button.setParent(self)
+        self.toggle_stream_credentials_button.hide()
         output_layout.addLayout(proxy_row)
 
-        stats_group = QGroupBox("Realtime Stats")
-        stats_layout = QGridLayout(stats_group)
+        stats_group, stats_layout = section("Realtime Stats", grid=True)
         stats_layout.setHorizontalSpacing(8)
         stats_layout.setVerticalSpacing(5)
 
@@ -3298,64 +3837,56 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.live_status_stats_output = QLineEdit()
         self.live_status_stats_output.setReadOnly(True)
-        self.live_status_stats_output.setFixedHeight(28)
+        self.live_status_stats_output.setFixedHeight(36)
         allow_horizontal_shrink(self.live_status_stats_output)
         add_stats_field(0, 0, "Live", self.live_status_stats_output)
 
         self.live_viewer_count_output = QLineEdit()
         self.live_viewer_count_output.setReadOnly(True)
-        self.live_viewer_count_output.setFixedHeight(28)
+        self.live_viewer_count_output.setFixedHeight(36)
         allow_horizontal_shrink(self.live_viewer_count_output)
         add_stats_field(0, 2, "Live Viewers", self.live_viewer_count_output)
 
         self.viewer_count_output = QLineEdit()
         self.viewer_count_output.setReadOnly(True)
-        self.viewer_count_output.setFixedHeight(28)
+        self.viewer_count_output.setFixedHeight(36)
         allow_horizontal_shrink(self.viewer_count_output)
         add_stats_field(1, 0, "Views", self.viewer_count_output)
 
         self.like_count_output = QLineEdit()
         self.like_count_output.setReadOnly(True)
-        self.like_count_output.setFixedHeight(28)
+        self.like_count_output.setFixedHeight(36)
         allow_horizontal_shrink(self.like_count_output)
         add_stats_field(1, 2, "Likes", self.like_count_output)
 
         self.comment_count_output = QLineEdit()
         self.comment_count_output.setReadOnly(True)
-        self.comment_count_output.setFixedHeight(28)
+        self.comment_count_output.setFixedHeight(36)
         allow_horizontal_shrink(self.comment_count_output)
         add_stats_field(2, 0, "Comments", self.comment_count_output)
 
         self.share_count_output = QLineEdit()
         self.share_count_output.setReadOnly(True)
-        self.share_count_output.setFixedHeight(28)
+        self.share_count_output.setFixedHeight(36)
         allow_horizontal_shrink(self.share_count_output)
         add_stats_field(2, 2, "Shares", self.share_count_output)
 
         self.new_fans_count_output = QLineEdit()
         self.new_fans_count_output.setReadOnly(True)
-        self.new_fans_count_output.setFixedHeight(28)
+        self.new_fans_count_output.setFixedHeight(36)
         allow_horizontal_shrink(self.new_fans_count_output)
         add_stats_field(3, 0, "New Fans", self.new_fans_count_output)
 
         self.refresh_stats_button = QPushButton("Refresh Stats")
         self.refresh_stats_button.clicked.connect(lambda: self.refresh_realtime_stats(force=True))
-        self.refresh_stats_button.setFixedHeight(28)
+        self.refresh_stats_button.setFixedHeight(36)
         allow_button_shrink(self.refresh_stats_button)
         stats_layout.addWidget(self.refresh_stats_button, 4, 0, 1, 4)
 
         stats_layout.setColumnStretch(1, 1)
         stats_layout.setColumnStretch(3, 1)
-        output_layout.addWidget(stats_group)
 
-        monitoring_group = QGroupBox("Audience and Safety")
-        monitoring_group.setMinimumWidth(0)
-        monitoring_group.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        monitoring_layout = QVBoxLayout(monitoring_group)
-        monitoring_layout.setSpacing(8)
-
-        audience_summary_group = QGroupBox("Online Audience")
-        audience_summary_layout = QGridLayout(audience_summary_group)
+        audience_summary_group, audience_summary_layout = section("Online Audience", grid=True)
         audience_summary_layout.setHorizontalSpacing(8)
         audience_summary_layout.setVerticalSpacing(5)
 
@@ -3368,13 +3899,13 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.online_audience_total_output = QLineEdit()
         self.online_audience_total_output.setReadOnly(True)
-        self.online_audience_total_output.setFixedHeight(28)
+        self.online_audience_total_output.setFixedHeight(36)
         allow_horizontal_shrink(self.online_audience_total_output)
         add_audience_field(0, 0, "Total", self.online_audience_total_output)
 
         self.online_audience_preview_output = QLineEdit()
         self.online_audience_preview_output.setReadOnly(True)
-        self.online_audience_preview_output.setFixedHeight(28)
+        self.online_audience_preview_output.setFixedHeight(36)
         allow_horizontal_shrink(self.online_audience_preview_output)
         add_audience_field(0, 2, "Preview", self.online_audience_preview_output)
 
@@ -3395,10 +3926,8 @@ class StreamKeyGeneratorWindow(QWidget):
         audience_summary_layout.addWidget(self.online_audience_table_output, 2, 0, 1, 4)
         audience_summary_layout.setColumnStretch(1, 1)
         audience_summary_layout.setColumnStretch(3, 1)
-        monitoring_layout.addWidget(audience_summary_group)
 
-        safety_group = QGroupBox("Safety")
-        safety_layout = QGridLayout(safety_group)
+        safety_group, safety_layout = section("Safety", grid=True)
         safety_layout.setHorizontalSpacing(8)
         safety_layout.setVerticalSpacing(5)
 
@@ -3411,19 +3940,19 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.violation_status_output = QLineEdit()
         self.violation_status_output.setReadOnly(True)
-        self.violation_status_output.setFixedHeight(28)
+        self.violation_status_output.setFixedHeight(36)
         allow_horizontal_shrink(self.violation_status_output)
         add_safety_field(0, 0, "Status", self.violation_status_output)
 
         self.community_status_output = QLineEdit()
         self.community_status_output.setReadOnly(True)
-        self.community_status_output.setFixedHeight(28)
+        self.community_status_output.setFixedHeight(36)
         allow_horizontal_shrink(self.community_status_output)
         add_safety_field(0, 2, "Community", self.community_status_output)
 
         self.ban_status_output = QLineEdit()
         self.ban_status_output.setReadOnly(True)
-        self.ban_status_output.setFixedHeight(28)
+        self.ban_status_output.setFixedHeight(36)
         allow_horizontal_shrink(self.ban_status_output)
         add_safety_field(1, 0, "Ban", self.ban_status_output)
 
@@ -3447,99 +3976,329 @@ class StreamKeyGeneratorWindow(QWidget):
 
         self.refresh_audience_safety_button = QPushButton("Refresh Audience / Safety")
         self.refresh_audience_safety_button.clicked.connect(lambda: self.refresh_audience_safety(force=True))
-        self.refresh_audience_safety_button.setFixedHeight(28)
+        self.refresh_audience_safety_button.setFixedHeight(36)
         allow_button_shrink(self.refresh_audience_safety_button)
         safety_layout.addWidget(self.refresh_audience_safety_button, 4, 0, 1, 4)
         safety_layout.setColumnStretch(1, 1)
         safety_layout.setColumnStretch(3, 1)
-        monitoring_layout.addWidget(safety_group)
-        monitoring_layout.addStretch()
-
-
         output_layout.addStretch()
 
         # Bottom buttons
-        bottom_buttons = QHBoxLayout()
-        bottom_buttons.setSpacing(5)
-
         self.save_config_button = QPushButton("Save Config")
-        self.save_config_button.clicked.connect(lambda: self.save_config())
-        self.save_config_button.setFixedHeight(32)
+        self.save_config_button.setFixedHeight(36)
         allow_button_shrink(self.save_config_button)
-        bottom_buttons.addWidget(self.save_config_button)
+        self.save_config_button.setParent(self)
+        self.save_config_button.hide()
 
         self.donate_button = QPushButton("Donate")
         self.donate_button.setToolTip("Support development")
         self.donate_button.clicked.connect(self.open_donation_url)
-        self.donate_button.setFixedHeight(32)
+        self.donate_button.setFixedHeight(36)
         allow_button_shrink(self.donate_button)
-        bottom_buttons.addWidget(self.donate_button)
-
-        output_layout.addLayout(bottom_buttons)
-
-        root_layout.addWidget(output_group, 0, 1, 2, 1)
-        root_layout.addWidget(monitoring_group, 0, 2, 2, 1)
-
-        root_layout.setColumnStretch(0, 1)
-        root_layout.setColumnStretch(1, 1)
-        root_layout.setColumnStretch(2, 1)
-
+        self.donate_button.setParent(self)
+        self.donate_button.hide()
+        account_layout.addStretch(1)
+        root_layout.addWidget(output_group, 1)
+        self.workspace_pages = {'live': self.live_page}
+        self.workspace_titles = {'live': 'LIVE', 'chat': 'Chat', 'stats': 'Stats', 'audience': 'Audience', 'safety': 'Safety'}
+        self.visible_workspace_views = {'chat', 'stats', 'audience', 'safety'}
+        chat_page = QWidget()
+        chat_layout = QVBoxLayout(chat_page)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_group, chat_content = section('LIVE chat')
+        chat_header = QHBoxLayout()
+        self.chat_status = CaptionLabel('Start a LIVE to read chat')
+        self.chat_status.setWordWrap(True)
+        chat_header.addWidget(self.chat_status, 1)
+        self.chat_reconnect_button = QPushButton('Reconnect')
+        self.chat_reconnect_button.setEnabled(False)
+        self.chat_reconnect_button.clicked.connect(self.reconnect_chat)
+        chat_header.addWidget(self.chat_reconnect_button)
+        chat_clear_button = QPushButton('Clear')
+        chat_clear_button.clicked.connect(self.clear_chat)
+        chat_header.addWidget(chat_clear_button)
+        chat_content.addLayout(chat_header)
+        self.chat_output = QPlainTextEdit()
+        self.chat_output.setReadOnly(True)
+        self.chat_output.setPlaceholderText('Viewer comments and gifts will appear here during your LIVE.')
+        self.chat_output.setAccessibleName('LIVE chat messages and gifts')
+        self.chat_output.setMaximumBlockCount(1000)
+        chat_content.addWidget(self.chat_output, 1)
+        chat_layout.addWidget(chat_group)
+        self.workspace_pages['chat'] = chat_page
+        for key, card in (('stats', stats_group), ('audience', audience_summary_group), ('safety', safety_group)):
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(card)
+            if key == 'stats':
+                layout.addStretch(1)
+            self.workspace_pages[key] = page
+        for key, page in self.workspace_pages.items():
+            self.workspace_stack.addWidget(page)
+            self.workspace_navigation.addItem(key, self.workspace_titles[key])
+        self.workspace_navigation.currentItemChanged.connect(self.show_workspace_view)
+        self.workspace_navigation.setCurrentItem('live')
+        outer_layout.addLayout(primary_controls_row)
+        setup_feedback = QHBoxLayout()
+        setup_feedback.addWidget(self.device_setup_status, 1)
+        setup_feedback.addWidget(self.device_setup_details_button)
+        setup_feedback.addWidget(self.retry_devices_button)
+        outer_layout.addLayout(setup_feedback)
+        self._build_settings_dialog()
+        self._build_workspace_menus()
+        self.account_username.textChanged.connect(self.update_account_summary)
+        self.account_status.textChanged.connect(self.update_account_summary)
+        style_controls(self)
         self.on_topic_changed(self.topic_combo.currentText())
 
+    def _build_settings_dialog(self):
+        self.settings_dialog = QDialog(self)
+        self.settings_dialog.setWindowTitle('Settings')
+        self.settings_dialog.resize(760, 570)
+        self.settings_dialog.setMinimumWidth(640)
+        layout = QVBoxLayout(self.settings_dialog)
+        layout.setContentsMargins(20, 16, 20, 16)
+        navigation = Pivot(self.settings_dialog)
+        self.settings_stack = QStackedWidget(self.settings_dialog)
+        self.settings_navigation = navigation
+        layout.addWidget(navigation)
+        layout.addWidget(self.settings_stack, 1)
+        for key, title, page in (('account', 'Account', self.account_panel),
+                                 ('stream', 'Stream', self.stream_options_panel)):
+            page.setObjectName(key)
+            self.settings_stack.addWidget(page)
+            navigation.addItem(key, title)
+        navigation.currentItemChanged.connect(
+            lambda key: self.settings_stack.setCurrentWidget(
+                self.account_panel if key == 'account' else self.stream_options_panel))
+        navigation.setCurrentItem('stream')
+        footer = QHBoxLayout()
+        footer.addWidget(CaptionLabel('Settings are saved when you close this window.'))
+        footer.addStretch(1)
+        done = PrimaryPushButton('Done')
+        done.setDefault(True)
+        done.clicked.connect(self.settings_dialog.accept)
+        footer.addWidget(done)
+        layout.addLayout(footer)
+        self.settings_dialog.finished.connect(self._save_workspace_settings)
+        self.save_config_button.clicked.connect(lambda: self.save_config())
+        style_controls(self.settings_dialog)
+
+    def open_settings(self, page='stream'):
+        self.settings_navigation.setCurrentItem('account' if page == 'account' else 'stream')
+        self.settings_dialog.exec()
+
+    def _save_workspace_settings(self):
+        typed_path = _normalize_configured_path(self.cookies_path_edit.text().strip() or DEFAULT_COOKIES_PATH)
+        if typed_path != self.get_cookies_path():
+            self.set_cookies_path(typed_path, save=False, refresh=True)
+        self.update_stream_options_summary()
+        self.save_config(show_message=False)
+
+    def _build_workspace_menus(self):
+        self.workspace_action_controls = {}
+
+        def control_action(text, button, shortcut=None):
+            action = Action(text, self)
+            action.triggered.connect(button.click)
+            if shortcut:
+                action.setShortcut(shortcut)
+                self.addAction(action)
+            self.workspace_action_controls[action] = button
+            return action
+
+        self.account_menu = RoundMenu('Account', self)
+        self.account_menu.addAction(control_action('Log in with QR code', self.login_button))
+        self.account_menu.addAction(control_action('Import cookies…', self.browse_cookies_button))
+        if self.studio_import_button is not None:
+            self.account_menu.addAction(control_action('Import from LIVE Studio…', self.studio_import_button))
+        self.account_menu.addAction(control_action('Refresh account', self.refresh_account_button))
+        self.account_menu.addAction(control_action('LIVE campaigns…', self.campaigns_button))
+        self.account_menu.addSeparator()
+        account_settings = Action('Account settings…', self)
+        account_settings.triggered.connect(lambda: self.open_settings('account'))
+        self.account_menu.addAction(account_settings)
+        self.account_menu.addSeparator()
+        self.account_menu.addAction(control_action('Support development', self.donate_button))
+        self.account_menu_button.setMenu(self.account_menu)
+
+        self.views_menu = CheckableMenu('Views', self)
+        self.view_actions = {}
+        for key in ('chat', 'stats', 'audience', 'safety'):
+            action = Action(self.workspace_titles[key], self)
+            action.setCheckable(True)
+            action.setChecked(True)
+            action.toggled.connect(lambda visible, view=key: self.set_workspace_view_visible(view, visible))
+            self.view_actions[key] = action
+            self.views_menu.addAction(action)
+        self.views_menu.addSeparator()
+        restore = Action('Restore default views', self)
+        restore.triggered.connect(self.restore_workspace_views)
+        self.views_menu.addAction(restore)
+        self.views_menu_button.setMenu(self.views_menu)
+
+        self.workspace_menu = RoundMenu('Workspace', self)
+        self.workspace_menu.addAction(control_action('Device settings…', self.device_settings_button))
+        settings = Action(FluentIcon.SETTING, 'Stream settings…', self)
+        settings.setShortcut('Ctrl+,')
+        settings.triggered.connect(lambda: self.open_settings('stream'))
+        self.addAction(settings)
+        self.workspace_menu.addAction(settings)
+        self.workspace_menu.addAction(control_action('Save settings', self.save_config_button, 'Ctrl+S'))
+        self.workspace_menu.addSeparator()
+        self.workspace_menu.addAction(control_action('Refresh stats', self.refresh_stats_button))
+        self.workspace_menu.addAction(control_action('Refresh audience / safety', self.refresh_audience_safety_button))
+        context_views = CheckableMenu('Views', self.workspace_menu)
+        self.context_view_actions = {}
+        for key in self.view_actions:
+            action = Action(self.workspace_titles[key], self)
+            action.setCheckable(True)
+            action.setChecked(True)
+            action.toggled.connect(lambda visible, view=key: self.set_workspace_view_visible(view, visible))
+            self.context_view_actions[key] = action
+            context_views.addAction(action)
+        self.workspace_menu.addMenu(context_views)
+        self.copy_workspace_actions = {}
+        for name, field in (('Stream URL', self.url_output), ('Stream key', self.key_output),
+                            ('Share URL', self.share_url_output)):
+            action = Action(FluentIcon.COPY, 'Copy ' + name, self)
+            action.triggered.connect(lambda checked=False, widget=field: self.copy_to_clipboard(widget.text()))
+            self.copy_workspace_actions[action] = field
+            self.workspace_menu.addAction(action)
+        # The visible Views/Settings controls expose everything offered here.
+        for widget in (self.workspace_stack, *self.workspace_pages.values()):
+            widget.setContextMenuPolicy(Qt.CustomContextMenu)
+            widget.customContextMenuRequested.connect(
+                lambda point, target=widget: self.show_workspace_context_menu(target.mapToGlobal(point)))
+        # Keep existing shortcuts stable; the new Chat view uses Ctrl+5.
+        for index, key in enumerate(('live', 'stats', 'audience', 'safety', 'chat'), 1):
+            action = Action(self.workspace_titles[key], self)
+            action.setShortcut('Ctrl+' + str(index))
+            action.triggered.connect(lambda checked=False, view=key: self.show_workspace_view(view))
+            self.addAction(action)
+
+    def show_workspace_context_menu(self, position):
+        self.sync_workspace_actions()
+        self.workspace_menu.exec(position)
+
+    def sync_workspace_actions(self):
+        if not hasattr(self, 'workspace_action_controls'):
+            return
+        for action, button in self.workspace_action_controls.items():
+            action.setEnabled(button.isEnabled())
+        for action, field in self.copy_workspace_actions.items():
+            action.setEnabled(bool(field.text()))
+        username = self.account_username.text().strip()
+        self.account_menu_button.setToolTip('Loading account details…' if self.account_is_loading() else
+                                            'Account: ' + username if username else 'Log in, import cookies or manage your account')
+
+    def show_workspace_view(self, key):
+        if key not in self.workspace_pages or (key != 'live' and key not in self.visible_workspace_views):
+            return
+        changed = self.workspace_stack.currentWidget() is not self.workspace_pages[key]
+        self.workspace_stack.setCurrentWidget(self.workspace_pages[key])
+        self.workspace_navigation.blockSignals(True)
+        self.workspace_navigation.setCurrentItem(key)
+        self.workspace_navigation.blockSignals(False)
+        if changed and not self._workspace_restoring:
+            self.save_config(show_message=False)
+
+    def set_workspace_view_visible(self, key, visible):
+        if key not in self.view_actions:
+            return
+        if visible:
+            self.visible_workspace_views.add(key)
+        else:
+            self.visible_workspace_views.discard(key)
+            if self.workspace_stack.currentWidget() is self.workspace_pages[key]:
+                self.show_workspace_view('live')
+        self.workspace_navigation.items[key].setVisible(visible)
+        for action in (self.view_actions[key], self.context_view_actions[key]):
+            action.blockSignals(True)
+            action.setChecked(visible)
+            action.blockSignals(False)
+        if not self._workspace_restoring:
+            self.save_config(show_message=False)
+
+    def restore_workspace_views(self):
+        for key in self.view_actions:
+            self.set_workspace_view_visible(key, True)
+        self.show_workspace_view('live')
+
+    def load_workspace_preferences(self, preferences):
+        preferences = preferences if isinstance(preferences, dict) else {}
+        visible = preferences.get('visible_views', list(self.view_actions))
+        if not isinstance(visible, list):
+            visible = list(self.view_actions)
+        # Existing installations should see the newly added Chat view once.
+        known = preferences.get('known_views')
+        if not isinstance(known, list):
+            known = []
+        if 'chat' not in known and 'chat' not in visible:
+            visible = [*visible, 'chat']
+        for key in self.view_actions:
+            self.set_workspace_view_visible(key, key in visible)
+        active = preferences.get('active_view', 'live')
+        if not isinstance(active, str) or active not in self.workspace_pages or (active != 'live' and active not in self.visible_workspace_views):
+            active = 'live'
+        self.show_workspace_view(active)
+
+    def account_is_loading(self):
+        return (self.account_info_in_flight or self.account_refresh_timer.isActive() or
+                (self.device_initialization_in_flight and self.get_cookie_file_status()[0]))
+
+    def schedule_account_refresh(self, delay_ms=0):
+        self.account_load_failed = False
+        self.account_refresh_timer.start(delay_ms)
+        self.update_account_summary()
+
+    def update_account_summary(self):
+        username = self.account_username.text().strip()
+        loading = self.account_is_loading()
+        if loading:
+            text = ('@' + username.lstrip('@') + ' · Refreshing…') if username else 'Loading account…'
+        elif self.account_load_failed:
+            text = ('@' + username.lstrip('@') + ' · Refresh failed') if username else 'Account load failed'
+        else:
+            text = '@' + username.lstrip('@') if username else 'No account loaded'
+        self.account_summary.setText(
+            self.account_summary.fontMetrics().elidedText(text, Qt.ElideRight, 240) if username else text)
+        self.account_summary.setAccessibleName(text)
+        self.account_summary.setToolTip(text + '\n' + self.account_status.text())
+        for field in (self.account_username, self.account_status, self.can_go_live_output, self.dual_layout_output):
+            field.setPlaceholderText('Loading…' if loading else '')
+
+    def update_stream_options_summary(self):
+        if not hasattr(self, 'stream_options_summary') or not hasattr(self, 'dual_layout_checkbox'):
+            return
+        options = ['Replay on' if self.replay_checkbox.isChecked() else 'Replay off',
+                   'Dual layout' if self.dual_layout_checkbox.isChecked() else 'Single canvas']
+        if self.age_restricted_checkbox.isChecked():
+            options.append('Age restricted')
+        self.stream_options_summary.setText(' · '.join(options))
+        self.stream_options_summary.setToolTip('Change these options in Settings → Stream.')
+
     def _rapidapi_error_kind(self, message):
-        text = str(message or "").strip()
-        lowered = text.lower()
-        signer_markers = (
-            "rapidapi",
-            "signer",
-            "signature api",
-            "frame-sign",
-            "framesign",
-            "signed ffmpeg",
-            "signed metadata",
-        )
-        if not any(marker in lowered for marker in signer_markers):
-            return ""
-
-        quota_markers = (
-            "quota",
-            "rate limit",
-            "too many requests",
-            "monthly",
-            "exceeded",
-            "429",
-            "limit reached",
-        )
-        if any(marker in lowered for marker in quota_markers):
-            return "quota"
-
-        missing_markers = (
-            "required",
-            "not subscribed",
-            "subscription",
-            "401",
-            "403",
-            "forbidden",
-            "unauthorized",
-            "invalid api key",
-        )
-        if not self.get_rapidapi_key() or any(marker in lowered for marker in missing_markers):
-            return "subscription"
-        return "unavailable"
+        failure = hosted_signer_failure(message)
+        return failure.kind.value if failure is not None else ''
 
     def show_rapidapi_error(self, message):
         kind = self._rapidapi_error_kind(message)
+        if not kind:
+            QMessageBox.critical(self, "Error", str(message))
+            return
         if kind == "quota":
-            title = "RapidAPI quota exhausted"
+            title = "RapidAPI request limit reached"
             body = (
-                "The RapidAPI signing quota has been exhausted.\n\n"
+                "The signing service has reached a rate or quota limit.\n\n"
                 "The app cannot safely continue without fresh signatures. "
                 "Upgrade the RapidAPI plan or wait for the quota to reset, then try again."
             )
         elif kind == "subscription":
-            title = "RapidAPI subscription required"
+            title = "RapidAPI key or subscription error"
             body = (
-                "A RapidAPI signer subscription and key are required.\n\n"
+                "The signing service requires a valid API key and subscription.\n\n"
                 "Subscribe to the free tier on the TikTok LIVE Studio API Signer page, "
                 "copy your RapidAPI key, and paste it into the app."
             )
@@ -3571,7 +4330,7 @@ class StreamKeyGeneratorWindow(QWidget):
         if self._rapidapi_error_kind(message):
             self.show_rapidapi_error(message)
             return
-        QMessageBox.critical(self, "Error", message)
+        QMessageBox.critical(self, "Error", str(message))
 
     def show_info(self, message):
         QMessageBox.information(self, "Info", message)
@@ -3584,6 +4343,8 @@ class StreamKeyGeneratorWindow(QWidget):
         return ""
 
     def get_selected_game_id(self):
+        if self._game_tags_loading:
+            return str(self._config_extra.get('game_tag_id') or '')
         selected = self.game_combo.currentText().strip().lower()
         for game_id, game_name in self.games.items():
             if game_name.lower() == selected:
@@ -3591,7 +4352,8 @@ class StreamKeyGeneratorWindow(QWidget):
         return ""
 
     def on_topic_changed(self, topic_name):
-        is_gaming = topic_name == "Gaming"
+        mobile_video = self.device_type == 'mobile' and self.devices.get('mobile', {}).get('broadcast_type', 'video') == 'video'
+        is_gaming = topic_name == "Gaming" and not mobile_video
         self.game_label.setVisible(is_gaming)
         self.game_combo.setVisible(is_gaming)
 
@@ -3612,13 +4374,18 @@ class StreamKeyGeneratorWindow(QWidget):
 
         original_text = button.property("copy_default_text") or button.text()
         button.setProperty("copy_default_text", original_text)
-        button.setText("✓")
+        if button.property('copy_icon_button'):
+            button.setIcon(FluentIcon.ACCEPT)
+        else:
+            button.setText("✓")
         button.setEnabled(False)
         QTimer.singleShot(1000, lambda: self.restore_copy_button(button, original_text))
 
     def restore_copy_button(self, button, original_text):
         try:
             button.setText(original_text)
+            if button.property('copy_icon_button'):
+                button.setIcon(FluentIcon.COPY)
             button.setEnabled(True)
         except RuntimeError:
             pass
@@ -3727,6 +4494,7 @@ class StreamKeyGeneratorWindow(QWidget):
             return
 
         self.realtime_stats_in_flight = True
+        self.sync_activity_spinner()
         if force:
             self.refresh_stats_button.setEnabled(False)
             self.refresh_stats_button.setText("Refreshing...")
@@ -3734,19 +4502,22 @@ class StreamKeyGeneratorWindow(QWidget):
         room_id = self.current_room_id
         priority_region = self.stream_priority_region or self.region_combo.currentText()
 
+        factory = self.stream_factory()
+        device_id, install_id = self.device_id, self.install_id
+
         def worker():
             try:
-                with Stream(cookies_path=self.get_cookies_path()) as stream:
+                with factory() as stream:
                     stats = stream.getRealtimeStats(
-                        device_id=self.device_id,
-                        install_id=self.install_id,
+                        device_id=device_id,
+                        install_id=install_id,
                         priority_region=priority_region,
                         room_id=room_id,
                     )
                     try:
                         trends = stream.getTrendsStats(
-                            device_id=self.device_id,
-                            install_id=self.install_id,
+                            device_id=device_id,
+                            install_id=install_id,
                             priority_region=priority_region,
                             room_id=room_id,
                         )
@@ -3758,20 +4529,22 @@ class StreamKeyGeneratorWindow(QWidget):
                         stats["trends_error"] = str(trends_exc)
                 self.realtime_stats_loaded.emit(stats)
             except Exception as exc:
-                self.realtime_stats_failed.emit(str(exc))
-            finally:
-                self.realtime_stats_in_flight = False
+                self.realtime_stats_failed.emit(exc)
 
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as exc:
+            self.handle_realtime_stats_error(exc)
 
     def apply_realtime_stats(self, stats):
-        self.refresh_stats_button.setEnabled(True)
+        self.realtime_stats_in_flight = False
+        self.update_stream_controls()
         self.refresh_stats_button.setText("Refresh Stats")
         is_live = stats.get("is_live")
         if is_live is True:
-            self.live_status_stats_output.setText("Yes")
+            self.live_status_stats_output.setText("Live")
         elif is_live is False:
-            self.live_status_stats_output.setText("No")
+            self.live_status_stats_output.setText("Offline")
         else:
             self.live_status_stats_output.setText("")
         self.live_viewer_count_output.setText(self.format_stat_value(stats.get("live_viewer_count")))
@@ -3782,7 +4555,8 @@ class StreamKeyGeneratorWindow(QWidget):
         self.new_fans_count_output.setText(self.format_stat_value(stats.get("new_fans_count")))
 
     def handle_realtime_stats_error(self, message):
-        self.refresh_stats_button.setEnabled(True)
+        self.realtime_stats_in_flight = False
+        self.update_stream_controls()
         self.refresh_stats_button.setText("Refresh Stats")
         if message:
             print(f"Realtime stats refresh failed: {message}")
@@ -3959,7 +4733,7 @@ class StreamKeyGeneratorWindow(QWidget):
     def _style_active_violation_row(self, row):
         highlight = QBrush(QColor(80, 64, 24))
         text = QBrush(QColor(255, 230, 180))
-        bold_font = QFont()
+        bold_font = QFont(self.violation_details_output.font())
         bold_font.setBold(True)
         for column in range(self.violation_details_output.columnCount()):
             item = self.violation_details_output.item(row, column)
@@ -4066,6 +4840,7 @@ class StreamKeyGeneratorWindow(QWidget):
             return
 
         self.audience_safety_in_flight = True
+        self.sync_activity_spinner()
         if force:
             self.refresh_audience_safety_button.setEnabled(False)
             self.refresh_audience_safety_button.setText("Refreshing...")
@@ -4086,13 +4861,16 @@ class StreamKeyGeneratorWindow(QWidget):
         topic_id = self.get_selected_topic_id() or "5"
         fetch_safety_details = bool(ENABLE_SAFETY_DETAIL_POLLING and self.app_in_focus)
 
+        factory = self.stream_factory()
+        device_id, install_id = self.device_id, self.install_id
+
         def worker():
             try:
-                with Stream() as stream:
+                with factory() as stream:
                     if can_fetch_audience:
                         audience = stream.getOnlineAudience(
-                            device_id=self.device_id,
-                            install_id=self.install_id,
+                            device_id=device_id,
+                            install_id=install_id,
                             priority_region=priority_region,
                             room_id=room_id,
                             anchor_id=anchor_id,
@@ -4109,8 +4887,8 @@ class StreamKeyGeneratorWindow(QWidget):
                             ),
                         }
                     safety = stream.getViolationStatus(
-                        device_id=self.device_id,
-                        install_id=self.install_id,
+                        device_id=device_id,
+                        install_id=install_id,
                         priority_region=priority_region,
                         room_id=room_id,
                         last_time_hashtag_id=topic_id,
@@ -4118,14 +4896,16 @@ class StreamKeyGeneratorWindow(QWidget):
                     )
                 self.audience_safety_loaded.emit({"audience": audience, "safety": safety})
             except Exception as exc:
-                self.audience_safety_failed.emit(str(exc))
-            finally:
-                self.audience_safety_in_flight = False
+                self.audience_safety_failed.emit(exc)
 
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as exc:
+            self.handle_audience_safety_error(exc)
 
     def apply_audience_safety(self, result):
-        self.refresh_audience_safety_button.setEnabled(True)
+        self.audience_safety_in_flight = False
+        self.update_stream_controls()
         self.refresh_audience_safety_button.setText("Refresh Audience / Safety")
 
         audience = result.get("audience") or {}
@@ -4155,7 +4935,8 @@ class StreamKeyGeneratorWindow(QWidget):
         self._populate_violation_table(safety)
 
     def handle_audience_safety_error(self, message):
-        self.refresh_audience_safety_button.setEnabled(True)
+        self.audience_safety_in_flight = False
+        self.update_stream_controls()
         self.refresh_audience_safety_button.setText("Refresh Audience / Safety")
         if message:
             print(f"Audience/safety refresh failed: {message}")
@@ -4206,41 +4987,228 @@ class StreamKeyGeneratorWindow(QWidget):
         # no-op for existing call sites.
         pass
 
+    def saved_device_records(self):
+        import copy
+        records = copy.deepcopy(self.devices)
+        records.setdefault(self.device_type, {}).update(device_id=self.device_id, install_id=self.install_id)
+        records[self.device_type]['dual_layout_supported'] = self.dual_layout_supported
+        if self.device_type == 'mobile':
+            records['mobile'] = mobile_record_defaults(records['mobile'])
+        return records
+
+    def stream_factory(self):
+        from functools import partial
+        return partial(Stream, cookies_path=self.get_cookies_path(), device_type=self.device_type,
+                       device_profile=self.saved_device_records()[self.device_type])
+
+    def new_stream(self):
+        return self.stream_factory()()
+
+    def load_game_tags(self):
+        if self._closing:
+            return
+        self.game_combo.setPlaceholderText('Loading games…')
+        self.game_combo.setEnabled(False)
+        BackgroundTask(self, Work(fetch_game_tags), self.on_game_tags_loaded,
+                       lambda error: self.on_game_tags_loaded({})).start()
+
+    def on_game_tags_loaded(self, games):
+        if self._closing:
+            return
+        selected = self.get_selected_game_id() or str(self._config_extra.get('game_tag_id') or '')
+        self.games = games
+        self._game_tags_loading = False
+        self.game_combo.setEnabled(True)
+        self.game_combo.clear()
+        self.game_combo.addItems([''] + list(games.values()))
+        if selected in games:
+            self.game_combo.setCurrentText(games[selected])
+        self.game_combo.setPlaceholderText('Select a game' if games else 'Games unavailable; reopen the app to retry')
+        completer = QCompleter(list(games.values()), self)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        self.game_combo.setCompleter(completer)
+        self.sync_activity_spinner()
+
+    def open_campaigns(self):
+        if not self.get_cookie_file_status()[0] or not self.ensure_device_identifiers():
+            return
+        # Freeze the mode and identity for every request made by this dialog.
+        kind, record = self.device_type, self.saved_device_records()[self.device_type]
+        cookies_path, region = self.get_cookies_path(), self.region_combo.currentText()
+        def factory():
+            return Stream(cookies_path=cookies_path, device_type=kind, device_profile=record)
+        dialog = CampaignsDialog(factory, kind=kind, priority_region=region,
+                                 viewed_cache_path=os.path.join(os.path.dirname(CONFIG_PATH), 'campaign_views.json'), parent=self)
+        dialog.exec()
+
+    def update_device_mode_controls(self):
+        mobile = self.device_type == 'mobile'
+        self.mobile_broadcast_options.set_record(self.devices.get('mobile', {}))
+        self.mobile_broadcast_options.setVisible(mobile)
+        self.mobile_broadcast_options.setEnabled(not self.device_settings_busy())
+        self.close_room_checkbox.setEnabled(not mobile)
+        self.login_button.setEnabled(not mobile)
+        self.login_button.setToolTip('Import Android cookies for mobile mode.' if mobile else '')
+        self.rapidapi_key_edit.setEnabled(not is_development())
+        self.update_dual_layout_status()
+
+    def device_settings_busy(self, include_account_refresh=True):
+        return (getattr(self, '_foreground_task', None) is not None or self.is_live or self.local_proxy_starting or self.device_initialization_in_flight or
+                (include_account_refresh and self.account_info_in_flight) or
+                any(getattr(self, key, False) for key in (
+                    'realtime_stats_in_flight', 'audience_safety_in_flight', 'anchor_heartbeat_in_flight')))
+
+    def on_mobile_broadcast_changed(self):
+        if self.device_type != 'mobile' or self.device_settings_busy():
+            self.mobile_broadcast_options.set_record(self.devices.get('mobile', {}))
+            return
+        self.mobile_broadcast_options.update_record(self.devices.setdefault('mobile', {}))
+        self.update_dual_layout_status()
+        self.on_topic_changed(self.topic_combo.currentText())
+        self.save_config(show_message=False)
+
+    def on_device_type_changed(self):
+        kind = self.device_type_combo.currentData()
+        if kind == self.device_type:
+            return
+        if self.device_settings_busy(include_account_refresh=False):
+            self.device_type_combo.blockSignals(True)
+            self.device_type_combo.setCurrentIndex(1 if self.device_type == 'mobile' else 0)
+            self.device_type_combo.blockSignals(False)
+            return
+        self.invalidate_account_refresh()
+        self.devices = self.saved_device_records()
+        self.device_type = kind
+        record = self.devices.setdefault(kind, {})
+        self.device_id = str(record.get('device_id') or '')
+        self.install_id = str(record.get('install_id') or '')
+        self.account_can_go_live = None
+        self.dual_layout_supported = record.get('dual_layout_supported')
+        self.account_username.clear()
+        self.account_status.clear()
+        self.can_go_live_output.clear()
+        self.clear_output_fields()
+        self.update_device_mode_controls()
+        self.on_topic_changed(self.topic_combo.currentText())
+        self.update_stream_controls()
+        self.save_config(show_message=False)
+
+        # Switching profiles clears eligibility, but the selected cookies
+        # still identify the account. Reload it once the new mode is applied.
+        if self.has_device_identifiers() and self.get_cookie_file_status()[0]:
+            self.schedule_account_refresh()
+
+    def edit_device_settings(self):
+        if self.device_settings_busy() or not self.device_settings_button.isEnabled():
+            return
+        dialog = DeviceSettingsDialog(self.device_type, self.saved_device_records()[self.device_type], self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        record = dialog.record
+        self.devices[self.device_type] = record
+        self.device_id, self.install_id = record['device_id'], record['install_id']
+        self.update_device_mode_controls()
+        self.on_topic_changed(self.topic_combo.currentText())
+        self.save_config(show_message=False)
+        self.start_device_initialization()
+        self.update_stream_controls()
+
     def has_device_identifiers(self):
-        return bool(self.device_id and self.install_id)
+        return has_registered_ids({'device_id': self.device_id, 'install_id': self.install_id})
 
     def ensure_device_identifiers(self, show_popup=False):
-        if self.has_device_identifiers():
-            self.refresh_device_identifier_fields()
-            return True
+        if not self.device_initialization_attempted and not self.device_initialization_in_flight:
+            self.start_device_initialization()
+        ready = self.has_device_identifiers()
+        if not ready and show_popup and not self.device_initialization_in_flight:
+            self.show_error('Device setup could not finish. Use Retry device setup or enter the IDs in Device settings.')
+        return ready
 
-        progress = None
-        if show_popup:
-            progress = QProgressDialog(
-                "Generating secure device identifiers...",
-                None,
-                0,
-                0,
-                self,
-            )
-            progress.setWindowTitle("Initializing")
-            progress.setWindowModality(Qt.ApplicationModal)
-            progress.setCancelButton(None)
-            progress.setMinimumDuration(0)
-            progress.show()
-            QApplication.processEvents()
-
+    def start_device_initialization(self):
+        if self.device_initialization_in_flight or self.is_live or self.local_proxy_starting:
+            return
+        self.device_initialization_attempted = True
         try:
-            self.device_id, self.install_id = register_desktop_device_identifiers()
-            self.refresh_device_identifier_fields()
-            self.save_config(show_message=False)
-            return True
-        except Exception as exc:
-            self.show_error(f"Failed to initialize device identifiers: {exc}")
-            return False
-        finally:
-            if progress is not None:
-                progress.close()
+            self.devices = prepare_device_profiles(self.saved_device_records())
+        except (TypeError, ValueError) as exc:
+            self.device_initialization_errors = {'setup': str(exc)}
+            self.device_setup_status.setText('Device setup failed: ' + str(exc))
+            self.device_setup_status.show()
+            self.device_setup_details_button.show()
+            self.retry_devices_button.show()
+            return
+        # Save the local fingerprints before network I/O so a failed attempt or
+        # a restart reuses the same installation instead of rotating its UUIDs.
+        self.save_config(show_message=False)
+        missing = [kind for kind in ('pc', 'mobile') if not has_registered_ids(self.devices[kind])]
+        self.device_initialization_errors = {}
+        if not missing:
+            self.device_setup_status.clear()
+            self.device_setup_status.hide()
+            self.retry_devices_button.hide()
+            self.device_setup_details_button.hide()
+            return
+        import copy
+        pending = {kind: copy.deepcopy(self.devices[kind]) for kind in missing}
+        self.device_initialization_in_flight = True
+        self.device_setup_status.setText('Creating device IDs for ' + ', '.join('PC' if k == 'pc' else 'Android' for k in missing) + '…')
+        self.device_setup_status.show()
+        self.device_setup_details_button.hide()
+        self.retry_devices_button.hide()
+        self.update_stream_controls()
+
+        def worker():
+            errors = {}
+            for kind, profile in pending.items():
+                register = register_desktop_device_identifiers if kind == 'pc' else register_mobile_device_identifiers
+                try:
+                    record = register(device_profile=profile, return_profile=True)
+                    if not has_registered_ids(record):
+                        raise ValueError('Registration did not return valid device/install IDs.')
+                    self.device_registered.emit(kind, record)
+                except Exception as exc:
+                    errors[kind] = str(exc)
+            self.device_initialization_finished.emit(errors)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_device_registered(self, kind, record):
+        self.devices[kind] = {**self.devices[kind], **record}
+        if kind == self.device_type:
+            self.device_id, self.install_id = str(record['device_id']), str(record['install_id'])
+        self.save_config(show_message=False)
+        self.update_stream_controls()
+
+    def on_device_initialization_finished(self, errors):
+        self.device_initialization_in_flight = False
+        self.device_initialization_errors = errors
+        if errors:
+            names = ', '.join('PC' if k == 'pc' else 'Android' for k in errors)
+            zero_ids = errors.get('mobile', '').startswith('TikTok returned zero Android')
+            self.device_setup_status.setText(
+                'TikTok did not issue Android IDs. Use valid Android IDs or PC mode.' if zero_ids and len(errors) == 1
+                else names + ' device setup failed. Open Details for the reason.')
+            self.device_setup_status.setToolTip('\n'.join(('PC' if k == 'pc' else 'Android') + ': ' + str(v) for k, v in errors.items()))
+            self.device_setup_status.show()
+            self.retry_devices_button.show()
+            self.device_setup_details_button.show()
+        else:
+            self.device_setup_status.clear()
+            self.device_setup_status.hide()
+            self.retry_devices_button.hide()
+            self.device_setup_details_button.hide()
+        self.update_device_mode_controls()
+        self.update_stream_controls()
+        if self.has_device_identifiers() and self.get_cookie_file_status()[0]:
+            self.schedule_account_refresh()
+
+    def show_device_setup_details(self):
+        if not self.device_initialization_errors:
+            return
+        details = '\n\n'.join(
+            ('PC' if key == 'pc' else 'Android' if key == 'mobile' else 'Device setup') + ': ' + str(message)
+            for key, message in self.device_initialization_errors.items())
+        QMessageBox.information(self, 'Device setup details', details)
 
     def normalize_cookie_payload(self, payload):
         if isinstance(payload, dict):
@@ -4302,9 +5270,19 @@ class StreamKeyGeneratorWindow(QWidget):
     def set_cookies_path(self, path, *, save=True, refresh=True):
         new_path = _normalize_configured_path(path or DEFAULT_COOKIES_PATH)
         if new_path != getattr(self, "cookie_file_path", None):
+            self.invalidate_account_refresh()
+            self.stop_chat()
+            self.clear_chat()
+            self._chat_displayed_gifts.clear()
+            self._chat_displayed_message_ids.clear()
             # Account switch: the cached dual-layout capability result no
             # longer applies to the new cookies file.
             self.dual_layout_supported = None
+            self.account_can_go_live = None
+            self.account_load_failed = False
+            self.account_username.clear()
+            self.account_status.clear()
+            self.can_go_live_output.clear()
             self.update_dual_layout_status()
         self.cookie_file_path = new_path
         if hasattr(self, "cookies_path_edit"):
@@ -4315,6 +5293,7 @@ class StreamKeyGeneratorWindow(QWidget):
             self.save_config(show_message=False)
         if refresh:
             self.check_cookies()
+        self.sync_chat()
 
     def get_cookie_file_status(self):
         cookie_path = self.get_cookies_path()
@@ -4357,12 +5336,37 @@ class StreamKeyGeneratorWindow(QWidget):
         self.set_cookies_path(file_path, save=True, refresh=True)
         self.refresh_account_info(show_errors=False)
 
+    @foreground('Reading LIVE Studio accounts…')
+    def import_studio_cookies(self):
+        if sys.platform != 'win32' or self.is_live or self.device_initialization_in_flight:
+            return
+        from Libs.studio_cookies import StudioCookieError, read_studio_accounts
+        from Libs.studio_import_ui import StudioImportDialog
+        try:
+            accounts = (yield Work(read_studio_accounts, label='Reading LIVE Studio accounts…'))
+        except StudioCookieError as exc:
+            self.show_error(exc)
+            return
+        dialog = StudioImportDialog(accounts, output_dir=_runtime_base_dir(), parent=self)
+        if dialog.exec() != QDialog.Accepted or not dialog.saved_path:
+            return
+        self.set_cookies_path(dialog.saved_path, save=True, refresh=True)
+        self.refresh_account_info(show_errors=True)
+
     def get_rapidapi_key(self):
         if hasattr(self, "rapidapi_key_edit"):
             return self.rapidapi_key_edit.text().strip()
         return str(getattr(self, "rapidapi_key", "") or "").strip()
 
     def ensure_rapidapi_signer(self):
+        try:
+            if self.device_type == 'mobile':
+                ClientImplementation('mobile', mobile_record_defaults(self.saved_device_records()['mobile'])).validate()
+            if is_development():
+                return True
+        except Exception as exc:
+            self.show_error(exc)
+            return False
         if self.get_rapidapi_key():
             return True
         self.show_rapidapi_error("RapidAPI signer key is required for request and frame signing.")
@@ -4387,11 +5391,11 @@ class StreamKeyGeneratorWindow(QWidget):
         has_cookies, status_text = self.get_cookie_file_status()
         if hasattr(self, "cookies_path_edit"):
             self.cookies_path_edit.setToolTip(status_text)
-            self.cookies_path_edit.setStyleSheet("" if has_cookies else "border: 1px solid #c0392b;")
+            self.cookies_path_edit.setError(not has_cookies)
         if not has_cookies:
             self.account_can_go_live = None
 
-        self.login_button.setEnabled(True)
+        self.login_button.setEnabled(self.device_type == 'pc')
         self.update_stream_controls(has_cookies=has_cookies)
         self.sync_audience_safety_timer()
 
@@ -4490,11 +5494,10 @@ class StreamKeyGeneratorWindow(QWidget):
             if sei_log_path and os.path.exists(sei_log_path):
                 try:
                     with open(sei_log_path, "r", encoding="utf-8", errors="replace") as file:
-                        if marker in file.read():
+                        if marker in file.read(256 * 1024):
                             return True
                 except Exception:
                     pass
-            QApplication.processEvents()
             time.sleep(0.1)
         return False
 
@@ -4522,7 +5525,11 @@ class StreamKeyGeneratorWindow(QWidget):
             "--room-id",
             str(self.current_room_id or ""),
             "--aid",
-            "8311",
+            str(self.devices.get(self.device_type, {}).get('aid', '1233' if self.device_type == 'mobile' else '8311')),
+            "--device-type",
+            self.device_type,
+            "--config-path",
+            CONFIG_PATH,
             "--fps",
             "60",
             "--resolution",
@@ -4567,6 +5574,11 @@ class StreamKeyGeneratorWindow(QWidget):
 
     def _launch_sei_proxy(self, command, log_file, log_path, sei_log_path, process_attribute):
         # process_attribute: "ffmpeg_proxy_process" or "ffmpeg_proxy_portrait_process"
+        if '--output-url' in command:
+            # Unique to this launch, so a prior crash cannot label a new one.
+            report_path = log_path + '.' + secrets.token_hex(8) + '.error.json'
+            self._proxy_error_reports[process_attribute] = report_path
+            command = [*command, '--error-report', report_path]
         log_file.write(
             "[proxy] command: "
             + " ".join(_mask_stream_url(str(part)) for part in command)
@@ -4587,38 +5599,47 @@ class StreamKeyGeneratorWindow(QWidget):
         rapidapi_key = self.get_rapidapi_key()
         if rapidapi_key:
             child_env["RAPIDAPI_KEY"] = rapidapi_key
-        setattr(self, process_attribute, subprocess.Popen(
-            command,
+        setattr(self, process_attribute, (yield Work(subprocess.Popen, command,
             cwd=_runtime_base_dir(),
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
-            env=child_env,
-        ))
+            env=child_env, label='Preparing local FFmpeg proxy signatures…')))
 
-        time.sleep(0.35)
+        (yield Work(time.sleep, 0.35, label='Preparing local FFmpeg proxy signatures…'))
         process = getattr(self, process_attribute)
         return_code = process.poll()
         if return_code is not None:
-            tail = _safe_log_tail(log_path)
-            self.stop_ffmpeg_proxy(clear_status=False)
+            tail = (yield Work(_safe_log_tail, log_path, label='Preparing local FFmpeg proxy signatures…'))
             details = f"\n\nFFmpeg log tail:\n{tail}" if tail else ""
-            raise RuntimeError(f"FFmpeg proxy exited early with code {return_code}.{details}")
+            error = self.proxy_failure(process_attribute, f"FFmpeg proxy exited early with code {return_code}.{details}")
+            self.stop_ffmpeg_proxy(clear_status=False)
+            raise error
 
         self.set_proxy_status("Preparing local FFmpeg proxy signatures...")
-        if not self.wait_for_ffmpeg_proxy_listener(
-            timeout_seconds=25,
+        if not (yield Work(self.wait_for_ffmpeg_proxy_listener, timeout_seconds=25,
             process=process,
-            sei_log_path=sei_log_path,
-        ):
+            sei_log_path=sei_log_path, label='Preparing local FFmpeg proxy signatures…')):
             return_code = process.poll() if process is not None else None
-            tail = _safe_log_tail(sei_log_path)
-            self.stop_ffmpeg_proxy(clear_status=False)
+            tail = (yield Work(_safe_log_tail, sei_log_path, label='Preparing local FFmpeg proxy signatures…'))
             details = f"\n\nSEI proxy log tail:\n{tail}" if tail else ""
             if return_code is not None:
-                raise RuntimeError(f"FFmpeg proxy exited before the local listener was ready with code {return_code}.{details}")
-            raise RuntimeError(f"FFmpeg proxy did not open the local listener in time.{details}")
+                error = self.proxy_failure(process_attribute, f"FFmpeg proxy exited before the local listener was ready with code {return_code}.{details}")
+            else:
+                error = RuntimeError(f"FFmpeg proxy did not open the local listener in time.{details}")
+            self.stop_ffmpeg_proxy(clear_status=False)
+            raise error
+
+    def proxy_failure(self, process_attribute, message):
+        path = self._proxy_error_reports.pop(process_attribute, '')
+        cause = read_proxy_error(path)
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return OperationError(message, cause) if cause is not None else RuntimeError(message)
 
     def start_ffmpeg_proxy(self, tiktok_output_url, defer_display=False):
         # defer_display: dual layout suppresses the reveal of the landscape
@@ -4626,16 +5647,11 @@ class StreamKeyGeneratorWindow(QWidget):
         # portrait fields (the portrait proxy's start performs the single
         # combined refresh once both listeners are up).
         self.stop_ffmpeg_proxy(clear_status=False)
+        for cleanup in self._proxy_cleanup_threads:
+            yield Work(cleanup.join, label='Stopping previous FFmpeg proxy…')
+        self._proxy_cleanup_threads.clear()
         if not tiktok_output_url:
             raise RuntimeError("Missing TikTok RTMP URL for local FFmpeg proxy.")
-
-        progress = QProgressDialog("Preparing local FFmpeg proxy signatures...", None, 0, 0, self)
-        progress.setWindowTitle("Starting Stream")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(0)
-        progress.show()
-        QApplication.processEvents()
 
         self.local_proxy_starting = True
         self.show_real_stream_credentials = False
@@ -4652,13 +5668,13 @@ class StreamKeyGeneratorWindow(QWidget):
             self.ffmpeg_proxy_log_file = open(self.ffmpeg_proxy_log_path, "w", encoding="utf-8", errors="replace")
 
             command = self.build_ffmpeg_proxy_command(ffmpeg_path, local_input_url, tiktok_output_url)
-            self._launch_sei_proxy(
+            (yield from self._launch_sei_proxy(
                 command,
                 self.ffmpeg_proxy_log_file,
                 self.ffmpeg_proxy_log_path,
                 self.ffmpeg_proxy_sei_log_path,
                 "ffmpeg_proxy_process",
-            )
+            ))
 
             self.local_proxy_active = True
             self.local_proxy_starting = False
@@ -4670,7 +5686,6 @@ class StreamKeyGeneratorWindow(QWidget):
             return True
         finally:
             self.local_proxy_starting = False
-            progress.close()
 
     def start_portrait_ffmpeg_proxy(self, tiktok_output_url):
         # Dual layout: second signed listener forwarding to the portrait
@@ -4702,13 +5717,13 @@ class StreamKeyGeneratorWindow(QWidget):
             # default.
             resolution="1080x1920",
         )
-        self._launch_sei_proxy(
+        (yield from self._launch_sei_proxy(
             command,
             self.ffmpeg_proxy_portrait_log_file,
             self.ffmpeg_proxy_portrait_log_path,
             self.ffmpeg_proxy_portrait_sei_log_path,
             "ffmpeg_proxy_portrait_process",
-        )
+        ))
 
         self.local_portrait_proxy_active = True
         self.set_proxy_status("Dual proxies ready. Start streaming in OBS.")
@@ -4729,43 +5744,28 @@ class StreamKeyGeneratorWindow(QWidget):
         self.local_proxy_active = False
         self.local_portrait_proxy_active = False
         self.local_proxy_starting = False
-
-        for process, _ in processes:
-            if process is not None and process.poll() is None:
-                try:
-                    if os.name == "nt":
-                        process.send_signal(signal.CTRL_BREAK_EVENT)
-                    else:
-                        process.terminate()
-                    process.wait(timeout=5)
-                except Exception:
-                    try:
-                        process.kill()
-                        process.wait(timeout=5)
-                    except Exception:
-                        pass
-
-        if self.ffmpeg_proxy_log_file is not None:
-            try:
-                self.ffmpeg_proxy_log_file.close()
-            except Exception:
-                pass
-            self.ffmpeg_proxy_log_file = None
-
-        if self.ffmpeg_proxy_portrait_log_file is not None:
-            try:
-                self.ffmpeg_proxy_portrait_log_file.close()
-            except Exception:
-                pass
-            self.ffmpeg_proxy_portrait_log_file = None
+        reports = tuple(self._proxy_error_reports.values())
+        self._proxy_error_reports.clear()
+        self.ffmpeg_proxy_log_file = None
+        self.ffmpeg_proxy_portrait_log_file = None
+        cleanup = None
+        if any(process is not None or log is not None for process, log in processes) or reports:
+            cleanup = threading.Thread(target=reap_processes, args=(processes, reports), daemon=True,
+                                       name='proxy-cleanup')
+            cleanup.start()
+            self._proxy_cleanup_threads = [t for t in self._proxy_cleanup_threads if t.is_alive()]
+            self._proxy_cleanup_threads.append(cleanup)
 
         if clear_status:
             self.set_proxy_status("")
         if hasattr(self, "ffmpeg_proxy_watch_timer"):
             self.ffmpeg_proxy_watch_timer.stop()
         self.refresh_stream_credentials_display()
+        return cleanup
 
     def check_ffmpeg_proxy_health(self):
+        if self._foreground_task is not None:
+            return  # Startup checks own both listeners until the workflow ends.
         if not self.local_proxy_active and not self.local_portrait_proxy_active:
             self.ffmpeg_proxy_watch_timer.stop()
             return
@@ -4786,37 +5786,69 @@ class StreamKeyGeneratorWindow(QWidget):
             self.local_portrait_proxy_active = False
             self.ffmpeg_proxy_watch_timer.stop()
             details = _safe_log_tail(sei_log_path)
+            error = self.proxy_failure(
+                'ffmpeg_proxy_portrait_process' if endpoint_name == 'portrait' else 'ffmpeg_proxy_process',
+                f"The {endpoint_name} FFmpeg proxy stopped with code {return_code}." +
+                (f"\n\nProxy log:\n{details}" if details else ''))
             self.set_stream_state(is_live=False)
             self.clear_output_fields()
-            self.set_proxy_status(
-                f"{endpoint_name.capitalize()} proxy stopped with code {return_code}; forwarding halted because signed metadata is unavailable."
-            )
+            self.set_proxy_status(f"{endpoint_name.capitalize()} FFmpeg proxy stopped with code {return_code}.")
             self.refresh_stream_credentials_display()
-            detail_text = f"\n\nSigner details:\n{details}" if details else ""
-            self.show_error(
-                f"The signed {endpoint_name} FFmpeg proxy stopped, so forwarding was halted. "
-                "The real TikTok URL/key is intentionally not exposed."
-                f"{detail_text}"
-            )
+            self.show_error(error)
             return
 
+    def sync_activity_spinner(self):
+        self.activity_spinner.setVisible(bool(self._foreground_task or self._game_tags_loading or
+            self.account_info_in_flight or self.device_initialization_in_flight or
+            self.realtime_stats_in_flight or self.audience_safety_in_flight))
+
     def update_stream_controls(self, has_cookies=None):
+        busy = self.device_settings_busy()
+        self.device_type_combo.setEnabled(not self.device_settings_busy(include_account_refresh=False))
+        self.device_settings_button.setEnabled(not busy)
+        self.retry_devices_button.setEnabled(not busy)
+        if self.studio_import_button is not None:
+            self.studio_import_button.setEnabled(not busy)
+        self.mobile_broadcast_options.setEnabled(not busy)
+        self.login_button.setEnabled(self.device_type == "pc" and self.has_device_identifiers())
         if has_cookies is None:
             has_cookies = self.get_cookie_file_status()[0]
 
-        can_start = has_cookies and not self.is_live
+        self.campaigns_button.setEnabled(has_cookies and self.has_device_identifiers())
+        self.refresh_account_button.setEnabled(
+            has_cookies and self.has_device_identifiers() and not getattr(self, 'account_info_in_flight', False))
+
+        can_start = has_cookies and self.has_device_identifiers() and not self.is_live
 
         self.go_live_button.setEnabled(can_start)
-        self.pause_live_button.setEnabled(has_cookies and self.is_live and not self.is_paused)
-        self.resume_live_button.setEnabled(has_cookies and self.is_live and self.is_paused)
+        self.pause_live_button.setEnabled(self.device_type == "pc" and has_cookies and self.is_live and not self.is_paused)
+        self.resume_live_button.setEnabled(self.device_type == "pc" and has_cookies and self.is_live and self.is_paused)
         self.end_live_button.setEnabled(has_cookies and self.is_live)
+        self.main_live_status.set_state('paused' if self.is_paused else
+                                        'live' if self.is_live else 'offline')
         self.refresh_stats_button.setEnabled(has_cookies and bool(self.current_room_id))
+        self.chat_reconnect_button.setEnabled(self.is_live and bool(self.current_room_id))
         if hasattr(self, "refresh_audience_safety_button"):
             self.refresh_audience_safety_button.setEnabled(has_cookies)
         if hasattr(self, "toggle_stream_credentials_button"):
             self.toggle_stream_credentials_button.setEnabled(False)
+        if getattr(self, '_foreground_task', None) is not None:
+            for control in (self.go_live_button, self.pause_live_button, self.resume_live_button,
+                            self.end_live_button, self.login_button, self.campaigns_button,
+                            self.refresh_account_button, self.refresh_stats_button,
+                            self.refresh_audience_safety_button, self.browse_cookies_button,
+                            self.cookies_path_edit):
+                control.setEnabled(False)
+        else:
+            self.browse_cookies_button.setEnabled(True)
+            self.cookies_path_edit.setEnabled(True)
+        self.sync_activity_spinner()
+        self.sync_workspace_actions()
+        self.update_account_summary()
 
     def apply_stream_outputs(self, stream, priority_region="", start_proxy=True, dual_layout=False):
+        if dual_layout and not distinct_push_urls(getattr(stream, 'streamUrl', ''), getattr(stream, 'multiStreamUrl', '')):
+            raise RuntimeError('Dual Layout requires two distinct push URLs before either proxy can start.')
         self.clear_output_fields()
         # Set after clear_output_fields, which resets dual_layout_active.
         self.dual_layout_active = bool(dual_layout and getattr(stream, "multiStreamUrl", ""))
@@ -4830,8 +5862,8 @@ class StreamKeyGeneratorWindow(QWidget):
         self.current_stream_id = getattr(stream, "streamId", "")
         self.current_anchor_id = getattr(stream, "ownerUserId", "")
         self.active_violation_ids = set()
-        if priority_region:
-            self.stream_priority_region = str(priority_region).strip().lower()
+        self.stream_priority_region = country_code(
+            priority_region or getattr(stream, 'priority_region_used', ''))
 
         self.share_url_output.setText(self.real_share_url)
         self.refresh_stream_credentials_display()
@@ -4845,22 +5877,22 @@ class StreamKeyGeneratorWindow(QWidget):
                 # Dual layout: the landscape start defers its display
                 # refresh; the portrait start's final refresh reveals both
                 # endpoints at the same time.
-                self.start_ffmpeg_proxy(primary_target, defer_display=self.dual_layout_active)
+                (yield from self.start_ffmpeg_proxy(primary_target, defer_display=self.dual_layout_active))
                 if self.dual_layout_active:
-                    self.start_portrait_ffmpeg_proxy(self.real_stream_url)
+                    (yield from self.start_portrait_ffmpeg_proxy(self.real_stream_url))
             except Exception as exc:
                 self.set_stream_state(is_live=False)
                 self.clear_output_fields()
-                self.set_proxy_status("Stream blocked: signed FFmpeg proxy is unavailable.")
+                self.set_proxy_status("Local FFmpeg proxy failed to start.")
                 self.refresh_stream_credentials_display()
                 raise RuntimeError(
-                    "The stream was blocked because the signed FFmpeg proxy could not start. "
-                    "The real TikTok URL/key was not exposed.\n\n"
+                    "Could not start the local FFmpeg proxy:\n\n"
                     f"{exc}"
-                )
+                ) from exc
 
         self.sync_realtime_stats_timer()
         self.sync_audience_safety_timer()
+        self.sync_chat()
 
     def changeEvent(self, event):
         # Track activation/minimize to throttle display-only polling. Both
@@ -4943,7 +5975,111 @@ class StreamKeyGeneratorWindow(QWidget):
         self.sync_anchor_heartbeat_timer()
         self.sync_realtime_stats_timer()
         self.sync_audience_safety_timer()
+        self.sync_chat()
         self.update_stream_controls()
+
+    def clear_chat(self):
+        self.chat_output.clear()
+
+    def stop_chat(self):
+        self._chat_generation += 1
+        client, self.chat_client = self.chat_client, None
+        self._chat_identity = None
+        if client is not None:
+            client.stop()
+
+    def sync_chat(self, force=False):
+        if not self.is_live or not self.current_room_id:
+            self.stop_chat()
+            self.chat_status.setText('LIVE ended' if self._chat_display_room else 'Start a LIVE to read chat')
+            return
+        identity = (str(self.current_room_id), self.get_cookies_path())
+        if not force and self.chat_client is not None and self._chat_identity == identity:
+            return
+        self.stop_chat()
+        if self._chat_display_room != identity[0]:
+            self.clear_chat()
+            self._chat_displayed_gifts.clear()
+            self._chat_displayed_message_ids.clear()
+            self._chat_display_room = identity[0]
+        self._chat_identity = identity
+        generation = self._chat_generation
+        # Chat uses the captured Studio web IM protocol even for rooms created
+        # with Android. Keep PC chat identity separate from Android stream IDs.
+        record = copy.deepcopy(self.saved_device_records().get('pc', {}))
+        cookies_path = identity[1]
+
+        def factory():
+            return Stream(cookies_path=cookies_path, device_type='pc', device_profile=record)
+
+        def emit(signal, value):
+            try:
+                signal.emit((generation, value))
+            except RuntimeError:
+                pass  # Window was destroyed while a request was finishing.
+
+        self.chat_client = LiveChatClient(identity[0], factory, _build_signature_headers,
+            lambda messages: emit(self.chat_messages_received, messages),
+            lambda status: emit(self.chat_status_changed, status))
+        self.chat_status.setText('Connecting…')
+        try:
+            self.chat_client.start()
+        except Exception:
+            self.stop_chat()
+            self.chat_status.setText('Could not start chat. Use Reconnect to retry.')
+
+    def reconnect_chat(self):
+        self.sync_chat(force=True)
+
+    def on_chat_status(self, result):
+        generation, status = result
+        if generation == self._chat_generation and self.chat_client is not None:
+            self.chat_status.setText(status)
+
+    def on_chat_messages(self, result):
+        generation, messages = result
+        if generation != self._chat_generation or self.chat_client is None:
+            return
+        scroll = self.chat_output.verticalScrollBar()
+        at_bottom = scroll.value() >= scroll.maximum() - 2
+        position = scroll.value()
+        lines = []
+        for message in messages:
+            if message.message_id and message.message_id in self._chat_displayed_message_ids:
+                continue
+            try:
+                stamp = datetime.fromtimestamp(message.timestamp).strftime('%H:%M:%S') if message.timestamp else datetime.now().strftime('%H:%M:%S')
+            except (ValueError, OverflowError, OSError):
+                stamp = datetime.now().strftime('%H:%M:%S')
+            name = message.nickname or message.username or message.user_id or 'Viewer'
+            if isinstance(message, GiftMessage):
+                if not message.completed:
+                    continue
+                # A manual reconnect replaces the worker while retaining the
+                # feed. Remember gifts actually displayed, not worker events
+                # that may still be queued for a superseded GUI generation.
+                key = message.combo_key or (('message', message.message_id) if message.message_id else None)
+                if key is not None:
+                    if key in self._chat_displayed_gifts:
+                        continue
+                    self._chat_displayed_gifts[key] = None
+                    if len(self._chat_displayed_gifts) > 2000:
+                        self._chat_displayed_gifts.popitem(last=False)
+                lines.append(f'[{stamp}] 🎁 {" ".join(name.split())} {" ".join(message.text.split())}')
+            else:
+                lines.append(f'[{stamp}] {" ".join(name.split())}: {" ".join(message.text.split())}')
+            if message.message_id:
+                self._chat_displayed_message_ids[message.message_id] = None
+                if len(self._chat_displayed_message_ids) > 2000:
+                    self._chat_displayed_message_ids.popitem(last=False)
+        if lines:
+            self.chat_output.appendPlainText('\n'.join(lines))
+            scroll.setValue(scroll.maximum() if at_bottom else position)
+            self.chat_status.setText('Connected')
+            if self.chat_sound_checkbox.isChecked():
+                # One system sound per incoming batch; a replay or stale
+                # callback must not notify again. Uses Qt on every platform.
+                QApplication.beep()
 
     def start_anchor_ping_loop(self, status=ANCHOR_STATUS_PREPARE, send_immediately=True):
         self.anchor_ping_status = status
@@ -4970,41 +6106,50 @@ class StreamKeyGeneratorWindow(QWidget):
         self.anchor_heartbeat_in_flight = True
         priority_region = self.stream_priority_region or self.region_combo.currentText()
 
+        factory = self.stream_factory()
+        device_id, install_id = self.device_id, self.install_id
+
+        context = (self.device_type, device_id, install_id, room_id, stream_id, status)
+
         def worker():
-            try:
-                with Stream() as stream:
-                    payload = stream.anchorHeartbeat(
-                        status,
-                        device_id=self.device_id,
-                        install_id=self.install_id,
-                        priority_region=priority_region,
-                        room_id=room_id,
-                        stream_id=stream_id,
-                        action="Anchor heartbeat",
-                    )
+            with factory() as stream:
+                return stream.anchorHeartbeat(
+                    status, device_id=device_id, install_id=install_id,
+                    priority_region=priority_region, room_id=room_id,
+                    stream_id=stream_id, action="Anchor heartbeat")
 
-                self.anchor_heartbeat_error_count = 0
-                if _is_room_is_living_payload(payload) and self.anchor_ping_status == ANCHOR_STATUS_PREPARE:
-                    self.anchor_ping_status = ANCHOR_STATUS_LIVING
-            except Exception as exc:
-                label = {
-                    ANCHOR_STATUS_PREPARE: "Prepare",
-                    ANCHOR_STATUS_LIVING: "Live",
-                    ANCHOR_STATUS_PAUSE: "Paused",
-                    ANCHOR_STATUS_FINISH: "Finish",
-                }.get(status, "Anchor")
-                print(f"{label} heartbeat failed: {exc}")
-                if _is_already_ended_error(exc):
-                    self.anchor_heartbeat_error_count += 1
-                    if self.anchor_heartbeat_error_count >= 3:
-                        self.stream_ended_remotely.emit("TikTok reports that this LIVE has already ended.")
-                else:
-                    # Official Studio logs unknown ping errors and keeps the loop alive.
-                    self.anchor_heartbeat_error_count = 0
-            finally:
-                self.anchor_heartbeat_in_flight = False
+        BackgroundTask(self, Work(worker),
+                       lambda payload: self.on_anchor_heartbeat_finished(context, payload),
+                       lambda error: self.on_anchor_heartbeat_finished(context, error=error)).start()
 
-        threading.Thread(target=worker, daemon=True).start()
+    def on_anchor_heartbeat_finished(self, context, payload=None, error=None):
+        self.anchor_heartbeat_in_flight = False
+        self.update_stream_controls()
+        # A request from a finished room must not advance a new room's ping
+        # state or accumulate failures against another selected client.
+        current = (self.device_type, self.device_id, self.install_id,
+                   self.current_room_id, self.current_stream_id)
+        if not self.is_live or tuple(context[:5]) != current:
+            return
+        status = context[5]
+        if error is None:
+            self.anchor_heartbeat_error_count = 0
+            if (status == ANCHOR_STATUS_PREPARE and
+                    self.anchor_ping_status == ANCHOR_STATUS_PREPARE and
+                    _is_room_is_living_payload(payload)):
+                self.anchor_ping_status = ANCHOR_STATUS_LIVING
+            return
+        label = {
+            ANCHOR_STATUS_PREPARE: "Prepare", ANCHOR_STATUS_LIVING: "Live",
+            ANCHOR_STATUS_PAUSE: "Paused", ANCHOR_STATUS_FINISH: "Finish",
+        }.get(status, "Anchor")
+        print(f"{label} heartbeat failed: {error}")
+        if _is_already_ended_error(error):
+            self.anchor_heartbeat_error_count += 1
+            if self.anchor_heartbeat_error_count >= 3:
+                self.stream_ended_remotely.emit("TikTok reports that this LIVE has already ended.")
+        else:
+            self.anchor_heartbeat_error_count = 0
 
     def handle_stream_ended_remotely(self, message):
         self.set_stream_state(is_live=False)
@@ -5012,43 +6157,106 @@ class StreamKeyGeneratorWindow(QWidget):
         if message:
             self.show_info(message)
 
+    def invalidate_account_refresh(self):
+        # A monotonically increasing token also distinguishes Android -> PC
+        # -> Android from the earlier Android request still running.
+        self._account_request_id += 1
+        if self._account_request_cancel is not None:
+            self._account_request_cancel.set()
+        self._account_request_cancel = None
+        self.account_refresh_timeout.stop()
+        self.account_refresh_timer.stop()
+        self.account_info_in_flight = False
+        self.account_load_failed = False
+        self.refresh_account_button.setText('Refresh Account Info')
+
+    def on_account_info_loaded(self, response):
+        request_id, info = response
+        if request_id != self._account_request_id or not self.account_info_in_flight:
+            return
+        if not isinstance(info, dict) or not isinstance(info.get('account', {}), dict):
+            self.handle_account_info_error('Account information returned an invalid response.'
+                                           if self._account_refresh_show_errors else '')
+            return
+        self.apply_account_info(info)
+
+    def on_account_info_failed(self, response):
+        request_id, message = response
+        if request_id != self._account_request_id or not self.account_info_in_flight:
+            return
+        self.handle_account_info_error(message)
+
+    def on_account_refresh_timeout(self):
+        if not self.account_info_in_flight:
+            return
+        show_errors = self._account_refresh_show_errors
+        self.invalidate_account_refresh()
+        self.handle_account_info_error(
+            'Account information took too long to load. Try Refresh Account Info again.' if show_errors else '')
+
     def refresh_account_info(self, show_errors=True):
+        self.account_refresh_timer.stop()
         if not self.get_cookie_file_status()[0]:
+            self.update_account_summary()
             if show_errors:
                 self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
             return
 
         if not self.ensure_device_identifiers(show_popup=show_errors):
+            self.update_account_summary()
             return
 
-        self.refresh_account_button.setEnabled(False)
+        if self.account_info_in_flight:
+            return
+        self._account_request_id += 1
+        request_id = self._account_request_id
+        cancel = self._account_request_cancel = threading.Event()
+        self._account_refresh_show_errors = show_errors
+        self.account_info_in_flight = True
+        self.account_load_failed = False
+        self.account_refresh_timeout.start(ACCOUNT_INFO_TIMEOUT_MS)
+        self.update_stream_controls()
         self.refresh_account_button.setText("Refreshing...")
+        # No widget/current-profile reads in the worker: switching clients is
+        # allowed while this snapshot is loading.
+        kind = self.device_type
+        record = self.saved_device_records()[kind]
+        cookies_path = self.get_cookies_path()
+        device_id, install_id = self.device_id, self.install_id
         topic_id = self.get_selected_topic_id() or "5"
         priority_region = self.region_combo.currentText()
+        deadline = time.monotonic() + ACCOUNT_INFO_TIMEOUT_MS / 1000
 
         def worker():
             try:
-                # Pass the GUI's cookies path explicitly: re-resolving it
-                # from config.json inside Stream.__init__ loses the file the
-                # user picked whenever the config could not be saved (e.g.
-                # macOS .app bundles, where the bundle dir is not writable).
-                with Stream(cookies_path=self.get_cookies_path()) as stream:
+                with Stream(cookies_path=cookies_path, device_type=kind, device_profile=record) as stream:
+                    stream.account_info_deadline = deadline
+                    stream.account_info_cancel = cancel
                     info = stream.getAccountInfo(
-                        device_id=self.device_id,
-                        install_id=self.install_id,
-                        priority_region=priority_region,
-                        last_time_hashtag_id=topic_id,
+                        device_id=device_id, install_id=install_id,
+                        priority_region=priority_region, last_time_hashtag_id=topic_id,
                     )
-                self.account_info_loaded.emit(info)
             except Exception as exc:
-                if show_errors:
-                    self.account_info_failed.emit(f"Failed to load account info: {exc}")
-                else:
-                    self.account_info_failed.emit("")
+                message = OperationError("Failed to load account info", exc) if show_errors else ""
+                try:
+                    self.account_info_failed.emit((request_id, message))
+                except RuntimeError:
+                    pass  # The window was destroyed while the request ran.
+            else:
+                try:
+                    self.account_info_loaded.emit((request_id, info))
+                except RuntimeError:
+                    pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception as exc:
+            self.on_account_info_failed((request_id, OperationError("Could not start account refresh", exc) if show_errors else ''))
 
     def apply_account_info(self, info):
+        self.account_refresh_timeout.stop()
+        self.account_info_in_flight = False
+        self.account_load_failed = False
         self.refresh_account_button.setEnabled(True)
         self.refresh_account_button.setText("Refresh Account Info")
 
@@ -5073,8 +6281,8 @@ class StreamKeyGeneratorWindow(QWidget):
         # sensitive-feature restriction (threshold allowed OR dual_canvas_used,
         # mirroring LIVE Studio's dualEnable = !allowed && !dual_canvas_used).
         allow_dual = info.get("allow_multi_stream_scene1")
+        self.dual_layout_supported = None if allow_dual is None else bool(allow_dual and info.get("dual_layout_unlocked"))
         if allow_dual is not None:
-            self.dual_layout_supported = bool(allow_dual and info.get("dual_layout_unlocked"))
             if not self.dual_layout_supported:
                 self.dual_layout_checkbox.setChecked(False)
                 days_to_reach = info.get("dual_days_to_reach")
@@ -5091,7 +6299,7 @@ class StreamKeyGeneratorWindow(QWidget):
                         "account-level flag TikTok LIVE Studio uses to show or hide its dual "
                         "layout button. Updated by Refresh Account Info."
                     )
-            self.update_dual_layout_status()
+        self.update_dual_layout_status()
 
         # The account refresh just made several signed requests, so the
         # quota snapshot on disk is fresh; reflect it immediately instead
@@ -5100,8 +6308,12 @@ class StreamKeyGeneratorWindow(QWidget):
         self.update_stream_controls()
 
     def handle_account_info_error(self, message):
+        self.account_refresh_timeout.stop()
+        self.account_info_in_flight = False
+        self.account_load_failed = True
         self.refresh_account_button.setEnabled(True)
         self.refresh_account_button.setText("Refresh Account Info")
+        self.update_stream_controls()
         if message:
             self.show_error(message)
 
@@ -5117,14 +6329,24 @@ class StreamKeyGeneratorWindow(QWidget):
             "generate_replay": self.replay_checkbox.isChecked(),
             "close_room_when_close_stream": self.close_room_checkbox.isChecked(),
             "age_restricted": self.age_restricted_checkbox.isChecked(),
+            "device_type": self.device_type,
+            "devices": self.saved_device_records(),
             "device_id": self.device_id,
             "install_id": self.install_id,
             "cookies_path": self.get_cookies_path() if hasattr(self, "get_cookies_path") else _configured_cookies_path(),
             "rapidapi_key": self.get_rapidapi_key() if hasattr(self, "get_rapidapi_key") else _configured_rapidapi_key(),
             "suppress_donation_reminder": self.suppress_donation_reminder,
             "dual_layout_supported": self.dual_layout_supported,
+            "chat_notification_sound": self.chat_sound_checkbox.isChecked(),
+            "ui": {
+                **(self._config_extra.get('ui', {}) if isinstance(self._config_extra.get('ui'), dict) else {}),
+                "visible_views": [key for key in self.view_actions if key in self.visible_workspace_views],
+                "active_view": self.workspace_navigation.currentRouteKey() or 'live',
+                "known_views": list(self.view_actions),
+            },
         }
 
+        data = {**self._config_extra, **data}
         # CONFIG_PATH is absolute (app data dir); a CWD-relative "config.json"
         # would resolve to "/" for Finder-launched macOS .app bundles.
         # The write is atomic (temp file + os.replace): the SEI proxy child
@@ -5167,8 +6389,19 @@ class StreamKeyGeneratorWindow(QWidget):
             self.refresh_device_identifier_fields()
             return
 
-        loaded_device_id = data.get("device_id", "")
-        loaded_install_id = data.get("install_id", data.get("iid", ""))
+        self._config_extra = dict(data)
+        self.devices = device_records(data)
+        self.devices.setdefault('pc', {})
+        self.devices.setdefault('mobile', {'device_id': '', 'install_id': ''})
+        self.device_type = normalize_device_type(data.get('device_type', 'pc'))
+        self.device_type_combo.blockSignals(True)
+        self.device_type_combo.setCurrentIndex(1 if self.device_type == 'mobile' else 0)
+        self.device_type_combo.blockSignals(False)
+        selected = self.devices[self.device_type]
+        self.dual_layout_supported = selected.get('dual_layout_supported', data.get('dual_layout_supported') if self.device_type == 'pc' else None)
+        self.update_device_mode_controls()
+        loaded_device_id = selected.get("device_id", "")
+        loaded_install_id = selected.get("install_id", selected.get("iid", ""))
         self.device_id = str(loaded_device_id).strip() if loaded_device_id is not None else ""
         self.install_id = str(loaded_install_id).strip() if loaded_install_id is not None else ""
         self.cookie_file_path = _normalize_configured_path(data.get("cookies_path", self.cookie_file_path or DEFAULT_COOKIES_PATH))
@@ -5182,7 +6415,7 @@ class StreamKeyGeneratorWindow(QWidget):
             self.rapidapi_key_edit.setText(self.rapidapi_key)
             self.rapidapi_key_edit.blockSignals(False)
         self.suppress_donation_reminder = data.get("suppress_donation_reminder", False)
-        self.dual_layout_supported = data.get("dual_layout_supported", None)
+        self.dual_layout_supported = selected.get('dual_layout_supported', data.get('dual_layout_supported') if self.device_type == 'pc' else None)
         self.update_dual_layout_status()
 
         if self.device_id == "0":
@@ -5206,11 +6439,16 @@ class StreamKeyGeneratorWindow(QWidget):
         self.replay_checkbox.setChecked(data.get("generate_replay", True))
         self.close_room_checkbox.setChecked(data.get("close_room_when_close_stream", False))
         self.age_restricted_checkbox.setChecked(data.get("age_restricted", False))
+        self.chat_sound_checkbox.setChecked(data.get('chat_notification_sound') is True)
+        self.load_workspace_preferences(data.get('ui', {}))
 
     def open_donation_url(self):
         QDesktopServices.openUrl(QUrl("https://buymeacoffee.com/loukious"))
 
     def show_donation_reminder(self):
+        if self._foreground_task is not None:
+            single_shot(self, 1000, self.show_donation_reminder)
+            return
         if self.suppress_donation_reminder:
             return
 
@@ -5242,6 +6480,9 @@ class StreamKeyGeneratorWindow(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def handle_update_check(self, update_info):
+        if getattr(self, '_foreground_task', None) is not None:
+            single_shot(self, 1000, lambda: self.handle_update_check(update_info))
+            return
         if not update_info:
             return
 
@@ -5273,30 +6514,25 @@ class StreamKeyGeneratorWindow(QWidget):
         dialog = LoginDialog(self)
         dialog.exec()
 
+    @foreground('Logging in…', cancellable=True)
     def start_browser_login_flow(self):
+        if self.device_type == 'mobile':
+            self.show_error('Browser login uses PC identities. Import cookies from your Android session for mobile mode.')
+            return
         if not self.ensure_device_identifiers(show_popup=True):
             return
 
         self.login_button.setEnabled(False)
-        progress = QProgressDialog("Starting login flow...", None, 0, 0, self)
-        progress.setWindowTitle("Login")
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(0)
-        progress.show()
-        QApplication.processEvents()
-
         # 1. Backup existing protocol registration
-        backup = backup_protocol_registry()
+        backup = (yield Work(backup_protocol_registry, label='Preparing browser login…'))
         stop_listening = threading.Event()
 
         # 2. Start local callback server
-        server_thread, port, callback_event, result = start_callback_server(stop_event=stop_listening)
+        server_thread, port, callback_event, result = (yield Work(start_callback_server, stop_event=stop_listening, label='Preparing browser login…'))
         if not server_thread:
             self.show_error("Could not start local callback server.")
-            restore_protocol_registry(backup)
+            (yield Work(restore_protocol_registry, backup, label='Restoring browser login settings…'))
             self.login_button.setEnabled(True)
-            progress.close()
             return
 
         # 3. Register temporary protocol handler. In a frozen/compiled build
@@ -5307,27 +6543,31 @@ class StreamKeyGeneratorWindow(QWidget):
             script_path = None
         else:
             script_path = os.path.abspath(__file__)
-        if not register_temporary_protocol_handler(python_exe, script_path, port):
+        if not (yield Work(register_temporary_protocol_handler, python_exe, script_path, port, label='Preparing browser login…')):
             stop_listening.set()
             self.show_error(
                 "Failed to register the temporary protocol handler.\n"
                 "Try running the app as the same user you log in with, and check that "
                 "antivirus software is not blocking registry writes."
             )
-            restore_protocol_registry(backup)
+            (yield Work(restore_protocol_registry, backup, label='Restoring browser login settings…'))
             self.login_button.setEnabled(True)
-            progress.close()
             return
 
-        client = LiveStudioBrowserLoginClient(self.device_id, self.install_id)
+        client = None
         try:
-            state, nonce, ticket = client.prepare_login()
+            client = (yield Work(LiveStudioBrowserLoginClient, self.device_id, self.install_id, label='Preparing login…'))
+            if self._foreground_task.cancel_event.is_set():
+                return
+            state, nonce, ticket = (yield Work(client.prepare_login, label='Logging in…'))
+            if self._foreground_task.cancel_event.is_set():
+                return
             login_url = _build_onetap_auth_url(state, nonce, ticket)
-            webbrowser.open(login_url)
+            (yield Work(webbrowser.open, login_url, label='Logging in…'))
 
-            progress.setLabelText("Complete login in your browser...")
-            QApplication.processEvents()
-            callback_received = callback_event.wait(timeout=180)
+            callback_received = (yield Work(wait_for_login_callback, callback_event, self._foreground_task.cancel_event, timeout=180, label='Complete login in your browser…'))
+            if self._foreground_task.cancel_event.is_set():
+                return
             if not callback_received or not result["url"]:
                 raise RuntimeError(
                     "No login callback was received within 3 minutes. Possible causes:\n"
@@ -5356,19 +6596,19 @@ class StreamKeyGeneratorWindow(QWidget):
                     f"Received {len(result['url'])} chars."
                 )
 
-            client.exchange_login(id_token, state_from_callback, ticket)
-            client.save_cookies(self.get_cookies_path())
+            (yield Work(client.exchange_login, id_token, state_from_callback, ticket, label='Logging in…'))
+            (yield Work(client.save_cookies, self.get_cookies_path(), label='Logging in…'))
             self.show_info("Login successful! Cookies have been saved.")
             self.check_cookies()
             self.refresh_account_info()
 
         except Exception as exc:
-            self.show_error(f"Login failed: {exc}")
+            self.show_error(OperationError("Login failed", exc))
         finally:
             stop_listening.set()
-            client.close()
-            restore_protocol_registry(backup)
-            progress.close()
+            if client is not None:
+                yield Work(client.close)
+            (yield Work(restore_protocol_registry, backup, label='Restoring browser login settings…'))
             self.login_button.setEnabled(True)
 
     def update_rapidapi_quota_display(self):
@@ -5431,28 +6671,35 @@ class StreamKeyGeneratorWindow(QWidget):
         bar.setToolTip("\n".join(tooltip_parts) or "No RapidAPI usage recorded yet.")
 
     def update_dual_layout_status(self):
-        field = getattr(self, "dual_layout_output", None)
+        supported = getattr(self, 'dual_layout_supported', None)
+        mobile_camera = (self.device_type != 'mobile' or
+                         self.devices.get('mobile', {}).get('broadcast_type', 'video') == 'video')
+        field = getattr(self, 'dual_layout_output', None)
         if field is not None:
-            supported = getattr(self, "dual_layout_supported", None)
-            # Plain True/False text, matching the "Can Go Live" field format.
-            field.setText("Unknown" if supported is None else str(bool(supported)))
+            field.setText(('Unknown' if supported is None else str(bool(supported)))
+                          if mobile_camera else 'Camera LIVE only')
             field.setCursorPosition(0)
-        checkbox = getattr(self, "dual_layout_checkbox", None)
+        checkbox = getattr(self, 'dual_layout_checkbox', None)
         if checkbox is not None:
-            # The option only becomes selectable once the account is
-            # confirmed to have dual layout access.
-            enabled = getattr(self, "dual_layout_supported", None) is True
+            enabled = mobile_camera and supported is True
             checkbox.setEnabled(enabled)
+            if not mobile_camera:
+                checkbox.setToolTip('Android Dual Layout requires Camera LIVE. Mobile gaming screen capture uses one canvas.')
+            elif self.device_type == 'mobile':
+                checkbox.setToolTip('Create a Camera LIVE dual room. Landscape uses the secondary endpoint; portrait uses the main endpoint. Requires account unlock checks.')
+            else:
+                checkbox.setToolTip('Create a dual room with portrait and landscape canvases. Requires account unlock checks.')
             if not enabled:
                 checkbox.setChecked(False)
 
+    @foreground('Starting LIVE…')
     def generate_stream(self):
         topic_id = self.get_selected_topic_id()
         if not topic_id:
             self.show_error("Please select a topic.")
             return
 
-        if topic_id == "5":
+        if topic_id == "5" and (self.device_type == "pc" or self.devices.get("mobile", {}).get("broadcast_type") == "screen_record"):
             game_id = self.get_selected_game_id()
             if not game_id:
                 self.show_error("Please select a game tag.")
@@ -5465,33 +6712,33 @@ class StreamKeyGeneratorWindow(QWidget):
 
         if not self.ensure_rapidapi_signer():
             return
+        self.save_config(show_message=False)
 
         stream_started = False
         self.go_live_button.setEnabled(False)
         self.pause_live_button.setEnabled(False)
         self.resume_live_button.setEnabled(False)
         self.end_live_button.setEnabled(False)
+        self.device_type_combo.setEnabled(False)
+        self.device_settings_button.setEnabled(False)
+        self.mobile_broadcast_options.setEnabled(False)
 
         try:
-            with Stream() as stream:
+            with (yield Work(self.stream_factory())) as stream:
                 selected_region = self.region_combo.currentText()
 
-                create_info_payload = stream.getCreateRoomInfo(
-                    device_id=self.device_id,
+                create_info_payload = (yield Work(stream.getCreateRoomInfo, device_id=self.device_id,
                     install_id=self.install_id,
                     priority_region=selected_region,
-                    last_time_hashtag_id=topic_id,
-                )
+                    last_time_hashtag_id=topic_id, label='Starting LIVE…'))
                 create_data = create_info_payload.get("data", {}) if isinstance(create_info_payload, dict) else {}
                 live_status = create_data.get("live_status")
                 last_room_id = create_data.get("last_room_id_str") or str(create_data.get("last_room_id") or "")
                 already_live_hint = str(live_status) == "2"
 
-                continuable = stream.getContinuableStreamInfo(
-                    device_id=self.device_id,
+                continuable = (yield Work(stream.getContinuableStreamInfo, device_id=self.device_id,
                     install_id=self.install_id,
-                    priority_region=selected_region,
-                )
+                    priority_region=selected_region, label='Starting LIVE…'))
 
                 if continuable.get("has_room"):
                     room = continuable.get("room") or {}
@@ -5537,24 +6784,22 @@ class StreamKeyGeneratorWindow(QWidget):
                         return
 
                     if resume_button is not None and clicked == resume_button:
-                        stream.resumeStream(
-                            device_id=self.device_id,
+                        (yield Work(stream.resumeStream, device_id=self.device_id,
                             install_id=self.install_id,
                             priority_region=effective_region,
                             room_id=room_id,
-                            stream_id=stream_id,
-                        )
-                        resume_dual = bool(self.dual_layout_checkbox.isChecked() and stream.multiStreamUrl)
+                            stream_id=stream_id, label='Starting LIVE…'))
+                        resume_dual = bool(self.dual_layout_checkbox.isChecked() and distinct_push_urls(stream.streamUrl, stream.multiStreamUrl))
                         if self.dual_layout_checkbox.isChecked() and not resume_dual:
                             self.show_info(
                                 "Dual Layout was requested, but the resumed room has no landscape "
                                 "(multi_stream_url) push URL. Continuing with the main canvas only."
                             )
-                        self.apply_stream_outputs(
+                        (yield from self.apply_stream_outputs(
                             stream,
                             priority_region=effective_region,
                             dual_layout=resume_dual,
-                        )
+                        ))
                         stream_started = True
                         self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                         self.set_stream_state(is_live=True, is_paused=False)
@@ -5574,13 +6819,11 @@ class StreamKeyGeneratorWindow(QWidget):
                         if confirm != QMessageBox.Yes:
                             return
 
-                        stream.endStream(
-                            device_id=self.device_id,
+                        (yield Work(stream.endStream, device_id=self.device_id,
                             install_id=self.install_id,
                             priority_region=effective_region,
                             room_id=room_id,
-                            stream_id=stream_id,
-                        )
+                            stream_id=stream_id, label='Starting LIVE…'))
                         self.set_stream_state(is_live=False)
                         self.clear_output_fields()
                         self.show_info("Existing stream ended successfully.")
@@ -5601,8 +6844,7 @@ class StreamKeyGeneratorWindow(QWidget):
 
                 dual_layout_requested = self.dual_layout_checkbox.isChecked()
 
-                created = stream.createStream(
-                    self.title_edit.text(),
+                created = (yield Work(stream.createStream, self.title_edit.text(),
                     topic_id,
                     game_id,
                     self.replay_checkbox.isChecked(),
@@ -5612,20 +6854,17 @@ class StreamKeyGeneratorWindow(QWidget):
                     self.thumbnail_edit.text(),
                     self.device_id,
                     self.install_id,
-                    multi_stream_scene=dual_layout_requested,
-                )
+                    multi_stream_scene=dual_layout_requested, label='Starting LIVE…'))
 
-                if dual_layout_requested and created and not stream.multiStreamUrl:
+                if dual_layout_requested and created and not distinct_push_urls(stream.streamUrl, stream.multiStreamUrl):
                     # The room exists but has no second canvas; end it so the
                     # user is not left with a half-configured live room.
                     try:
-                        stream.endStream(
-                            device_id=self.device_id,
+                        (yield Work(stream.endStream, device_id=self.device_id,
                             install_id=self.install_id,
                             priority_region=selected_region,
                             room_id=stream.roomId,
-                            stream_id=stream.streamId,
-                        )
+                            stream_id=stream.streamId, label='Starting LIVE…'))
                     except Exception:
                         pass
                     self.set_stream_state(is_live=False)
@@ -5639,11 +6878,11 @@ class StreamKeyGeneratorWindow(QWidget):
                     return
 
                 if created:
-                    self.apply_stream_outputs(
+                    (yield from self.apply_stream_outputs(
                         stream,
                         priority_region=selected_region,
                         dual_layout=dual_layout_requested,
-                    )
+                    ))
                     stream_started = True
                     self.anchor_ping_status = ANCHOR_STATUS_PREPARE
                     self.set_stream_state(is_live=True, is_paused=False)
@@ -5654,14 +6893,15 @@ class StreamKeyGeneratorWindow(QWidget):
         except FileNotFoundError:
             self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
         except RuntimeError as exc:
-            self.show_error(str(exc))
+            self.show_error(exc)
         except Exception as exc:
-            self.show_error(f"Failed to create or resume stream: {exc}")
+            self.show_error(OperationError("Failed to create or resume stream", exc))
         finally:
             if not stream_started:
                 self.set_stream_state(is_live=False)
                 self.clear_output_fields()
 
+    @foreground('Pausing LIVE…')
     def pause_stream(self):
         if not self.is_live:
             self.show_error("No active stream to pause.")
@@ -5677,14 +6917,12 @@ class StreamKeyGeneratorWindow(QWidget):
         self.end_live_button.setEnabled(False)
 
         try:
-            with Stream() as stream:
-                stream.pauseStream(
-                    device_id=self.device_id,
+            with (yield Work(self.stream_factory())) as stream:
+                (yield Work(stream.pauseStream, device_id=self.device_id,
                     install_id=self.install_id,
                     priority_region=self.stream_priority_region or self.region_combo.currentText(),
                     room_id=self.current_room_id,
-                    stream_id=self.current_stream_id,
-                )
+                    stream_id=self.current_stream_id, label='Pausing LIVE…'))
                 stream_paused = True
                 self.anchor_heartbeat_error_count = 0
                 self.anchor_ping_status = ANCHOR_STATUS_PAUSE
@@ -5695,14 +6933,15 @@ class StreamKeyGeneratorWindow(QWidget):
         except FileNotFoundError:
             self.show_error("Cookies JSON file not found or invalid. Select a valid cookies JSON file first.")
         except RuntimeError as exc:
-            self.show_error(str(exc))
+            self.show_error(exc)
         except Exception as exc:
-            self.show_error(f"Failed to pause stream: {exc}")
+            self.show_error(OperationError("Failed to pause stream", exc))
         finally:
             if not stream_paused:
                 self.sync_anchor_heartbeat_timer()
                 self.update_stream_controls()
 
+    @foreground('Resuming LIVE…')
     def resume_stream(self):
         if not self.is_live:
             self.show_error("No paused stream to resume. Use Go Live to check for a continuable stream.")
@@ -5720,28 +6959,24 @@ class StreamKeyGeneratorWindow(QWidget):
         self.end_live_button.setEnabled(False)
 
         try:
-            with Stream() as stream:
+            with (yield Work(self.stream_factory())) as stream:
                 room_id = self.current_room_id
                 stream_id = self.current_stream_id
 
                 if not room_id or not stream_id:
-                    if not stream.getContinuableStream(
-                        device_id=self.device_id,
+                    if not (yield Work(stream.getContinuableStream, device_id=self.device_id,
                         install_id=self.install_id,
-                        priority_region=self.stream_priority_region or self.region_combo.currentText(),
-                    ):
+                        priority_region=self.stream_priority_region or self.region_combo.currentText(), label='Resuming LIVE…')):
                         raise RuntimeError("No continuable stream found.")
-                    self.apply_stream_outputs(stream, priority_region=self.region_combo.currentText())
+                    (yield from self.apply_stream_outputs(stream, priority_region=self.region_combo.currentText()))
                     room_id = self.current_room_id
                     stream_id = self.current_stream_id
 
-                stream.resumePausedStream(
-                    device_id=self.device_id,
+                (yield Work(stream.resumePausedStream, device_id=self.device_id,
                     install_id=self.install_id,
                     priority_region=self.stream_priority_region or self.region_combo.currentText(),
                     room_id=room_id,
-                    stream_id=stream_id,
-                )
+                    stream_id=stream_id, label='Resuming LIVE…'))
                 stream_resumed = True
                 self.anchor_heartbeat_error_count = 0
                 self.anchor_ping_status = ANCHOR_STATUS_LIVING
@@ -5757,14 +6992,15 @@ class StreamKeyGeneratorWindow(QWidget):
                 self.clear_output_fields()
                 self.show_error(f"Resume failed because TikTok says this LIVE has already ended: {exc}")
             else:
-                self.show_error(str(exc))
+                self.show_error(exc)
         except Exception as exc:
-            self.show_error(f"Failed to resume stream: {exc}")
+            self.show_error(OperationError("Failed to resume stream", exc))
         finally:
             if not stream_resumed:
                 self.sync_anchor_heartbeat_timer()
                 self.update_stream_controls()
 
+    @foreground('Ending LIVE…')
     def end_stream(self):
         if not self.is_live:
             self.show_error("No active stream to end.")
@@ -5777,14 +7013,12 @@ class StreamKeyGeneratorWindow(QWidget):
         self.end_live_button.setEnabled(False)
 
         try:
-            with Stream() as stream:
-                if stream.endStream(
-                    device_id=self.device_id,
+            with (yield Work(self.stream_factory())) as stream:
+                if (yield Work(stream.endStream, device_id=self.device_id,
                     install_id=self.install_id,
                     priority_region=self.stream_priority_region or self.region_combo.currentText(),
                     room_id=self.current_room_id,
-                    stream_id=self.current_stream_id,
-                ):
+                    stream_id=self.current_stream_id, label='Ending LIVE…')):
                     stream_ended = True
                     self.set_stream_state(is_live=False)
                     self.show_info("Stream ended successfully.")
@@ -5798,18 +7032,102 @@ class StreamKeyGeneratorWindow(QWidget):
                 self.clear_output_fields()
                 self.show_info("TikTok reports that this LIVE has already ended, so the local stream state was cleared.")
             else:
-                self.show_error(str(exc))
+                self.show_error(exc)
         except Exception as exc:
-            self.show_error(f"Failed to end stream: {exc}")
+            self.show_error(OperationError("Failed to end stream", exc))
         finally:
             if not stream_ended:
                 self.sync_anchor_heartbeat_timer()
                 self.update_stream_controls()
 
     def closeEvent(self, event):
+        if self._foreground_task is not None:
+            # Keep room creation/end and protocol restoration atomic. The
+            # window remains responsive, and can close after this operation.
+            self._close_after_task = True
+            if self._foreground_task.dialog.cancel_callback is not None:
+                self._foreground_task.cancel()
+            event.ignore()
+            return
+        self._closing = True
+        self.stop_chat()
+        self.invalidate_account_refresh()
+        if self.settings_dialog.isVisible():
+            self.settings_dialog.reject()
         self.stop_ffmpeg_proxy(clear_status=True)
         super().closeEvent(event)
 
+
+
+class DeviceSettingsDialog(QDialog):
+    """Only the editable server IDs belong in device settings."""
+    def __init__(self, kind, record, parent=None):
+        super().__init__(parent)
+        import copy
+        self.kind = kind
+        self.record = copy.deepcopy(record)
+        self.setWindowTitle('Android device settings' if kind == 'mobile' else 'PC device settings')
+        self.setMinimumWidth(440)
+        self.resize(480, 340)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 24)
+        layout.setSpacing(14)
+        layout.addWidget(TitleLabel('Android device' if kind == 'mobile' else 'PC device'))
+        hint = QLabel('Edit the IDs for this installation.')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.fields = {}
+        for key, title in [('device_id', 'Device ID'), ('install_id', 'Install ID')]:
+            label = QLabel(title)
+            field = QLineEdit(str(self.record.get(key) or ''))
+            field.setPlaceholderText('Created automatically')
+            field.setAccessibleName(title)
+            field.setMinimumHeight(36)
+            label.setBuddy(field)
+            self.fields[key] = field
+            layout.addWidget(label)
+            layout.addWidget(field)
+        self.error_label = QLabel('')
+        self.error_label.setWordWrap(True)
+        self.error_label.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.error_label)
+        layout.addStretch(1)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.cancel_button = QPushButton('Cancel')
+        self.cancel_button.clicked.connect(self.reject)
+        self.save_button = PrimaryPushButton('Save')
+        self.save_button.setDefault(True)
+        self.save_button.clicked.connect(self.save_record)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.save_button)
+        layout.addLayout(buttons)
+        QWidget.setTabOrder(self.fields['device_id'], self.fields['install_id'])
+        QWidget.setTabOrder(self.fields['install_id'], self.cancel_button)
+        QWidget.setTabOrder(self.cancel_button, self.save_button)
+        style_controls(self)
+
+    def collect_record(self):
+        import copy
+        record = copy.deepcopy(self.record)
+        for key, title in [('device_id', 'Device ID'), ('install_id', 'Install ID')]:
+            value = self.fields[key].text().strip()
+            if value and (not value.isascii() or not value.isdigit() or int(value) == 0):
+                self.fields[key].setError(True)
+                self.fields[key].setFocus()
+                raise ValueError(title + ' must be a nonzero decimal number, or blank to create it again.')
+            self.fields[key].setError(False)
+            record[key] = value
+        return record
+
+    def save_record(self):
+        try:
+            record = self.collect_record()
+        except ValueError as exc:
+            self.error_label.setText(str(exc))
+            return
+        self.record = record
+        self.accept()
 
 
 class LoginDialog(QDialog):
@@ -5818,6 +7136,10 @@ class LoginDialog(QDialog):
         self.parent_window = parent
         self.client = None
         self.qr_token = None
+        self._qr_generation = 0
+        self._qr_busy = False
+        self._qr_cancel = threading.Event()
+        self.finished.connect(lambda *_: self.cleanup())
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.poll_qr_status)
 
@@ -5836,12 +7158,17 @@ class LoginDialog(QDialog):
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+        from qfluentwidgets import IndeterminateProgressRing
+        self.qr_spinner = IndeterminateProgressRing(self)
+        self.qr_spinner.setFixedSize(24, 24)
+        self.qr_spinner.hide()
+        layout.addWidget(self.qr_spinner, alignment=Qt.AlignCenter)
 
         button_row = QHBoxLayout()
 
-        refresh_button = QPushButton("Refresh QR Code")
-        refresh_button.clicked.connect(self.load_qr_code)
-        button_row.addWidget(refresh_button)
+        self.refresh_button = QPushButton("Refresh QR Code")
+        self.refresh_button.clicked.connect(self.load_qr_code)
+        button_row.addWidget(self.refresh_button)
 
         browser_button = QPushButton("Login in Browser")
         browser_button.clicked.connect(self.open_browser_login)
@@ -5856,77 +7183,130 @@ class LoginDialog(QDialog):
 
     def cleanup(self):
         self.poll_timer.stop()
-        if self.client is not None:
-            self.client.close()
-            self.client = None
+        self._qr_generation += 1
+        self._qr_cancel.set()
+        client, self.client = self.client, None
+        if client is not None and not self._qr_busy:
+            threading.Thread(target=client.close, daemon=True).start()
+
+    def _run_qr(self, action, success):
+        if self._qr_busy or self.client is None:
+            return
+        generation, client, cancel = self._qr_generation, self.client, self._qr_cancel
+        self._qr_busy = True
+        self.qr_spinner.show()
+        self.refresh_button.setEnabled(False)
+        def work():
+            try:
+                return action(client)
+            finally:
+                if cancel.is_set():
+                    client.close()
+        def finish(result=None, error=None):
+            if generation != self._qr_generation:
+                return
+            self._qr_busy = False
+            self.qr_spinner.hide()
+            self.refresh_button.setEnabled(True)
+            if error is not None:
+                self.poll_timer.stop()
+                self.status_label.setText('QR login failed: ' + str(error))
+            else:
+                success(result)
+        BackgroundTask(self, Work(work), finish, lambda exc: finish(error=exc)).start()
 
     def load_qr_code(self):
-        self.poll_timer.stop()
-        if self.client is not None:
-            self.client.close()
-
-        self.client = LiveStudioBrowserLoginClient(
-            self.parent_window.device_id,
-            self.parent_window.install_id,
-        )
+        if self._qr_busy:
+            return
+        self.cleanup()
+        self._qr_cancel = threading.Event()
+        cancel, generation = self._qr_cancel, self._qr_generation
+        device_id, install_id = self.parent_window.device_id, self.parent_window.install_id
         self.qr_token = None
-        self.qr_label.setText("Loading QR code...")
-        self.status_label.setText("Scan with the TikTok app.")
-        QApplication.processEvents()
-
-        try:
-            qr_data = self.client.get_qrcode()
-            qrcode_b64 = qr_data["qrcode"]
-            self.qr_token = qr_data["token"]
-
-            pixmap = QPixmap()
-            if not pixmap.loadFromData(base64.b64decode(qrcode_b64)):
-                raise RuntimeError("TikTok returned an unreadable QR code.")
-
-            self.qr_label.setPixmap(
-                pixmap.scaled(260, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-            self.poll_timer.start(2500)
-        except Exception as exc:
-            self.qr_label.setText("QR login unavailable.")
-            self.status_label.setText(str(exc))
+        self.qr_label.clear()
+        self.qr_label.setText('Loading QR code…')
+        self.status_label.setText('Scan with the TikTok app.')
+        self._qr_busy = True
+        self.qr_spinner.show()
+        self.refresh_button.setEnabled(False)
+        def load():
+            client = LiveStudioBrowserLoginClient(device_id, install_id)
+            try:
+                return client, client.get_qrcode()
+            except Exception:
+                client.close()
+                raise
+            finally:
+                if cancel.is_set():
+                    client.close()
+        def loaded(result):
+            if generation != self._qr_generation:
+                # Cancellation can arrive after the worker emitted its result.
+                threading.Thread(target=result[0].close, daemon=True).start()
+                return
+            self._qr_busy = False
+            self.qr_spinner.hide()
+            self.refresh_button.setEnabled(True)
+            self.client, qr_data = result
+            try:
+                pixmap = QPixmap()
+                if not pixmap.loadFromData(base64.b64decode(qr_data['qrcode'])):
+                    raise RuntimeError('TikTok returned an unreadable QR code.')
+                self.qr_token = qr_data['token']
+                self.qr_label.setPixmap(pixmap.scaled(260, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self.poll_timer.start(2500)
+            except Exception as exc:
+                self.status_label.setText(str(exc))
+        def failed(error):
+            if generation == self._qr_generation:
+                self._qr_busy = False
+                self.qr_spinner.hide()
+                self.refresh_button.setEnabled(True)
+                self.status_label.setText('QR login failed: ' + str(error))
+        BackgroundTask(self, Work(load), loaded, failed).start()
 
     def poll_qr_status(self):
-        if not self.client or not self.qr_token:
+        if not self.client or not self.qr_token or self._qr_busy:
             return
+        token, cookies_path = self.qr_token, self.parent_window.get_cookies_path()
+        cancel = self._qr_cancel
+        def poll(client):
+            payload = client.check_qrconnect(token)
+            data = payload.get('data', {})
+            status = data.get('status') or data.get('qr_status') or data.get('state')
+            if status == 'confirmed':
+                expected = getattr(client, 'qr_client_secret', '')
+                returned = str(data.get('client_secret') or '')
+                if not expected or returned == expected or data.get('client_secret_match'):
+                    if not cancel.is_set():
+                        client.save_cookies(cookies_path)
+            return payload
+        self._run_qr(poll, self.on_qr_status)
 
-        try:
-            payload = self.client.check_qrconnect(self.qr_token)
-            data = payload.get("data", {})
-            status = data.get("status") or data.get("qr_status") or data.get("state")
-
-            if status == "new":
-                self.status_label.setText("Scan with the TikTok app.")
-            elif status == "scanned":
-                self.status_label.setText("Confirm login on your phone.")
-            elif status == "confirmed":
-                expected_secret = getattr(self.client, "qr_client_secret", "")
-                returned_secret = str(data.get("client_secret") or "")
-                if expected_secret and returned_secret != expected_secret and not data.get("client_secret_match"):
-                    self.status_label.setText("Waiting for the matching login confirmation...")
-                    return
-                self.client.save_cookies()
-                self.parent_window.check_cookies()
-                self.parent_window.refresh_account_info()
-                self.parent_window.show_info("Login successful! Cookies have been saved.")
-                self.cleanup()
-                self.accept()
-            elif status in {"expired", "timeout"}:
-                self.poll_timer.stop()
-                self.status_label.setText("QR code expired. Refresh it and try again.")
-            elif status:
-                self.status_label.setText(f"QR login status: {status}")
-            else:
-                message = payload.get("message") or payload.get("status_msg") or str(payload)
-                self.status_label.setText(message)
-        except Exception as exc:
+    def on_qr_status(self, payload):
+        data = payload.get('data', {})
+        status = data.get('status') or data.get('qr_status') or data.get('state')
+        if status == 'new':
+            self.status_label.setText('Scan with the TikTok app.')
+        elif status == 'scanned':
+            self.status_label.setText('Confirm login on your phone.')
+        elif status == 'confirmed':
+            expected = getattr(self.client, 'qr_client_secret', '')
+            if expected and str(data.get('client_secret') or '') != expected and not data.get('client_secret_match'):
+                self.status_label.setText('Waiting for the matching login confirmation…')
+                return
+            self.cleanup()
+            self.accept()
+            self.parent_window.check_cookies()
+            self.parent_window.refresh_account_info()
+            self.parent_window.show_info('Login successful! Cookies have been saved.')
+        elif status in {'expired', 'timeout'}:
             self.poll_timer.stop()
-            self.status_label.setText(f"QR login check failed: {exc}")
+            self.status_label.setText('QR code expired. Refresh it and try again.')
+        elif status:
+            self.status_label.setText(f'QR login status: {status}')
+        else:
+            self.status_label.setText(payload.get('message') or payload.get('status_msg') or str(payload))
 
     def open_browser_login(self):
         self.cleanup()
@@ -5965,6 +7345,10 @@ def handle_protocol_callback(port, url):
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] == '--smoke-test':
+        from Libs.release_smoke import run
+        raise SystemExit(run(log=_release_smoke_log))
+
     if len(sys.argv) >= 2 and sys.argv[1] == "--sei-proxy":
         log_path = None
         try:
@@ -5995,9 +7379,11 @@ def main():
         return
 
     # Normal GUI mode
+    install_font_diagnostics(os.path.join(_runtime_logs_dir(), 'qt-font-warnings.log'))
     app = QApplication(sys.argv)
+    app.setWindowIcon(_application_icon())
     window = StreamKeyGeneratorWindow()
-    window.resize(1040, 500)
+    window.resize(1040, 640)
     window.show()
     sys.exit(app.exec())
 

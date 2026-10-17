@@ -16,7 +16,8 @@ if str(APP_ROOT) not in sys.path:
 # Local-only testing note: in a source checkout, temporarily change this to
 # `from DevTools.XFrameSign import frame_sign`. Do not include that development
 # module in a production build.
-from Libs.XFrameSign import frame_sign
+from Libs.signing_backend import frame_sign, is_development
+from Libs.error_reporting import OperationError, write_proxy_error
 
 
 def _read_u24_be(data):
@@ -103,7 +104,9 @@ def _sign_result_summary(value):
 
 
 class LocalSeiSigner:
-    def __init__(self, *, uid, device_id, room_id, aid, width, height, log=None):
+    def __init__(self, *, uid, device_id, room_id, aid, width, height, log=None, implementation="pc", device_profile=None):
+        self.implementation = implementation
+        self.device_profile = device_profile or {}
         self.uid = str(uid or "")
         self.device_id = str(device_id or "")
         self.room_id = str(room_id or "")
@@ -118,6 +121,7 @@ class LocalSeiSigner:
         self._sign_lock = threading.Lock()
         self._sign_refreshing = False
         self._sign_failure_ms = 0
+        self._sign_failure_exception = None
 
     def _log_sign_result(self, source, now_ms, result):
         if self.log is None:
@@ -150,6 +154,7 @@ class LocalSeiSigner:
             self._last_signed_ms = now_ms
             self._sign_refreshing = False
             self._sign_failure_ms = 0
+            self._sign_failure_exception = None
         self._log_sign_result(source, now_ms, result)
 
     def _refresh_sign_result(self, now_ms, source, raise_on_error=False):
@@ -160,12 +165,13 @@ class LocalSeiSigner:
 
         def refresh():
             try:
-                sign_result = frame_sign(self._build_sign_input(now_ms))
+                sign_result = frame_sign(self._build_sign_input(now_ms), implementation=self.implementation, device_profile=self.device_profile)
                 self._set_sign_result(source, now_ms, sign_result)
             except Exception as exc:
                 with self._sign_lock:
                     self._sign_refreshing = False
                     self._sign_failure_ms = int(time.time() * 1000)
+                    self._sign_failure_exception = exc
                 self._log_cache(f"direct failed error={type(exc).__name__}: {exc}")
                 if raise_on_error:
                     raise
@@ -204,12 +210,11 @@ class LocalSeiSigner:
         sign_result, signed_ms = self._current_sign_result()
         with self._sign_lock:
             sign_failure_ms = self._sign_failure_ms
+            sign_failure = self._sign_failure_exception
         if sign_result is not None and sign_failure_ms:
-            raise RuntimeError(
-                "Frame-sign API unavailable; refusing to forward stale SEI signatures."
-            )
+            raise OperationError("Signature refresh failed; forwarding was halted", sign_failure)
         if sign_result is None:
-            sign_result = frame_sign(self._build_sign_input(now_ms))
+            sign_result = frame_sign(self._build_sign_input(now_ms), implementation=self.implementation, device_profile=self.device_profile)
             self._set_sign_result("signed_payload_initial_direct", now_ms, sign_result)
             signed_ms = now_ms
         elif refresh_signature:
@@ -222,8 +227,9 @@ class LocalSeiSigner:
             "sei_index": self._next_index(),
             "signResult": sign_result,
             "ts": str(now_ms),
-            "ttls_live_scene": "live_studio",
         }
+        if self.implementation == 'pc':
+            value['ttls_live_scene'] = 'live_studio'
         return b"JSON" + json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     def startup_signed_payload(self, now_ms=None):
@@ -231,7 +237,7 @@ class LocalSeiSigner:
             now_ms = int(time.time() * 1000)
         sign_result, _ = self._current_sign_result()
         if sign_result is None:
-            sign_result = frame_sign(self._build_sign_input(now_ms))
+            sign_result = frame_sign(self._build_sign_input(now_ms), implementation=self.implementation, device_profile=self.device_profile)
             self._set_sign_result("startup", now_ms, sign_result)
         value = {
             "live_sei_mute_mic": {"is_mute_mic": 0},
@@ -239,8 +245,9 @@ class LocalSeiSigner:
             "push_video_width": self.width,
             "sei_index": self._next_index(),
             "signResult": sign_result,
-            "ttls_live_scene": "live_studio",
         }
+        if self.implementation == 'pc':
+            value['ttls_live_scene'] = 'live_studio'
         return b"JSON" + json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     def begin_session(self):
@@ -278,6 +285,8 @@ class LocalSeiSigner:
                 "encode": now_ms + 110,
             },
         }
+        if self.implementation == 'pc':
+            value['ttls_live_scene'] = 'live_studio'
         return b"JSON" + json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     def payload(self):
@@ -624,16 +633,27 @@ def main():
     parser.add_argument("--device-id", default="")
     parser.add_argument("--room-id", default="")
     parser.add_argument("--aid", default="8311")
+    parser.add_argument("--device-type", choices=('pc', 'mobile'), default='pc')
+    parser.add_argument("--config-path", default='')
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--resolution", default="1920x1080")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--log", default="")
+    parser.add_argument("--error-report", default="")
     parser.add_argument("--dump-output-flv", default="")
     args = parser.parse_args()
 
     if args.input_flv == "listen" and not args.listen_url:
         parser.error("--listen-url is required when --input-flv=listen")
 
+    try:
+        return _run_proxy(args)
+    except Exception as exc:
+        write_proxy_error(args.error_report, exc)
+        raise
+
+
+def _run_proxy(args):
     width, height = args.resolution.lower().replace("*", "x").split("x", 1)
     args.width = int(width)
     args.height = int(height)
@@ -643,7 +663,27 @@ def main():
         log = log_path.open("w", encoding="utf-8", errors="replace")
     else:
         log = sys.stderr
+    try:
+        return _run_proxy_with_log(args, log)
+    finally:
+        if log is not sys.stderr:
+            log.close()
+
+
+def _run_proxy_with_log(args, log):
+    profile = {}
+    if args.device_type == 'mobile':
+        from Libs.client_profiles import device_records, mobile_record_defaults, ClientImplementation
+        if not args.config_path:
+            raise ValueError('--config-path is required for mobile')
+        config = json.loads(Path(args.config_path).read_text(encoding='utf-8'))
+        profile = mobile_record_defaults(device_records(config).get('mobile', {}))
+        if str(profile.get('device_id')) != args.device_id or str(profile.get('aid')) != args.aid:
+            raise ValueError('Proxy identity differs from the saved Android profile')
+        ClientImplementation('mobile', profile).validate()
     signer = LocalSeiSigner(
+        implementation=args.device_type,
+        device_profile=profile,
         uid=args.uid,
         device_id=args.device_id,
         room_id=args.room_id,
@@ -652,34 +692,30 @@ def main():
         height=args.height,
         log=log,
     )
-    log.write("[framesign] implementation=rapidapi\n")
+    log.write(f"[framesign] implementation={args.device_type} backend={'dev' if is_development() else 'api'}\n")
     log.flush()
     signer.start_initial_prefetch()
 
-    try:
-        if args.input_flv == "pipe":
-            return _relay_once(args, signer, log)
+    if args.input_flv == "pipe":
+        return _relay_once(args, signer, log)
 
-        attempt = 0
-        while True:
-            attempt += 1
-            log.write(f"[proxy] waiting for OBS/local RTMP connection attempt={attempt}\n")
+    attempt = 0
+    while True:
+        attempt += 1
+        log.write(f"[proxy] waiting for OBS/local RTMP connection attempt={attempt}\n")
+        log.flush()
+        try:
+            code = _relay_once(args, signer, log)
+            log.write(f"[proxy] local RTMP session ended code={code}; reopening listener\n")
             log.flush()
-            try:
-                code = _relay_once(args, signer, log)
-                log.write(f"[proxy] local RTMP session ended code={code}; reopening listener\n")
-                log.flush()
-            except Exception as exc:
-                # A dead session (OBS disconnected mid-stream, TikTok reset
-                # the push, a signer call failing after a long idle) must
-                # crash neither the proxy child nor the stream: log it and
-                # reopen the listener so OBS can reconnect.
-                log.write(f"[proxy] session error: {type(exc).__name__}: {exc}; reopening listener\n")
-                log.flush()
-            time.sleep(1)
-    finally:
-        if log is not sys.stderr:
-            log.close()
+        except Exception as exc:
+            # A dead session (OBS disconnected mid-stream, TikTok reset
+            # the push, a signer call failing after a long idle) must
+            # crash neither the proxy child nor the stream: log it and
+            # reopen the listener so OBS can reconnect.
+            log.write(f"[proxy] session error: {type(exc).__name__}: {exc}; reopening listener\n")
+            log.flush()
+        time.sleep(1)
 
 
 if __name__ == "__main__":

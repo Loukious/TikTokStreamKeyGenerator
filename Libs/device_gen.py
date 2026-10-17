@@ -12,6 +12,7 @@ except Exception:
     curl_requests = None
 
 from .log_encrypt_codec import DEFAULT_LOG_ENCRYPT_KEY, log_encrypt
+from .mobile_device_gen import register_mobile_device_identifiers
 from .domain_routing import (
     attach_webcast_ntp_t0,
     build_common_headers,
@@ -252,15 +253,20 @@ def _build_device_register_payload(version, pc_uuid, pc_serial, fingerprint):
     }
 
 
-def register_desktop_device_identifiers(session=None, timeout=25):
+def register_desktop_device_identifiers(session=None, timeout=25, *, device_profile=None, return_profile=False):
     close_session = session is None
     client = session if session is not None else _new_http_session()
     try:
         client.headers.update(build_common_headers(client))
 
         version = fetch_live_studio_latest_version(client)
-        pc_uuid, pc_serial = generate_private_pc_identifiers()
-        fingerprint = generate_desktop_fingerprint()
+        saved = device_profile or {}
+        identifiers = saved.get('identifiers') or {}
+        if identifiers.get('pc_uuid') and identifiers.get('pc_serial'):
+            pc_uuid, pc_serial = identifiers['pc_uuid'], identifiers['pc_serial']
+        else:
+            pc_uuid, pc_serial = generate_private_pc_identifiers()
+        fingerprint = saved.get('fingerprint') or generate_desktop_fingerprint()
         browser_version = build_live_studio_browser_version(version)
 
         params = _build_device_register_query_params(
@@ -311,6 +317,11 @@ def register_desktop_device_identifiers(session=None, timeout=25):
         if not device_id or device_id == "0" or not install_id or install_id == "0":
             raise RuntimeError(f"Device registration failed: {response_data}")
 
+        if return_profile:
+            return {'device_id': device_id, 'install_id': install_id, 'aid': '8311',
+                    'app_version': version, 'browser_version': browser_version,
+                    'identifiers': {'pc_uuid': pc_uuid, 'pc_serial': pc_serial},
+                    'fingerprint': fingerprint}
         return device_id, install_id
     finally:
         if close_session:

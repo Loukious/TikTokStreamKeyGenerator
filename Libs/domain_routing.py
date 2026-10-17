@@ -86,6 +86,9 @@ def _live_studio_version_from_user_agent(session=None):
 
 
 def build_common_headers(session=None):
+    if getattr(session, '_tiktok_tnc_params', None) is not None:
+        return {'accept': 'application/json', 'accept-language': 'en-US',
+                'user-agent': get_tiktok_user_agent(session)}
     return {
         "accept": "application/json, text/plain, */*",
         "accept-language": "en-US",
@@ -180,10 +183,12 @@ def _extract_strategy_maps(response_json):
 
 
 def _tnc_discovery_params(session):
-    params = dict(TNC_DISCOVERY_PARAMS)
-    params["version_code"] = _live_studio_version_from_user_agent(session)
+    overrides = getattr(session, '_tiktok_tnc_params', None)
+    params = dict(overrides if overrides is not None else TNC_DISCOVERY_PARAMS)
+    if overrides is None:
+        params["version_code"] = _live_studio_version_from_user_agent(session)
     device_id = _session_cookie_value(session, "device_id") or _session_cookie_value(session, "ttwid") or ""
-    if device_id:
+    if device_id and not params.get("device_id"):
         params["device_id"] = str(device_id)
     region = _session_cookie_value(session, "store-country-code") or ""
     if region:
@@ -212,6 +217,14 @@ def _fetch_strategy_maps(session, timeout):
 
 
 def _get_strategy_maps(session, timeout=12):
+    if getattr(session, '_tiktok_tnc_params', None) is not None:
+        # Android dispatch must not reuse the global Windows cache.
+        cache = getattr(session, '_tiktok_dispatch_cache', {})
+        if cache.get('strategy_maps') and time.time() - cache.get('fetched_at', 0) < _CACHE_TTL_SECONDS:
+            return cache['strategy_maps']
+        maps = _fetch_strategy_maps(session, timeout)
+        session._tiktok_dispatch_cache = {'fetched_at': time.time(), 'strategy_maps': maps}
+        return maps
     now = time.time()
     cached = _DISPATCH_CACHE.get("strategy_maps")
     cached_at = _DISPATCH_CACHE.get("fetched_at", 0.0)

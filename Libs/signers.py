@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
+from Libs.error_reporting import HostedSignerError, SignerFailureKind
 
 try:
     from Libs.rapidapi_quota import update_from_headers as _update_quota_headers
@@ -142,7 +143,43 @@ def _normalize_headers(value) -> dict[str, str]:
         raise ValueError(
             "signature API response has blank x-khronos/x-ladon/x-argus"
         )
+    if value.get('x-gorgon'):
+        headers['x-gorgon'] = _string_header(value['x-gorgon'])
     return headers
+
+
+_mobile_capabilities = {}
+
+
+def mobile_api_ready():
+    setting = os.environ.get('TIKTOK_MOBILE_API_ENABLED')
+    if setting == '0':
+        raise RuntimeError('Mobile signing is not enabled on the hosted API yet. '
+                           'Use development mode until the API has been updated.')
+    if setting == '1':
+        return
+    base_url = _api_base_url()
+    if not _should_use_api():
+        raise HostedSignerError('Configure the signing API key before using Android mode.', kind=SignerFailureKind.SUBSCRIPTION)
+    cache_key = (base_url, _rapidapi_key())
+    if _mobile_capabilities.get(cache_key, 0) > time.monotonic():
+        return
+    try:
+        response = requests.get(urljoin(base_url, 'health'), headers=_headers(base_url),
+                                timeout=10, impersonate='chrome')
+    except requests.exceptions.RequestException as exc:
+        raise HostedSignerError(f'Signing service connection failed: {exc}') from exc
+    try:
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise HostedSignerError.from_http(response.status_code, f'Signing service health check failed: {exc}') from exc
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HostedSignerError('Signing service health check returned invalid JSON.') from exc
+    if not isinstance(data, dict) or not data.get('success') or 'mobile' not in data.get('implementations', []):
+        raise HostedSignerError('The hosted API does not support Android yet. Update the server first.')
+    _mobile_capabilities[cache_key] = time.monotonic() + 60
 
 
 def _string_header(value) -> str:
@@ -166,18 +203,18 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
     if _rate_limit_wait_seconds is not None:
         wait = _rate_limit_wait_seconds()
         if wait > 0:
-            raise RuntimeError(
-                f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s"
+            raise HostedSignerError(
+                f"RapidAPI signer rate-limited; pausing requests for {int(wait) + 1}s", kind=SignerFailureKind.QUOTA
             )
     base_url = _api_base_url()
     started = time.perf_counter()
-    response = requests.post(
-        urljoin(base_url, "signatures"),
-        headers=_headers(base_url),
-        data=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
-        timeout=timeout,
-        impersonate="chrome",
-    )
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    headers = _headers(base_url)
+    try:
+        response = requests.post(urljoin(base_url, "signatures"), headers=headers,
+                                 data=body, timeout=timeout, impersonate="chrome")
+    except requests.exceptions.RequestException as exc:
+        raise HostedSignerError(f'Signing service connection failed: {exc}') from exc
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     if response.status_code == 429:
         if _note_rate_limited is not None:
@@ -191,7 +228,7 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
             pass
     try:
         data = response.json()
-    except Exception:
+    except ValueError:
         data = {"success": False, "error": response.text[:500]}
 
     if response.status_code >= 400:
@@ -205,13 +242,16 @@ def _post_signatures(payload: dict, *, timeout: int = 20) -> dict[str, str]:
             f"path=/signatures status={response.status_code} "
             f"elapsed_ms={elapsed_ms} error={detail[:300]}"
         )
-        raise RuntimeError(
-            f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
+        raise HostedSignerError.from_http(
+            response.status_code, f"RapidAPI signer HTTP {response.status_code}: {detail or 'request rejected'}"
         )
     if isinstance(data, dict) and data.get("success") is False:
-        raise RuntimeError(str(data.get("error") or data))
+        raise HostedSignerError(str(data.get("error") or data))
 
-    headers = _normalize_headers(data)
+    try:
+        headers = _normalize_headers(data)
+    except ValueError as exc:
+        raise HostedSignerError(str(exc)) from exc
     _log(
         "path=/signatures "
         f"status={response.status_code} elapsed_ms={elapsed_ms} "
@@ -231,11 +271,16 @@ def signature_headers(
     x_ss_stub=None,
     device_id=None,
     local_id=1877999593,
+    *, implementation='pc', url=None, request_headers=None, body_base64=None, install_id=None,
 ):
+    if implementation not in ('pc', 'mobile'):
+        raise ValueError('implementation must be pc or mobile')
+    if implementation == 'mobile':
+        mobile_api_ready()
     khronos = _fallback_khronos(timestamp)
     if not _should_use_api():
         _log("missing RapidAPI key; refusing to send blank signature headers")
-        raise RuntimeError("RapidAPI signer key is required for request signing")
+        raise HostedSignerError("RapidAPI signer key is required for request signing", kind=SignerFailureKind.SUBSCRIPTION)
 
     payload = {
         "timestamp": int(khronos),
@@ -245,14 +290,19 @@ def signature_headers(
         "params": params or "",
         "stub": x_ss_stub or "",
     }
+    if implementation == 'mobile':
+        payload.update(implementation='mobile', url=url, headers=request_headers or {},
+                       body_base64=body_base64, install_id=str(install_id or ''))
     try:
         headers = _post_signatures(payload)
+        if implementation == 'mobile' and not headers.get('x-gorgon'):
+            raise HostedSignerError('Hosted API does not return Android x-gorgon signatures yet.')
         if not headers["x-khronos"]:
             headers["x-khronos"] = khronos
         return headers
     except Exception as exc:
         _log(f"signature API failed; refusing to send blank signatures: {exc}")
-        raise RuntimeError(f"signature API failed: {exc}") from exc
+        raise
 
 
 def make_ladon(x_khronos: int, local_id: int, aid: str = "8311", **_kwargs):
