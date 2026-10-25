@@ -480,6 +480,7 @@ class ModeTests(unittest.TestCase):
         from Libs import XFrameSign as hosted
         result = {'signversion': '2.0', 'signinfo': 'i', 'signvalue': 'v', 'lid': '123'}
         with patch.dict(os.environ, {'TIKTOK_SIGNER_MODE': 'api', 'TIKTOK_MOBILE_API_ENABLED': '1'}), \
+             patch.object(hosted_headers, '_should_use_api', return_value=True), \
              patch.object(hosted, '_post_json', return_value=result) as api, \
              patch.object(hosted, '_frame_sign_from_cache') as cache:
             backend.frame_sign({'aid': '1233'}, implementation='mobile', device_profile={'frame_sdk': {}})
@@ -645,23 +646,44 @@ class ModeTests(unittest.TestCase):
                     register_mobile_device_identifiers(device_profile=profile)
             session.assert_not_called()
 
-    def test_mobile_capability_check_allows_new_api_and_rejects_old_api(self):
-        from unittest.mock import Mock
-        response = Mock(); response.json.return_value = {'success': True, 'implementations': ['pc', 'mobile']}
+    def test_mobile_signing_uses_existing_routes_without_internal_health_requests(self):
+        from Libs import XFrameSign as frames
+        headers = {'x-khronos': '1700000000', 'x-argus': 'a', 'x-ladon': 'l', 'x-gorgon': 'g'}
+        frame = {'signversion': '2.0', 'signinfo': 'i', 'signvalue': 'v', 'lid': '123'}
         with patch.dict(os.environ, {'TIKTOK_SIGNER_MODE': 'api'}), \
-             patch('Libs.signers._api_base_url', return_value='http://fixture.test/'), \
              patch('Libs.signers._should_use_api', return_value=True), \
-             patch('Libs.signers._rapidapi_key', return_value='fixture-key'), \
-             patch('Libs.signers.requests.get', return_value=response) as get:
+             patch('Libs.signers.requests.get', side_effect=AssertionError('Internal endpoint requested')) as get, \
+             patch.object(hosted_headers, '_post_signatures', return_value=headers) as sign, \
+             patch.object(frames, '_post_json', return_value=frame) as frame_sign:
             os.environ.pop('TIKTOK_MOBILE_API_ENABLED', None)
-            hosted_headers._mobile_capabilities.clear()
             backend.validate_mobile({'device_id': '333', 'install_id': '444'})
             backend.validate_mobile({'device_id': '333', 'install_id': '444'})
-            self.assertEqual(get.call_count, 1)
-            hosted_headers._mobile_capabilities.clear()
-            response.json.return_value = {'success': True}
-            with self.assertRaisesRegex(RuntimeError, 'Update the server'):
-                backend.validate_mobile({'device_id': '333', 'install_id': '444'})
+            sign.assert_not_called()
+            frame_sign.assert_not_called()
+            self.assertEqual(backend.signature_headers(1700000000, '1233', implementation='mobile',
+                                                      url='https://fixture.test/'), headers)
+            self.assertEqual(backend.frame_sign({'aid': '1233'}, implementation='mobile',
+                                               device_profile={'frame_sdk': {}})['signversion'], '2.0')
+            self.assertEqual(sign.call_count, 1)
+            frame_sign.assert_called_once()
+            self.assertEqual(frame_sign.call_args.args[0], '/framesign')
+            get.assert_not_called()
+
+    def test_mobile_preflight_requires_credentials_even_with_legacy_enable_flag(self):
+        from Libs.error_reporting import HostedSignerError, SignerFailureKind
+        with patch.dict(os.environ, {'TIKTOK_SIGNER_MODE': 'api'}), \
+             patch.object(hosted_headers, '_should_use_api', return_value=False), \
+             patch.object(hosted_headers.requests, 'get') as get:
+            for flag in (None, '1'):
+                with self.subTest(flag=flag):
+                    if flag is None:
+                        os.environ.pop('TIKTOK_MOBILE_API_ENABLED', None)
+                    else:
+                        os.environ['TIKTOK_MOBILE_API_ENABLED'] = flag
+                    with self.assertRaises(HostedSignerError) as error:
+                        backend.validate_mobile({'device_id': '333', 'install_id': '444'})
+                    self.assertEqual(error.exception.kind, SignerFailureKind.SUBSCRIPTION)
+            get.assert_not_called()
 
     def test_gui_registration_saves_mobile_identity_separately(self):
         from Libs.mobile_device_gen import generate_mobile_device

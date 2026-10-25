@@ -148,38 +148,18 @@ def _normalize_headers(value) -> dict[str, str]:
     return headers
 
 
-_mobile_capabilities = {}
-
-
 def mobile_api_ready():
+    """Check client configuration; Android support is checked in signing responses.
+
+    /health is an internal monitoring endpoint, not a subscriber API route.
+    Do not spend a request probing it before real signing operations.
+    """
     setting = os.environ.get('TIKTOK_MOBILE_API_ENABLED')
     if setting == '0':
         raise RuntimeError('Mobile signing is not enabled on the hosted API yet. '
                            'Use development mode until the API has been updated.')
-    if setting == '1':
-        return
-    base_url = _api_base_url()
     if not _should_use_api():
         raise HostedSignerError('Configure the signing API key before using Android mode.', kind=SignerFailureKind.SUBSCRIPTION)
-    cache_key = (base_url, _rapidapi_key())
-    if _mobile_capabilities.get(cache_key, 0) > time.monotonic():
-        return
-    try:
-        response = requests.get(urljoin(base_url, 'health'), headers=_headers(base_url),
-                                timeout=10, impersonate='chrome')
-    except requests.exceptions.RequestException as exc:
-        raise HostedSignerError(f'Signing service connection failed: {exc}') from exc
-    try:
-        response.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise HostedSignerError.from_http(response.status_code, f'Signing service health check failed: {exc}') from exc
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise HostedSignerError('Signing service health check returned invalid JSON.') from exc
-    if not isinstance(data, dict) or not data.get('success') or 'mobile' not in data.get('implementations', []):
-        raise HostedSignerError('The hosted API does not support Android yet. Update the server first.')
-    _mobile_capabilities[cache_key] = time.monotonic() + 60
 
 
 def _string_header(value) -> str:

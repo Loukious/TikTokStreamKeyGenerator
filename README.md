@@ -290,9 +290,12 @@ Maintainers with the private local signing tools can explicitly set
 `TIKTOK_SIGNER_MODE=dev`. Those tools are not part of this repository. Packaged
 builds refuse development mode and never fall back to a local signer.
 
-Production mobile signing checks `/health` for Android support. Deploy the updated
-FrameSignTiktok API and expose `/health` through the gateway. The optional
-`TIKTOK_MOBILE_API_ENABLED=1` bypasses discovery; `0` explicitly disables mobile.
+Production mobile signing uses the existing `/signatures` and `/framesign`
+routes. Android support is validated from their responses: headers must include
+`x-gorgon`, and frame signatures must use version `2.0`. `/health` is reserved
+for internal server/Docker monitoring and is not called by the GUI or exposed
+through RapidAPI. `TIKTOK_MOBILE_API_ENABLED=0` explicitly disables mobile;
+no environment override is needed to avoid health checks.
 The prepared `/signatures` contract adds `implementation: "mobile"`, the exact
 `url`, request `headers`, `body_base64`, and `install_id` to the existing fields.
 Android responses must include x-gorgon as well as x-argus/x-ladon/x-khronos.
