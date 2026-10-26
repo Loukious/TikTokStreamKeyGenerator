@@ -17,13 +17,15 @@ def native_build_matrix():
     ]}
 
 
-def validate_release_request(*, version, signing_policy, publish, repository, has_signpath_token):
+def validate_release_request(*, version, signing_policy, publish, repository, has_signpath_token,
+                             allow_test_certificate_release=False):
     validate_version(version)
     if signing_policy not in ('release-signing', 'test-signing', 'unsigned'):
         raise ValueError('Unknown Windows signing policy.')
     if publish and repository != PUBLIC_REPOSITORY:
         raise ValueError('Test repositories produce workflow artifacts only; publishing is disabled.')
-    if publish and signing_policy != RELEASE_SIGNING_POLICY:
+    test_release = signing_policy == 'test-signing' and allow_test_certificate_release
+    if publish and signing_policy != RELEASE_SIGNING_POLICY and not test_release:
         raise ValueError(f'Published releases require {RELEASE_SIGNING_POLICY} using {RELEASE_CERTIFICATE}.')
     if signing_policy != 'unsigned' and not has_signpath_token:
         raise ValueError('Add the CI user token as the SIGNPATH_API_TOKEN repository secret before requesting signing.')

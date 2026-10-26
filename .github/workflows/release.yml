@@ -16,6 +16,10 @@ on:
         description: Publish on the public repository after all five packages pass
         type: boolean
         default: false
+      allow_test_certificate_release:
+        description: Allow publishing with the untrusted SignPath test certificate
+        type: boolean
+        default: false
       prerelease:
         description: Mark the published release as a pre-release
         type: boolean
@@ -52,6 +56,7 @@ jobs:
           APP_VERSION: ${{ inputs.version }}
           SIGNING_POLICY: ${{ inputs.signing_policy }}
           PUBLISH: ${{ inputs.publish }}
+          ALLOW_TEST_CERTIFICATE_RELEASE: ${{ inputs.allow_test_certificate_release }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
         run: |
           python - <<'PY'
@@ -63,6 +68,7 @@ jobs:
               publish=os.environ['PUBLISH'] == 'true',
               repository=os.environ['GITHUB_REPOSITORY'],
               has_signpath_token=bool(os.environ['SIGNPATH_API_TOKEN']),
+              allow_test_certificate_release=os.environ['ALLOW_TEST_CERTIFICATE_RELEASE'] == 'true',
           )
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('matrix=' + json.dumps(native_build_matrix()) + '\n')
@@ -225,7 +231,10 @@ jobs:
         with:
           target_commitish: ${{ github.sha }}
           tag_name: v${{ inputs.version }}
-          body: ${{ inputs.changelog }}
+          body: |
+            ${{ inputs.signing_policy == 'test-signing' && '**Windows signing:** These downloads use a self-signed SignPath test certificate while the production certificate is pending. Windows will not recognize it as a publicly trusted publisher, so security warnings may appear. No certificate installation is required.' || '' }}
+
+            ${{ inputs.changelog }}
           prerelease: ${{ inputs.prerelease }}
           fail_on_unmatched_files: true
           files: artifacts/*.zip

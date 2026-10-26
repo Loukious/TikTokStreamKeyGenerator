@@ -62,6 +62,21 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unknown'):
             config.validate_release_request(**options)
 
+    def test_test_certificate_publication_requires_explicit_opt_in(self):
+        options = self.request()
+        options.update(repository=config.PUBLIC_REPOSITORY, publish=True,
+                       signing_policy='test-signing', allow_test_certificate_release=True)
+        config.validate_release_request(**options)
+        options['signing_policy'] = 'unsigned'
+        with self.assertRaisesRegex(ValueError, 'release_certificate_2026'):
+            config.validate_release_request(**options)
+        options.update(signing_policy='test-signing', repository='Loukious/TestTikTok')
+        with self.assertRaisesRegex(ValueError, 'publishing is disabled'):
+            config.validate_release_request(**options)
+        options.update(repository=config.PUBLIC_REPOSITORY, has_signpath_token=False)
+        with self.assertRaisesRegex(ValueError, 'SIGNPATH_API_TOKEN'):
+            config.validate_release_request(**options)
+
     def test_windows_build_keeps_metadata_in_debug_and_release(self):
         for kind in ('Release', 'Debug'):
             args = build.nuitka_command('1.2.3', kind, 'Windows')
