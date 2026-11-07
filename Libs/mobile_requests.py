@@ -6,6 +6,8 @@ the Android profile, rather than the desktop dual-layout checkbox.
 """
 import time
 
+from Libs.live_settings import LiveSettings
+
 # X.0gFM.LJII maps GameLandScapeOrientationChannel to 2 when true, else 1;
 # X.0gEE.LIZIZ sends that value as the screen-record orientation.
 MOBILE_BROADCAST_MODES = (('Camera LIVE', 'video'), ('Mobile gaming (screen capture)', 'screen_record'))
@@ -13,21 +15,24 @@ MOBILE_ORIENTATIONS = (('Portrait', '1'), ('Landscape', '2'))
 
 
 def create_room_form(record, *, title, hashtag_id, game_tag_id='0', gen_replay=True,
-                     age_restricted=False, cover_uri='', multi_stream_scene=False, multi_stream_source=1):
+                     age_restricted=False, cover_uri='', multi_stream_scene=False, multi_stream_source=1,
+                     allow_gifts=True, allow_comments=True, content_disclosure='off',
+                     filter_comments=True, subscriber_only_chat=False, star_comments=None,
+                     filter_spam=True, filter_flagged=False, review_flagged=False):
+    settings = LiveSettings(allow_gifts, allow_comments, content_disclosure,
+                           filter_comments, subscriber_only_chat, star_comments,
+                           filter_spam, filter_flagged, review_flagged)
     if multi_stream_scene and record.get('broadcast_type', 'video') != 'video':
         raise ValueError('Android Dual Layout requires Camera LIVE; screen capture uses a single canvas.')
     if multi_stream_scene and str(multi_stream_source) != '1':
         raise ValueError('Android Dual Layout requires multi_stream_source=1')
     form = {
         'title': title, 'cover_uri': cover_uri, 'hashtag_id': str(hashtag_id),
-        'gen_replay': str(bool(gen_replay)).lower(), 'chat_auth': '1', 'gift_auth': '1',
+        'gen_replay': str(bool(gen_replay)).lower(),
         'age_restricted': '4' if age_restricted else '0',
         'live_agreement': '0', 'game': '', 'tags': '',
         'has_commerce_goods': 'false', 'deco_list': '',
-        'hold_living_room': '1', 'create_source': '0', 'chat_l_2': '1',
-        'open_commercial_content_toggle': 'false',
-        'commercial_content_promote_myself': 'false',
-        'commercial_content_promote_third_party': 'false',
+        'hold_living_room': '1', 'create_source': '0',
         'timestamp': str(int(time.time() * 1000)),
     }
     form.update({k: str(v) for k, v in record.get('create_params', {}).items()})
@@ -47,6 +52,10 @@ def create_room_form(record, *, title, hashtag_id, game_tag_id='0', gen_replay=T
     form.update(title=title, hashtag_id=str(hashtag_id), cover_uri=cover_uri,
                 gen_replay=str(bool(gen_replay)).lower(),
                 age_restricted='4' if age_restricted else '0')
+    # Explicit startup choices take precedence over imported request extras.
+    for key in ('star_comment_switch', 'grant_group', 'grant_level', 'star_comment_qualification'):
+        form.pop(key, None)
+    form.update(settings.room_fields('mobile'))
     if multi_stream_scene:
         form.pop('live_mode', None)
         form.update(live_studio='1', multi_stream_scene='1', multi_stream_source='1')

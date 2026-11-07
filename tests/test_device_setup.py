@@ -294,7 +294,7 @@ class DeviceSetupTests(unittest.TestCase):
         self.assertTrue(w.live_page.isAncestorOf(w.title_edit))
         self.assertFalse(w.live_page.isAncestorOf(w.online_audience_table_output))
 
-    def test_view_choices_persist_and_hiding_active_view_returns_to_live(self):
+    def test_view_visibility_persists_but_startup_and_hiding_active_view_use_live(self):
         w = self.window()
         w._config_extra['ui'] = {'future_preference': 'keep'}
         w.show_workspace_view('audience')
@@ -305,11 +305,14 @@ class DeviceSetupTests(unittest.TestCase):
         self.assertFalse(w.context_view_actions['audience'].isChecked())
         w.show_workspace_view('stats')
         saved = json.loads(Path(self.path).read_text())
-        self.assertEqual(saved['ui']['active_view'], 'stats')
+        self.assertEqual(saved['ui']['active_view'], 'live')
         self.assertEqual(saved['ui']['visible_views'], ['chat', 'stats', 'safety'])
         self.assertEqual(saved['ui']['future_preference'], 'keep')
+        # Older configurations may still contain the previously selected tab.
+        saved['ui']['active_view'] = 'safety'
+        Path(self.path).write_text(json.dumps(saved))
         other = self.window()
-        self.assertIs(other.workspace_stack.currentWidget(), other.workspace_pages['stats'])
+        self.assertIs(other.workspace_stack.currentWidget(), other.live_page)
         self.assertNotIn('audience', other.visible_workspace_views)
         other.restore_workspace_views()
         self.assertEqual(other.visible_workspace_views, {'chat', 'stats', 'audience', 'safety'})

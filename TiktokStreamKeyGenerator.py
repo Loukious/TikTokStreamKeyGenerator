@@ -43,6 +43,7 @@ from packaging import version
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QIcon, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -103,6 +104,11 @@ from Libs.device_gen import (
 from Libs.signing_backend import signature_headers, is_development
 from Libs.client_profiles import ClientImplementation, device_records, mobile_record_defaults, normalize_device_type
 from Libs.mobile_requests import create_room_form, MOBILE_BROADCAST_MODES, MOBILE_ORIENTATIONS
+from Libs.live_settings import CONTENT_DISCLOSURES, LiveSettings
+from Libs.live_management import LiveManagement
+from Libs.live_management_ui import LiveManagementDialog
+from Libs.live_appeals import record_key as appeal_record_key
+from Libs.live_appeals_ui import ViolationAppealDialog
 from Libs.mobile_dual_layout import dual_layout_info, dual_create_params, distinct_push_urls, secondary_stream_id
 from Libs.campaigns import CampaignFormatError, center_params, normalize_campaigns, visit_request
 from Libs.campaign_ui import CampaignsDialog
@@ -792,7 +798,7 @@ class Stream:
             return exc.status_code is None
         return False
 
-    def _signed_get_json(self, url, *, params, priority_region="", extra_headers=None, timeout=None):
+    def _signed_get_json(self, url, *, params, priority_region="", extra_headers=None, timeout=None, retry=True):
         self._apply_live_studio_headers()
         timestamp = get_synced_unix_seconds()
         headers = {
@@ -807,7 +813,9 @@ class Stream:
         }
         headers.update(self._store_region_headers())
         headers.update(extra_headers or {})
-        return self._request_json_with_webcast_fallback("GET", url, params=params, headers=headers, timeout=timeout)
+        request = self._request_json_with_webcast_fallback if retry else self._request_json
+        return request("GET", url, params=params, headers=headers, timeout=timeout,
+                       **({"allow_redirects": False} if not retry else {}))
 
     def _signed_post_json(self, url, *, params, payload, priority_region="", timeout=20, retry=True):
         self._apply_live_studio_headers()
@@ -913,7 +921,7 @@ class Stream:
             raise RuntimeError('TikTok did not confirm the campaign view event.')
         return response
 
-    def _signed_post_form(self, url, *, params, data, priority_region="", timeout=20):
+    def _signed_post_form(self, url, *, params, data, priority_region="", timeout=20, retry=True):
         self._apply_live_studio_headers()
         body = _encode_form_body(data)
         x_ss_stub = _make_x_ss_stub(body)
@@ -931,13 +939,15 @@ class Stream:
             ),
         }
         headers.update(self._store_region_headers())
-        return self._request_json_with_webcast_fallback(
+        request = self._request_json_with_webcast_fallback if retry else self._request_json
+        return request(
             "POST",
             url,
             params=params,
             data=body,
             headers=headers,
             timeout=timeout,
+            **({"allow_redirects": False} if not retry else {}),
         )
 
     def _request_json(
@@ -1070,6 +1080,41 @@ class Stream:
             raise last_error
         raise RuntimeError(f"No candidate URL was available for {url}")
 
+    def _check_created_live_settings(self, room, settings, previous_room_id, *,
+                                     device_id, install_id, priority_region):
+        conflicts = settings.room_conflicts(room)
+        if not conflicts:
+            return
+        message = 'TikTok left ' + ' and '.join(conflicts) + ' enabled despite your startup settings.'
+        if self.roomId and self.streamId and self.roomId != previous_room_id:
+            try:
+                ended = self.endStream(device_id=device_id, install_id=install_id,
+                                       priority_region=priority_region,
+                                       room_id=self.roomId, stream_id=self.streamId)
+                if not ended:
+                    raise RuntimeError('TikTok did not confirm that the room ended.')
+            except Exception as exc:
+                raise RuntimeError(message + ' Cleanup failed; the new room may still be open.') from exc
+            message += ' The new room was ended before streaming started.'
+        raise RuntimeError(message)
+
+    def _prepare_chat_preferences(self, settings, priority_region):
+        changes = settings.as_config()
+        if not settings.subscriber_only_chat and settings.star_comments is not True:
+            return {}
+        if self.client.kind == 'pc':
+            return LiveManagement(self, priority_region=priority_region).prepare_creation(changes)
+        record = device_records(_load_config_file()).get('pc', {})
+        if not record.get('device_id') or not record.get('install_id'):
+            raise RuntimeError('Set up the PC device profile to check subscriber and Star Comments access.')
+        owner = self._cookie_account_info(priority_region)
+        owner_id = owner.get('user_id_str') or owner.get('user_id')
+        if not owner_id:
+            raise RuntimeError('Cannot verify the selected account before checking chat permissions.')
+        with Stream(cookies_path=self.cookies_path, device_type='pc', device_profile=record) as studio:
+            return LiveManagement(studio, priority_region=priority_region,
+                                  expected_user_id=owner_id).prepare_creation(changes)
+
     def createStream(
         self,
         title,
@@ -1084,12 +1129,26 @@ class Stream:
         install_id="",
         multi_stream_scene=False,
         multi_stream_source=1,
+        *,
+        allow_gifts=True,
+        allow_comments=True,
+        content_disclosure='off',
+        filter_comments=True,
+        subscriber_only_chat=False,
+        star_comments=None,
+        filter_spam=True,
+        filter_flagged=False,
+        review_flagged=False,
     ):
+        live_settings = LiveSettings(allow_gifts, allow_comments, content_disclosure,
+                                     filter_comments, subscriber_only_chat, star_comments,
+                                     filter_spam, filter_flagged, review_flagged)
         mobile_dual = self.client.kind == 'mobile' and bool(multi_stream_scene)
         previous_room_id = self.roomId
         if mobile_dual and self.client.record.get('broadcast_type', 'video') != 'video':
             raise ValueError('Android Dual Layout requires Camera LIVE; screen capture uses a single canvas.')
         self._ensure_region_context(priority_region, device_id=device_id, install_id=install_id)
+        chat_permissions = self._prepare_chat_preferences(live_settings, priority_region)
         base_url = self.getServerUrl()
         self._apply_live_studio_headers()
 
@@ -1103,7 +1162,6 @@ class Stream:
             "title": title,
             "live_studio": "1",
             "gen_replay": str(gen_replay).lower(),
-            "chat_auth": "1",
             "age_restricted": "0",
             "cover_uri": "",
             "close_room_when_close_stream": str(close_room_when_close_stream).lower(),
@@ -1112,24 +1170,25 @@ class Stream:
             "game_bitrate_type": "high",
             "screenshot_cover_status": "1",
             "multi_stream_scene": "1" if multi_stream_scene else "0",
-            "gift_auth": "1",
-            "chat_l2": "1",
-            "star_comment_switch": "true",
             "multi_stream_source": str(multi_stream_source),
             "is_group_live_session": "false",
-            "open_commercial_content_toggle": "false",
-            "commercial_content_promote_myself": "false",
-            "commercial_content_promote_third_party": "false",
             "rtc_net_enabled": "false",
         }
+        data.update(live_settings.room_fields('pc'))
 
         if self.client.kind == 'mobile':
             data = create_room_form(self.client.record, title=title, hashtag_id=hashtag_id,
                                     game_tag_id=game_tag_id, gen_replay=gen_replay,
                                     age_restricted=age_restricted, multi_stream_scene=multi_stream_scene,
-                                    multi_stream_source=multi_stream_source)
+                                    multi_stream_source=multi_stream_source,
+                                    **live_settings.as_config())
             if mobile_dual and not self._get_dual_layout_info(params)['dual_layout_unlocked']:
                 raise RuntimeError('Dual Layout is not unlocked for this account, or its eligibility check failed. No room was created.')
+        if star_comments is True:
+            for field in ('grant_group', 'grant_level'):
+                value = chat_permissions.get('star_' + field)
+                if value is not None:
+                    data[field] = str(value)
         if age_restricted:
             data["age_restricted"] = "4"
 
@@ -1183,11 +1242,15 @@ class Stream:
                     message += ' The new room was ended before either proxy started.'
                 raise RuntimeError(message)
             self.multiStreamId = secondary_stream_id(room)
+            self._check_created_live_settings(room, live_settings, previous_room_id,
+                device_id=device_id, install_id=install_id, priority_region=priority_region)
             return True
 
         try:
             if not self._apply_room_info(streamInfo["data"], require_stream_url=True):
                 raise KeyError("stream_url")
+            self._check_created_live_settings(streamInfo['data'], live_settings, previous_room_id,
+                device_id=device_id, install_id=install_id, priority_region=priority_region)
             return True
         except KeyError as exc:
             prompt = streamInfo.get("data", {}).get("prompts") or streamInfo.get("prompts")
@@ -3086,14 +3149,19 @@ def start_callback_server(stop_event=None):
 class MobileBroadcastOptions(QWidget):
     changed = Signal()
 
-    def __init__(self, record=None, parent=None):
+    def __init__(self, record=None, parent=None, label_reference=None):
         super().__init__(parent)
         self.updating = False
+        self.label_reference = label_reference
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
         layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel('Broadcast:'))
+        mode_row.setSpacing(6)
+        self.mode_label = QLabel('Broadcast:')
+        self.mode_label.setStyleSheet('font-weight: bold;')
+        mode_row.addWidget(self.mode_label)
         self.mode_combo = QComboBox()
         for label, value in MOBILE_BROADCAST_MODES:
             self.mode_combo.addItem('Mobile gaming' if value == 'screen_record' else label, value)
@@ -3102,14 +3170,35 @@ class MobileBroadcastOptions(QWidget):
         self.orientation_row = QWidget()
         orientation_layout = QHBoxLayout(self.orientation_row)
         orientation_layout.setContentsMargins(0, 0, 0, 0)
+        orientation_layout.setSpacing(6)
         orientation_layout.setSizeConstraint(QHBoxLayout.SetMinimumSize)
-        orientation_layout.addWidget(QLabel('Orientation:'))
+        self.orientation_label = QLabel('Orientation:')
+        self.orientation_label.setStyleSheet('font-weight: bold;')
+        orientation_layout.addWidget(self.orientation_label)
         self.orientation_combo = QComboBox()
         orientation_layout.addWidget(self.orientation_combo, 1)
         layout.addWidget(self.orientation_row)
+        self._set_label_width(label_reference.sizeHint().width() if label_reference is not None else
+                              max(self.mode_label.sizeHint().width(), self.orientation_label.sizeHint().width()))
+        if label_reference is not None:
+            label_reference.installEventFilter(self)
         self.set_record(record or {})
         self.mode_combo.currentIndexChanged.connect(self.on_changed)
         self.orientation_combo.currentIndexChanged.connect(self.on_changed)
+
+    def _set_label_width(self, width):
+        for label in (self.mode_label, self.orientation_label):
+            label.setFixedWidth(width)
+
+    def eventFilter(self, watched, event):
+        # Follow the surrounding form's actual label column, including font
+        # and window-size changes, while retaining this group's visibility.
+        if watched is self.label_reference:
+            if event.type() == QEvent.Resize:
+                self._set_label_width(event.size().width())
+            elif event.type() in (QEvent.FontChange, QEvent.StyleChange):
+                self._set_label_width(watched.sizeHint().width())
+        return super().eventFilter(watched, event)
 
     def set_record(self, record):
         self.updating = True
@@ -3184,6 +3273,8 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self._chat_display_room = ''
         self._chat_displayed_gifts = OrderedDict()
         self._chat_displayed_message_ids = OrderedDict()
+        self._chat_viewers = OrderedDict()
+        self._submitted_appeals = set()
         self.current_stream_id = ""
         self.stream_priority_region = ""
         self.is_live = False
@@ -3413,7 +3504,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.device_setup_details_button.clicked.connect(self.show_device_setup_details)
         self.device_setup_details_button.hide()
 
-        self.mobile_broadcast_options = MobileBroadcastOptions(parent=self)
+        self.mobile_broadcast_options = MobileBroadcastOptions(parent=self, label_reference=client_label)
         self.mobile_broadcast_options.changed.connect(self.on_mobile_broadcast_changed)
         input_layout.addWidget(self.mobile_broadcast_options, 4, 0, 1, 3)
 
@@ -3478,6 +3569,35 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.chat_sound_checkbox.setToolTip('Play the system notification sound for new comments and gifts. Off by default.')
         options_grid.addWidget(self.chat_sound_checkbox, 3, 0, 1, 2)
 
+        self.allow_gifts_checkbox = QCheckBox('Allow gifts')
+        self.allow_gifts_checkbox.setChecked(True)
+        self.allow_gifts_checkbox.setToolTip('Allow viewers to send gifts in the next LIVE, subject to TikTok account eligibility.')
+        self.allow_comments_checkbox = QCheckBox('Allow comments')
+        self.allow_comments_checkbox.setChecked(True)
+        self.allow_comments_checkbox.setToolTip('Uncheck to create the next LIVE with comments already disabled.')
+        for column, checkbox in enumerate((self.allow_gifts_checkbox, self.allow_comments_checkbox)):
+            checkbox.setMinimumWidth(0)
+            checkbox.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            options_grid.addWidget(checkbox, 4, column)
+
+        disclosure_label = QLabel('Content disclosure:')
+        allow_label_shrink(disclosure_label)
+        self.content_disclosure_combo = QComboBox()
+        for label, value in CONTENT_DISCLOSURES:
+            self.content_disclosure_combo.addItem(label, value)
+        self.content_disclosure_combo.setFixedHeight(36)
+        allow_horizontal_shrink(self.content_disclosure_combo)
+        disclosure_label.setBuddy(self.content_disclosure_combo)
+        self.content_disclosure_combo.setAccessibleName('Content disclosure')
+        self.content_disclosure_combo.setToolTip(
+            'Own brand: promotional content. Third-party brand: paid partnership. '
+            'Choose both when both apply to your LIVE.')
+        options_grid.addWidget(disclosure_label, 5, 0)
+        options_grid.addWidget(self.content_disclosure_combo, 5, 1)
+        startup_hint = CaptionLabel('Gifts, comments and disclosure apply to new LIVE rooms. Resuming keeps the existing room settings.')
+        startup_hint.setWordWrap(True)
+        options_grid.addWidget(startup_hint, 6, 0, 1, 2)
+
         options_grid.setColumnStretch(0, 1)
         options_grid.setColumnStretch(1, 1)
         options_layout.addLayout(options_grid)
@@ -3506,8 +3626,10 @@ class StreamKeyGeneratorWindow(AccentWindow):
         options_layout.addLayout(thumbnail_row)
         options_layout.addStretch(1)
         for checkbox in (self.replay_checkbox, self.age_restricted_checkbox,
-                         self.close_room_checkbox, self.dual_layout_checkbox):
+                         self.close_room_checkbox, self.dual_layout_checkbox,
+                         self.allow_gifts_checkbox, self.allow_comments_checkbox):
             checkbox.toggled.connect(self.update_stream_options_summary)
+        self.content_disclosure_combo.currentIndexChanged.connect(self.update_stream_options_summary)
 
         root_layout.addWidget(input_group, 1)
 
@@ -3971,14 +4093,29 @@ class StreamKeyGeneratorWindow(AccentWindow):
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.violation_details_output.setWordWrap(True)
         self.violation_details_output.setTextElideMode(Qt.ElideRight)
+        self.violation_details_output.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.violation_details_output.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.violation_details_output.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.violation_details_output.itemSelectionChanged.connect(self.update_appeal_control)
         safety_layout.addWidget(QLabel("Violations"), 2, 0, 1, 4)
         safety_layout.addWidget(self.violation_details_output, 3, 0, 1, 4)
 
         self.refresh_audience_safety_button = QPushButton("Refresh Audience / Safety")
         self.refresh_audience_safety_button.clicked.connect(lambda: self.refresh_audience_safety(force=True))
         self.refresh_audience_safety_button.setFixedHeight(36)
-        allow_button_shrink(self.refresh_audience_safety_button)
-        safety_layout.addWidget(self.refresh_audience_safety_button, 4, 0, 1, 4)
+        self.refresh_audience_safety_button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.appeal_violation_button = QPushButton('Review / appeal selected')
+        self.appeal_violation_button.setFixedHeight(36)
+        self.appeal_violation_button.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.appeal_violation_button.setToolTip('Select a violation to check its appeal status and available options.')
+        self.appeal_violation_button.setEnabled(False)
+        self.appeal_violation_button.clicked.connect(self.open_violation_appeal)
+        safety_actions = QHBoxLayout()
+        safety_actions.setSpacing(10)
+        safety_actions.addWidget(self.refresh_audience_safety_button)
+        safety_actions.addWidget(self.appeal_violation_button)
+        safety_actions.addStretch(1)
+        safety_layout.addLayout(safety_actions, 4, 0, 1, 4)
         safety_layout.setColumnStretch(1, 1)
         safety_layout.setColumnStretch(3, 1)
         output_layout.addStretch()
@@ -4014,6 +4151,9 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.chat_reconnect_button.setEnabled(False)
         self.chat_reconnect_button.clicked.connect(self.reconnect_chat)
         chat_header.addWidget(self.chat_reconnect_button)
+        self.manage_live_button = QPushButton('Manage LIVE')
+        self.manage_live_button.clicked.connect(self.open_live_management)
+        chat_header.addWidget(self.manage_live_button)
         chat_clear_button = QPushButton('Clear')
         chat_clear_button.clicked.connect(self.clear_chat)
         chat_header.addWidget(chat_clear_button)
@@ -4064,14 +4204,53 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.settings_navigation = navigation
         layout.addWidget(navigation)
         layout.addWidget(self.settings_stack, 1)
+        self.comment_preferences_panel, comment_layout = section('New LIVE comment preferences')
+        comment_note = CaptionLabel('Saved for new LIVE rooms. Use Manage LIVE to change an existing room.')
+        comment_note.setWordWrap(True)
+        comment_layout.addWidget(comment_note)
+        self.filter_comments_checkbox = QCheckBox('Filter potentially unkind comments')
+        self.filter_comments_checkbox.setChecked(True)
+        self.subscriber_chat_checkbox = QCheckBox('Subscriber / Super Fans-only chat')
+        self.star_comments_combo = QComboBox()
+        for label, value in (('Account default', None), ('On', True), ('Off', False)):
+            self.star_comments_combo.addItem(label, value)
+        self.star_comments_combo.setAccessibleName('Star Comments')
+        for control in (self.filter_comments_checkbox, self.subscriber_chat_checkbox):
+            comment_layout.addWidget(control)
+        star_row = QHBoxLayout()
+        star_row.addWidget(QLabel('Star Comments:'))
+        star_row.addWidget(self.star_comments_combo, 1)
+        comment_layout.addLayout(star_row)
+        permission_note = CaptionLabel('Subscriber chat and Star Comments are checked against account permissions before starting.')
+        permission_note.setWordWrap(True)
+        comment_layout.addWidget(permission_note)
+        comment_layout.addWidget(QLabel('Additional Android filters:'))
+        self.spam_comments_checkbox = QCheckBox('Filter spam comments')
+        self.spam_comments_checkbox.setChecked(True)
+        self.flagged_comments_checkbox = QCheckBox('Filter community-flagged comments')
+        self.review_flagged_checkbox = QCheckBox('Review community-flagged comments')
+        for control in (self.spam_comments_checkbox, self.flagged_comments_checkbox, self.review_flagged_checkbox):
+            comment_layout.addWidget(control)
+        comment_layout.addStretch(1)
+        manage = QPushButton('Manage current LIVE / account tools')
+        manage.clicked.connect(self.open_live_management)
+        comment_layout.addWidget(manage)
+        for control in (self.filter_comments_checkbox, self.subscriber_chat_checkbox,
+                        self.spam_comments_checkbox, self.flagged_comments_checkbox, self.review_flagged_checkbox):
+            control.toggled.connect(self.update_stream_options_summary)
+        self.allow_comments_checkbox.toggled.connect(self._sync_comment_preferences)
+        self.star_comments_combo.currentIndexChanged.connect(self.update_stream_options_summary)
+        self._sync_comment_preferences()
+        self.settings_pages = {'account': self.account_panel, 'stream': self.stream_options_panel,
+                               'comments': self.comment_preferences_panel}
         for key, title, page in (('account', 'Account', self.account_panel),
-                                 ('stream', 'Stream', self.stream_options_panel)):
+                                 ('stream', 'Stream', self.stream_options_panel),
+                                 ('comments', 'Comments', self.comment_preferences_panel)):
             page.setObjectName(key)
             self.settings_stack.addWidget(page)
             navigation.addItem(key, title)
         navigation.currentItemChanged.connect(
-            lambda key: self.settings_stack.setCurrentWidget(
-                self.account_panel if key == 'account' else self.stream_options_panel))
+            lambda key: self.settings_stack.setCurrentWidget(self.settings_pages[key]))
         navigation.setCurrentItem('stream')
         footer = QHBoxLayout()
         footer.addWidget(CaptionLabel('Settings are saved when you close this window.'))
@@ -4086,7 +4265,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
         style_controls(self.settings_dialog)
 
     def open_settings(self, page='stream'):
-        self.settings_navigation.setCurrentItem('account' if page == 'account' else 'stream')
+        self.settings_navigation.setCurrentItem(page if page in self.settings_pages else 'stream')
         self.settings_dialog.exec()
 
     def _save_workspace_settings(self):
@@ -4239,10 +4418,8 @@ class StreamKeyGeneratorWindow(AccentWindow):
             visible = [*visible, 'chat']
         for key in self.view_actions:
             self.set_workspace_view_visible(key, key in visible)
-        active = preferences.get('active_view', 'live')
-        if not isinstance(active, str) or active not in self.workspace_pages or (active != 'live' and active not in self.visible_workspace_views):
-            active = 'live'
-        self.show_workspace_view(active)
+        # Always begin with stream setup, including configs saved on another tab.
+        self.show_workspace_view('live')
 
     def account_is_loading(self):
         return (self.account_info_in_flight or self.account_refresh_timer.isActive() or
@@ -4269,6 +4446,30 @@ class StreamKeyGeneratorWindow(AccentWindow):
         for field in (self.account_username, self.account_status, self.can_go_live_output, self.dual_layout_output):
             field.setPlaceholderText('Loading…' if loading else '')
 
+    def live_start_settings(self):
+        extra = {}
+        if hasattr(self, 'star_comments_combo'):
+            extra = {'filter_comments': self.filter_comments_checkbox.isChecked(),
+                     'subscriber_only_chat': self.subscriber_chat_checkbox.isChecked() and self.allow_comments_checkbox.isChecked(),
+                     'star_comments': self.star_comments_combo.currentData(),
+                     'filter_spam': self.spam_comments_checkbox.isChecked(),
+                     'filter_flagged': self.flagged_comments_checkbox.isChecked(),
+                     'review_flagged': self.review_flagged_checkbox.isChecked()}
+        return LiveSettings(self.allow_gifts_checkbox.isChecked(), self.allow_comments_checkbox.isChecked(),
+                            self.content_disclosure_combo.currentData(), **extra)
+
+    def _sync_comment_preferences(self):
+        if not hasattr(self, 'star_comments_combo'):
+            return
+        comments = self.allow_comments_checkbox.isChecked()
+        if not comments:
+            self.subscriber_chat_checkbox.setChecked(False)
+        self.subscriber_chat_checkbox.setEnabled(comments)
+        for control in (self.spam_comments_checkbox, self.flagged_comments_checkbox, self.review_flagged_checkbox):
+            control.setEnabled(self.device_type == 'mobile')
+            control.setToolTip('Applies when starting an Android LIVE.')
+        self.review_flagged_checkbox.setToolTip('Let hosts and moderators review community-flagged comments in an Android LIVE.')
+
     def update_stream_options_summary(self):
         if not hasattr(self, 'stream_options_summary') or not hasattr(self, 'dual_layout_checkbox'):
             return
@@ -4276,8 +4477,20 @@ class StreamKeyGeneratorWindow(AccentWindow):
                    'Dual layout' if self.dual_layout_checkbox.isChecked() else 'Single canvas']
         if self.age_restricted_checkbox.isChecked():
             options.append('Age restricted')
+        if hasattr(self, 'content_disclosure_combo'):
+            settings = self.live_start_settings()
+            if not settings.allow_gifts:
+                options.append('Gifts off')
+            if not settings.allow_comments:
+                options.append('Comments off')
+            if settings.content_disclosure != 'off':
+                options.append('Disclosure: ' + self.content_disclosure_combo.currentText())
+            if settings.subscriber_only_chat:
+                options.append('Subscriber chat')
+            if settings.star_comments is not None:
+                options.append('Star Comments ' + ('on' if settings.star_comments else 'off'))
         self.stream_options_summary.setText(' · '.join(options))
-        self.stream_options_summary.setToolTip('Change these options in Settings → Stream.')
+        self.stream_options_summary.setToolTip('Change these options in Settings → Stream or Comments.')
 
     def _rapidapi_error_kind(self, message):
         failure = hosted_signer_failure(message)
@@ -4752,6 +4965,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.violation_details_output.insertRow(row)
         room_title = live.get("title") or ""
         self._set_table_item(self.violation_details_output, row, 0, room_title)
+        self.violation_details_output.item(row, 0).setData(Qt.UserRole, copy.deepcopy(record))
         self._set_table_item(
             self.violation_details_output,
             row,
@@ -4784,6 +4998,8 @@ class StreamKeyGeneratorWindow(AccentWindow):
             self._style_active_violation_row(row)
 
     def _populate_violation_table(self, safety):
+        selected = self.selected_violation()
+        selected_key = appeal_record_key(selected) if selected else None
         self.violation_details_output.setRowCount(0)
         self.violation_details_output.clearSpans()
 
@@ -4804,6 +5020,43 @@ class StreamKeyGeneratorWindow(AccentWindow):
             self.violation_details_output.setSpan(0, 0, 1, 5)
             self._set_table_item(self.violation_details_output, 0, 0, "No violations returned by violation_list.")
         self.violation_details_output.resizeRowsToContents()
+        if selected_key:
+            for row in range(self.violation_details_output.rowCount()):
+                record = self.violation_details_output.item(row, 0).data(Qt.UserRole)
+                if isinstance(record, dict) and appeal_record_key(record) == selected_key:
+                    self.violation_details_output.selectRow(row)
+                    break
+        self.update_appeal_control()
+
+    def selected_violation(self):
+        table = self.violation_details_output
+        item = table.item(table.currentRow(), 0)
+        record = item.data(Qt.UserRole) if item is not None else None
+        return copy.deepcopy(record) if isinstance(record, dict) else None
+
+    def update_appeal_control(self):
+        if hasattr(self, 'appeal_violation_button'):
+            self.appeal_violation_button.setEnabled(bool(self.selected_violation())
+                and self.get_cookie_file_status()[0] and not bool(self._foreground_task))
+
+    def open_violation_appeal(self):
+        record = self.selected_violation()
+        if not record or self._foreground_task is not None or not self.get_cookie_file_status()[0]:
+            return
+        profile = copy.deepcopy(self.saved_device_records().get('pc', {}))
+        if not profile.get('device_id') or not profile.get('install_id'):
+            self.show_error('Set up the PC device profile to review and appeal LIVE violations. It also supports Android-created rooms.')
+            return
+        cookies_path, kind = self.get_cookies_path(), self.device_type
+        region = self.stream_priority_region or self.region_combo.currentText()
+        def factory():
+            return Stream(cookies_path=cookies_path, device_type='pc', device_profile=profile)
+        def current():
+            return not self._closing and self.get_cookies_path() == cookies_path and self.device_type == kind
+        dialog = ViolationAppealDialog(factory, record, priority_region=region, is_current=current,
+            submitted=self._submitted_appeals, parent=self)
+        dialog.appeal_submitted.connect(lambda _: self.refresh_audience_safety(force=True))
+        dialog.exec()
 
     def _populate_audience_list(self, ranks, notice):
         self.online_audience_table_output.setRowCount(0)
@@ -5042,7 +5295,28 @@ class StreamKeyGeneratorWindow(AccentWindow):
                                  viewed_cache_path=os.path.join(os.path.dirname(CONFIG_PATH), 'campaign_views.json'), parent=self)
         dialog.exec()
 
+    def open_live_management(self):
+        if self._foreground_task is not None or not self.get_cookie_file_status()[0]:
+            return
+        record = copy.deepcopy(self.saved_device_records().get('pc', {}))
+        if not record.get('device_id') or not record.get('install_id'):
+            self.show_error('Set up the PC device profile to use LIVE management. It also manages Android-created rooms.')
+            return
+        cookies_path = self.get_cookies_path()
+        room_id = str(self.current_room_id or '') if self.is_live else ''
+        kind = self.device_type
+        region = self.stream_priority_region or self.region_combo.currentText()
+        def factory():
+            return Stream(cookies_path=cookies_path, device_type='pc', device_profile=record)
+        def current():
+            return (not self._closing and self.get_cookies_path() == cookies_path and self.device_type == kind
+                    and (str(self.current_room_id or '') if self.is_live else '') == room_id)
+        dialog = LiveManagementDialog(factory, room_id=room_id, priority_region=region,
+            viewers=list(self._chat_viewers.values()), is_current=current, parent=self)
+        dialog.exec()
+
     def update_device_mode_controls(self):
+        self._sync_comment_preferences()
         mobile = self.device_type == 'mobile'
         self.mobile_broadcast_options.set_record(self.devices.get('mobile', {}))
         self.mobile_broadcast_options.setVisible(mobile)
@@ -5828,6 +6102,8 @@ class StreamKeyGeneratorWindow(AccentWindow):
                                         'live' if self.is_live else 'offline')
         self.refresh_stats_button.setEnabled(has_cookies and bool(self.current_room_id))
         self.chat_reconnect_button.setEnabled(self.is_live and bool(self.current_room_id))
+        self.manage_live_button.setEnabled(has_cookies and not bool(self._foreground_task))
+        self.update_appeal_control()
         if hasattr(self, "refresh_audience_safety_button"):
             self.refresh_audience_safety_button.setEnabled(has_cookies)
         if hasattr(self, "toggle_stream_credentials_button"):
@@ -5980,6 +6256,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
 
     def clear_chat(self):
         self.chat_output.clear()
+        self._chat_viewers.clear()
 
     def stop_chat(self):
         self._chat_generation += 1
@@ -6072,6 +6349,11 @@ class StreamKeyGeneratorWindow(AccentWindow):
                 self._chat_displayed_message_ids[message.message_id] = None
                 if len(self._chat_displayed_message_ids) > 2000:
                     self._chat_displayed_message_ids.popitem(last=False)
+            if message.user_id:
+                self._chat_viewers[str(message.user_id)] = {'id': str(message.user_id), 'name': name}
+                self._chat_viewers.move_to_end(str(message.user_id))
+                if len(self._chat_viewers) > 500:
+                    self._chat_viewers.popitem(last=False)
         if lines:
             self.chat_output.appendPlainText('\n'.join(lines))
             scroll.setValue(scroll.maximum() if at_bottom else position)
@@ -6329,6 +6611,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
             "generate_replay": self.replay_checkbox.isChecked(),
             "close_room_when_close_stream": self.close_room_checkbox.isChecked(),
             "age_restricted": self.age_restricted_checkbox.isChecked(),
+            **self.live_start_settings().as_config(),
             "device_type": self.device_type,
             "devices": self.saved_device_records(),
             "device_id": self.device_id,
@@ -6341,7 +6624,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
             "ui": {
                 **(self._config_extra.get('ui', {}) if isinstance(self._config_extra.get('ui'), dict) else {}),
                 "visible_views": [key for key in self.view_actions if key in self.visible_workspace_views],
-                "active_view": self.workspace_navigation.currentRouteKey() or 'live',
+                "active_view": 'live',
                 "known_views": list(self.view_actions),
             },
         }
@@ -6439,6 +6722,18 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.replay_checkbox.setChecked(data.get("generate_replay", True))
         self.close_room_checkbox.setChecked(data.get("close_room_when_close_stream", False))
         self.age_restricted_checkbox.setChecked(data.get("age_restricted", False))
+        live_settings = LiveSettings.from_config(data)
+        self.allow_gifts_checkbox.setChecked(live_settings.allow_gifts)
+        self.allow_comments_checkbox.setChecked(live_settings.allow_comments)
+        self.content_disclosure_combo.setCurrentIndex(
+            self.content_disclosure_combo.findData(live_settings.content_disclosure))
+        self.filter_comments_checkbox.setChecked(live_settings.filter_comments)
+        self.subscriber_chat_checkbox.setChecked(live_settings.subscriber_only_chat)
+        self.star_comments_combo.setCurrentIndex(0 if live_settings.star_comments is None else (1 if live_settings.star_comments else 2))
+        self.spam_comments_checkbox.setChecked(live_settings.filter_spam)
+        self.flagged_comments_checkbox.setChecked(live_settings.filter_flagged)
+        self.review_flagged_checkbox.setChecked(live_settings.review_flagged)
+        self._sync_comment_preferences()
         self.chat_sound_checkbox.setChecked(data.get('chat_notification_sound') is True)
         self.load_workspace_preferences(data.get('ui', {}))
 
@@ -6715,6 +7010,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
         self.save_config(show_message=False)
 
         stream_started = False
+        live_settings = self.live_start_settings()
         self.go_live_button.setEnabled(False)
         self.pause_live_button.setEnabled(False)
         self.resume_live_button.setEnabled(False)
@@ -6854,7 +7150,8 @@ class StreamKeyGeneratorWindow(AccentWindow):
                     self.thumbnail_edit.text(),
                     self.device_id,
                     self.install_id,
-                    multi_stream_scene=dual_layout_requested, label='Starting LIVE…'))
+                    multi_stream_scene=dual_layout_requested,
+                    **live_settings.as_config(), label='Starting LIVE…'))
 
                 if dual_layout_requested and created and not distinct_push_urls(stream.streamUrl, stream.multiStreamUrl):
                     # The room exists but has no second canvas; end it so the

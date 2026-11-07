@@ -411,10 +411,68 @@ from different accounts. Saved sessions can expire; sign in again in Studio and
 reimport if account refresh reports an expired session.
 **Settings** contains Account settings (cookies, account facts and the API key
 in production) and Stream preferences (replay, age restriction, close behavior,
-dual layout and thumbnail). Settings are saved when the dialog closes.
+dual layout, gifts, comments, content disclosure and thumbnail). Settings are saved when the dialog closes.
+
+In **Settings → Stream**, uncheck **Allow gifts** to disable receiving gifts,
+or **Allow comments** to create the next LIVE with comments already off.
+**Content disclosure** offers Off, Own brand (promotional content), Third-party
+brand (paid partnership), or both. These choices are saved across restarts and
+apply to new PC, Android camera, and mobile-gaming rooms. Resuming an existing
+room keeps that room's settings. TikTok still controls account eligibility.
+If the creation response explicitly reports gifts or comments enabled despite
+an off selection, the app stops startup and attempts to end the new room.
+
+**Settings → Comments** saves new-room preferences for comment filtering,
+subscriber/Super Fans-only chat, and Star Comments (Account default, On, or Off).
+Android also has separate spam, community-flagged comment, and host/moderator
+review switches. Subscriber chat and explicitly enabled Star Comments require
+an account permission check before creation; unavailable permissions stop startup.
+
+Open **Chat → Manage LIVE**, or **Settings → Comments → Manage current LIVE /
+account tools**, for these controls:
+
+- **Comments:** turn comments and filtering on/off during a LIVE, switch
+  subscriber-only chat, and control Star Comments, including audience and minimum level.
+- **Blocked words:** list, add, and remove account keywords (up to 500 entries,
+  30 characters each; emoji can count as two).
+- **Viewers:** select a recent commenter or enter a numeric user ID to mute,
+  unmute, block, or unblock. Mutes can last 5 seconds through the entire LIVE.
+- **Moderators:** list, add, and remove account moderators by user ID.
+- **About me:** edit or clear the LIVE intro using TikTok's returned templates
+  and character limits. Currently supports single-input templates; TikTok may review changes.
+
+Management uses the saved PC/Studio device profile and selected cookies, including
+for Android-created rooms. Configure that profile before using management or
+checking Android subscriber/Star eligibility. Room controls require an active
+LIVE; blocked words, moderators, and About me are also available before going live.
+Changing runtime controls does not change saved new-room preferences. Operations
+run in the background, verify the account and room owner, and send changes only
+after an action button is pressed. Failed writes are not automatically retried;
+partial updates and unconfirmed results are displayed for review and refresh.
+These unofficial endpoints remain subject to TikTok eligibility and server changes.
+
+**Safety → Review / appeal selected** opens the selected LIVE violation's current
+details and appeal status. For eligible general restrictions, choose one of
+TikTok's appeal reasons, then click **Submit appeal**. **Other** requires an
+explanation of up to 140 characters (emoji may count as two). Restrictions using
+TikTok's snapshot-based flow show a confirmation without a reason field.
+
+The app verifies the signed-in account, the selected violation, and fresh appeal
+eligibility before submitting. It uses the saved PC/Studio profile, including for
+Android-created rooms. Loading, selecting, or refreshing a violation does not
+submit an appeal. Accepted submissions are marked as submitted, not approved;
+use **Refresh** to check TikTok's decision. Submission failures are not retried
+automatically. During the current app session, a successful appeal cannot be
+submitted again for the same account and restriction.
+
+Copyright restrictions that require uploaded evidence use **Open official
+details** to continue in TikTok's official form. Sign in to the same account in
+the browser if requested. Expired, pending, rejected, and unavailable appeals
+remain viewable; the app only offers a new submission when TikTok allows it.
+
 The **Views** menu shows or hides Chat, Stats, Audience and Safety, remembers your
 choices and offers **Restore default views**. Hiding a view does not stop
-monitoring or suppress LIVE violation alerts. The LIVE view is always available.
+monitoring or suppress LIVE violation alerts. The app always opens on LIVE at startup.
 Right-click the workspace for device/settings, refresh and copy actions; the
 same features remain available through visible menus and buttons. Shortcuts:
 Ctrl+1–4 selects the existing views, Ctrl+5 opens Chat, Ctrl+, opens Settings,
@@ -429,7 +487,7 @@ message IDs across automatic reconnects; TikTok controls how much history can
 be recovered. **Reconnect** retries immediately; **Clear** clears the display.
 The display retains up to 1,000 lines in memory and stays at your scroll position
 when you scroll back. Entries are plain text and are not saved to disk.
-There is no message sending or moderation interface.
+Use **Manage LIVE → Viewers** for moderation. The app does not send chat messages.
 
 **Settings → Stream → Chat notification sound** enables the system notification
 sound for new comments and gifts. It is off by default and saved when Settings
@@ -472,6 +530,8 @@ System appearance synchronization and accent contrast checks:
 `python -m unittest tests.test_system_theme tests.test_fluent_menus`.
 Windows Studio import, account isolation and file export checks:
 `python -m unittest tests.test_studio_cookies`.
+LIVE startup settings, request encoding and persistence checks:
+`python -m unittest tests.test_live_settings`.
 
 
 ## Building and Windows code signing
