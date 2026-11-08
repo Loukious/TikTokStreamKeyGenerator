@@ -2,7 +2,21 @@
 
 This project creates a TikTok LIVE room and gives OBS an RTMP target through a local FFmpeg proxy. OBS does not stream directly to TikTok; it streams to the local proxy, and the proxy forwards the stream with the metadata TikTok expects.
 
-For most users, [Loukious/StreamLabsTikTokStreamKeyGenerator](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator) is still the preferred option. It has a smaller architecture, fewer moving parts, and therefore less that can go wrong. Use this project if you specifically need the newer local FFmpeg proxy flow, SEI injection path, RapidAPI signing integration, or the extra GUI controls here.
+## Stream to TikTok directly from OBS
+
+**[Loukious's TikTok extension for OBS-Multi-RTMP](https://github.com/Loukious/obs-multi-rtmp)** brings TikTok streaming into OBS. Start your LIVE with OBS's normal streaming controls or add TikTok destinations in the **Multiple output** dock. The plugin handles room creation, native TikTok signing, and stream metadata inside OBS.
+
+- **Streamlabs, LIVE Studio, and Android:** choose the connection method that fits your account, including Android Camera LIVE and mobile gaming.
+- **QR login:** sign in with your phone, renew expired codes automatically, and save account-named `cookies_<username>.json` files.
+- **Portrait + landscape:** eligible LIVE Studio and Android Camera LIVE accounts can stream both layouts with independent scenes, resolutions, encoders, and audio settings.
+- **LIVE controls and account feedback:** manage gifts, comments, and content disclosure; check eligibility, signer quota, LIVE violations, and appeals.
+- **OBS 33 support:** the Windows installer uses the new plugin layout and cleans up legacy copies while preserving other plugins and user settings.
+
+**[Download the OBS plugin](https://github.com/Loukious/obs-multi-rtmp/releases/latest)** · **[Setup and requirements](https://github.com/Loukious/obs-multi-rtmp#readme)**
+
+Requires OBS **32.2.1 or newer**. On Windows, use **Installer.exe** or the standard ZIP for OBS **33+**, and **OBS32.zip** for OBS **32.2.1**. Native LIVE Studio/Android connections require the [RapidAPI signer](https://rapidapi.com/Loukious/api/tiktok-live-studio-api-signer1); Streamlabs connections require Streamlabs TikTok LIVE access. Dual layout also requires account eligibility.
+
+For a standalone Streamlabs tool, see [StreamLabsTikTokStreamKeyGenerator](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator). This project remains available for its standalone LIVE Studio/Android workflow, local FFmpeg proxy, chat, and other app controls.
 
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/loukious)
 
@@ -202,9 +216,11 @@ Use `tw` only when it matches the actual Studio environment's returned or captur
 
 Changing this query parameter requires signing the updated query. Argus includes the query digest. `x-ss-stub` hashes the request body, so it remains the same if the body is unchanged. Ladon uses the timestamp, app/license identifiers and a random prefix; different Ladon strings alone do not demonstrate a region dependency. Compare signatures only with timestamps and randomness controlled.
 
-### Why is the StreamLabs project preferred?
+### Which project should I use?
 
-It has a smaller flow and fewer dependencies. This project has more advanced features, but that also means more components: login, room creation, request signing, FFmpeg, local RTMP proxying, and stream metadata injection.
+- Use the **[OBS plugin](https://github.com/Loukious/obs-multi-rtmp)** to manage TikTok connections and stream directly from OBS, including native dual layouts on eligible accounts.
+- Use **[StreamLabsTikTokStreamKeyGenerator](https://github.com/Loukious/StreamLabsTikTokStreamKeyGenerator)** for a standalone app that retrieves a stream key through Streamlabs.
+- Use **this app** for the standalone LIVE Studio/Android workflow with a local FFmpeg proxy and its additional app controls.
 
 ### Why do I need FFmpeg?
 
