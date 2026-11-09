@@ -453,6 +453,14 @@ account tools**, for these controls:
   30 characters each; emoji can count as two).
 - **Viewers:** select a recent commenter or enter a numeric user ID to mute,
   unmute, block, or unblock. Mutes can last 5 seconds through the entire LIVE.
+  The list also includes identified viewers from the loaded audience table.
+  For **View contributions**, you can also type `@username` or `username`;
+  the app resolves an exact username match to its numeric ID. Use `@` for an
+  all-digit username (for example `@12345`). Display names are not matched.
+  **View contributions** opens a viewer card with watch time, likes, shares,
+  comment count, follow duration when confirmed, and up to ten recent comments.
+  Emoji and returned emote images appear inline; hover or click an emote to
+  enlarge it. The section can be collapsed and refreshed manually.
 - **Moderators:** list, add, and remove account moderators by user ID.
 - **About me:** edit or clear the LIVE intro using TikTok's returned templates
   and character limits. Currently supports single-input templates; TikTok may review changes.
@@ -466,6 +474,14 @@ run in the background, verify the account and room owner, and send changes only
 after an action button is pressed. Failed writes are not automatically retried;
 partial updates and unconfirmed results are displayed for review and refresh.
 These unofficial endpoints remain subject to TikTok eligibility and server changes.
+
+Contributions use TikTok's summary for the selected viewer and current room.
+Watch time follows Studio's rounded minute ranges; it is not a continuous timer.
+Missing values display as unavailable, and account/LIVE changes invalidate the
+card. This feature does not enumerate every viewer or infer watch time from
+chat activity. Availability and freshness depend on TikTok's response.
+Username lookup uses TikTok's user search; unavailable or ambiguous results show
+an error. After a successful lookup, Refresh stays bound to the resolved viewer ID.
 
 **Safety → Review / appeal selected** opens the selected LIVE violation's current
 details and appeal status. For eligible general restrictions, choose one of

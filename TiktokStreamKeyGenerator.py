@@ -5072,6 +5072,11 @@ class StreamKeyGeneratorWindow(AccentWindow):
                 self._set_table_item(self.online_audience_table_output, row, 2, fields.get("nickname"))
                 self._set_table_item(self.online_audience_table_output, row, 3, fields.get("score"))
                 self._set_table_item(self.online_audience_table_output, row, 4, fields.get("badges"))
+                user = self._audience_entry_user(entry)
+                viewer_id = str(user.get('id_str') or user.get('id') or '')
+                if viewer_id.isascii() and viewer_id.isdigit() and 0 < len(viewer_id) <= 20 and int(viewer_id) > 0:
+                    self.online_audience_table_output.item(row, 1).setData(Qt.UserRole,
+                        {'id': viewer_id, 'name': str(fields.get('nickname') or fields.get('display_id') or viewer_id)})
 
             if len(ranks) > 50:
                 row = self.online_audience_table_output.rowCount()
@@ -5311,8 +5316,15 @@ class StreamKeyGeneratorWindow(AccentWindow):
         def current():
             return (not self._closing and self.get_cookies_path() == cookies_path and self.device_type == kind
                     and (str(self.current_room_id or '') if self.is_live else '') == room_id)
+        viewers = dict(self._chat_viewers)
+        if room_id:
+            for row in range(self.online_audience_table_output.rowCount()):
+                item = self.online_audience_table_output.item(row, 1)
+                viewer = item.data(Qt.UserRole) if item else None
+                if isinstance(viewer, dict) and viewer.get('id'):
+                    viewers.setdefault(viewer['id'], viewer)
         dialog = LiveManagementDialog(factory, room_id=room_id, priority_region=region,
-            viewers=list(self._chat_viewers.values()), is_current=current, parent=self)
+            viewers=list(viewers.values()), is_current=current, parent=self)
         dialog.exec()
 
     def update_device_mode_controls(self):

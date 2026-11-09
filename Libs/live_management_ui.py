@@ -13,6 +13,8 @@ from Libs.fluent_ui import (
 )
 from Libs.gui_tasks import BackgroundTask, Work, single_shot
 from Libs.live_management import LiveManagement
+from Libs.viewer_contributions_ui import ViewerContributionsDialog
+from Libs.viewer_contributions import parse_viewer_lookup
 
 
 def note(text):
@@ -163,7 +165,7 @@ class LiveManagementDialog(AccentDialog):
 
     def _viewers_page(self, viewers):
         layout = self._page('viewers', 'Viewers')
-        layout.addWidget(note('Select a recent commenter or enter a viewer ID. Actions affect the current LIVE.'))
+        layout.addWidget(note('Select a viewer or enter @username / user ID for contributions. Moderation uses numeric user IDs.'))
         self.viewer_table = self._table(['Viewer', 'User ID'])
         layout.addWidget(self.viewer_table, 1)
         for viewer in viewers:
@@ -173,8 +175,10 @@ class LiveManagementDialog(AccentDialog):
                 self.viewer_table.setItem(row, column, QTableWidgetItem(str(value)))
         inputs = QHBoxLayout()
         self.viewer_id = LineEdit()
-        self.viewer_id.setMaxLength(20)
-        self.viewer_id.setPlaceholderText('Viewer user ID')
+        self.viewer_id.setMaxLength(25)
+        self.viewer_id.setPlaceholderText('@username or numeric user ID')
+        self.viewer_id.setAccessibleName('Viewer username or user ID')
+        self.viewer_id.setToolTip('Use @ before an all-digit username, for example @12345.')
         self.mute_duration = ComboBox()
         for label, seconds in (('5 seconds', 5), ('30 seconds', 30), ('1 minute', 60), ('5 minutes', 300), ('Entire LIVE', 0)):
             self.mute_duration.addItem(label, seconds)
@@ -182,6 +186,12 @@ class LiveManagementDialog(AccentDialog):
         inputs.addWidget(self.viewer_id, 1)
         inputs.addWidget(self.mute_duration)
         layout.addLayout(inputs)
+        contributions = QHBoxLayout()
+        self.contributions_button = PushButton('View contributions')
+        self.contributions_button.clicked.connect(self.open_contributions)
+        contributions.addWidget(self.contributions_button)
+        contributions.addStretch(1)
+        layout.addLayout(contributions)
         row = QHBoxLayout()
         self.viewer_buttons = {}
         for action, label in (('mute', 'Mute'), ('unmute', 'Unmute'), ('block', 'Block'), ('unblock', 'Unblock')):
@@ -274,9 +284,15 @@ class LiveManagementDialog(AccentDialog):
         self.remove_word_button.setEnabled(ready and 0 <= self.word_table.currentRow() < len(self.words))
         self.viewer_id.setEnabled(live)
         self.mute_duration.setEnabled(live)
-        valid_viewer = self.viewer_id.text().isascii() and self.viewer_id.text().isdigit() and int(self.viewer_id.text()) > 0
+        try:
+            lookup_kind, _ = parse_viewer_lookup(self.viewer_id.text())
+            valid_lookup = True
+        except ValueError:
+            lookup_kind = ''
+            valid_lookup = False
         for button in self.viewer_buttons.values():
-            button.setEnabled(live and valid_viewer)
+            button.setEnabled(live and valid_lookup and lookup_kind == 'id')
+        self.contributions_button.setEnabled(live and valid_lookup)
         moderator_id = self.moderator_id.text()
         self.add_moderator_button.setEnabled(ready and 'moderators' in self.loaded and moderator_id.isascii() and moderator_id.isdigit() and int(moderator_id) > 0)
         self.remove_moderator_button.setEnabled(ready and 0 <= self.moderator_table.currentRow() < len(self.moderators))
@@ -349,7 +365,7 @@ class LiveManagementDialog(AccentDialog):
             method, success = operations[key]
             self._run(method, success=success)
         else:
-            self.status.setText('Recent commenters are listed. Enter a user ID to act on another viewer.')
+            self.status.setText('Use an exact @username or user ID to view contributions. Display names are not usernames.')
 
     def _bind_state(self, state):
         self._load_state(state)
@@ -428,6 +444,22 @@ class LiveManagementDialog(AccentDialog):
     def moderate(self, action):
         self._run('moderate_user', self.viewer_id.text().strip(), action,
                   duration=self.mute_duration.currentData())
+
+    def open_contributions(self):
+        self.update_controls()
+        if not self.contributions_button.isEnabled():
+            return
+        viewer_id = self.viewer_id.text().strip()
+        name = ''
+        for row in range(self.viewer_table.rowCount()):
+            if self.viewer_table.item(row, 1).text() == viewer_id:
+                name = self.viewer_table.item(row, 0).text()
+                break
+        dialog = ViewerContributionsDialog(self.stream_factory, room_id=self.room_id,
+            viewer_id=viewer_id, viewer_name=name, expected_user_id=self.user_id,
+            priority_region=self.priority_region, is_current=self._current, parent=self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _load_moderators(self, moderators):
         self.moderators = list(moderators)

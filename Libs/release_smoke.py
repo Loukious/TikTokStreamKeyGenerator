@@ -22,7 +22,8 @@ def run(log=None):
     if is_development():
         raise RuntimeError('Release smoke test requires the hosted signing backend')
     for name in ('mobile_device_gen', 'client_profiles', 'live_chat', 'campaign_ui',
-                 'studio_import_ui', 'ffmpeg_sei_proxy', 'gui_tasks', 'error_reporting'):
+                 'studio_import_ui', 'ffmpeg_sei_proxy', 'gui_tasks', 'error_reporting',
+                 'viewer_contributions_ui'):
         importlib.import_module('Libs.' + name)
     checkpoint('Creating QApplication')
     app = QApplication.instance() or QApplication([])
