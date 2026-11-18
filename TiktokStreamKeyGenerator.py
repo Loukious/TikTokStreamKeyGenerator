@@ -6783,7 +6783,7 @@ class StreamKeyGeneratorWindow(AccentWindow):
 
     @foreground('Logging in…', cancellable=True)
     def start_browser_login_flow(self):
-        if sys.platform == 'darwin':
+        if sys.platform != 'win32':
             QDesktopServices.openUrl(QUrl(COOKIE_EXPORT_GUIDE_URL))
             return
         if self.device_type == 'mobile':
@@ -7442,15 +7442,15 @@ class LoginDialog(QDialog):
         self.refresh_button.clicked.connect(self.load_qr_code)
         button_row.addWidget(self.refresh_button)
 
-        if sys.platform == 'darwin':
+        if sys.platform == 'win32':
+            browser_button = QPushButton("Login in Browser")
+            browser_button.clicked.connect(self.open_browser_login)
+            button_row.addWidget(browser_button)
+        else:
             guide_button = QPushButton("Cookie Export Guide")
             guide_button.setToolTip("Export cookies with the browser extension, then choose Account → Import cookies…")
             guide_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(COOKIE_EXPORT_GUIDE_URL)))
             button_row.addWidget(guide_button)
-        else:
-            browser_button = QPushButton("Login in Browser")
-            browser_button.clicked.connect(self.open_browser_login)
-            button_row.addWidget(browser_button)
 
         layout.addLayout(button_row)
         self.load_qr_code()

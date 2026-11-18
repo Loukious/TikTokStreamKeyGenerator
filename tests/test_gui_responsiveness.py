@@ -314,27 +314,29 @@ class ResponsiveTests(unittest.TestCase):
             error.assert_not_called()
         self.assertNotEqual(constructor_threads[0], threading.get_ident())
 
-    def test_macos_login_offers_cookie_export_guide(self):
+    def test_macos_and_linux_login_offer_cookie_export_guide(self):
         w = self.window()
-        with (
-            patch.object(gui.sys, 'platform', 'darwin'),
-            patch.object(gui.LoginDialog, 'load_qr_code') as load_qr,
-            patch.object(gui.QDesktopServices, 'openUrl') as open_url,
-            patch.object(gui, 'start_callback_server') as start_server,
-        ):
-            dialog = gui.LoginDialog(w)
-            buttons = {button.text(): button for button in dialog.findChildren(gui.QPushButton)}
-            load_qr.assert_called_once()
-            self.assertNotIn('Login in Browser', buttons)
-            buttons['Cookie Export Guide'].click()
-            open_url.assert_called_once_with(gui.QUrl(gui.COOKIE_EXPORT_GUIDE_URL))
-            dialog.reject()
+        for platform in ('darwin', 'linux'):
+            with (
+                self.subTest(platform=platform),
+                patch.object(gui.sys, 'platform', platform),
+                patch.object(gui.LoginDialog, 'load_qr_code') as load_qr,
+                patch.object(gui.QDesktopServices, 'openUrl') as open_url,
+                patch.object(gui, 'start_callback_server') as start_server,
+            ):
+                dialog = gui.LoginDialog(w)
+                buttons = {button.text(): button for button in dialog.findChildren(gui.QPushButton)}
+                load_qr.assert_called_once()
+                self.assertNotIn('Login in Browser', buttons)
+                buttons['Cookie Export Guide'].click()
+                open_url.assert_called_once_with(gui.QUrl(gui.COOKIE_EXPORT_GUIDE_URL))
+                dialog.reject()
 
-            open_url.reset_mock()
-            w.start_browser_login_flow()
-            wait_until(lambda: w._foreground_task is None)
-            open_url.assert_called_once_with(gui.QUrl(gui.COOKIE_EXPORT_GUIDE_URL))
-            start_server.assert_not_called()
+                open_url.reset_mock()
+                w.start_browser_login_flow()
+                wait_until(lambda: w._foreground_task is None)
+                open_url.assert_called_once_with(gui.QUrl(gui.COOKIE_EXPORT_GUIDE_URL))
+                start_server.assert_not_called()
 
     def test_qr_poll_does_not_overlap_and_cancelled_confirmation_does_not_save(self):
         w = self.window()
