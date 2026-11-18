@@ -17,6 +17,7 @@ from PySide6.QtCore import QCoreApplication, QEvent
 from tests import test_client_modes as base
 from Libs.error_reporting import (HostedSignerError, OperationError, SignerFailureKind,
                                  hosted_signer_failure, write_proxy_error, read_proxy_error)
+from Libs import app_paths
 from Libs import signers as headers_api
 from Libs import XFrameSign as frames_api
 from Libs import ffmpeg_sei_proxy as proxy
@@ -262,6 +263,44 @@ class SignerBoundaryTests(unittest.TestCase):
 
     def call(self, module):
         return module._post_signatures({}) if module is headers_api else module._post_json('/framesign', {})
+
+    def test_macos_signers_read_saved_settings_before_bundle_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / 'home'
+            bundle = Path(temp) / 'TikTok.app' / 'Contents' / 'MacOS'
+            bundle.mkdir(parents=True)
+            (bundle / 'config.json').write_text('{"rapidapi_key": "legacy-key"}', encoding='utf-8')
+            with (
+                patch.object(app_paths.sys, 'platform', 'darwin'),
+                patch.object(app_paths.sys, 'frozen', True, create=True),
+                patch.object(app_paths, '__file__', str(bundle / 'Libs' / 'app_paths.py')),
+                patch.object(app_paths.os.path, 'expanduser', return_value=str(home)),
+                patch.dict(os.environ, {'rapidapi_key': '', 'RAPIDAPI_KEY': ''}),
+            ):
+                path = Path(app_paths.config_path())
+                self.assertEqual(path, home / 'Library' / 'Application Support' / 'TiktokStreamKeyGenerator' / 'config.json')
+                path.write_text('{"rapidapi_key": "saved-key"}', encoding='utf-8')
+                for module in (headers_api, frames_api):
+                    self.assertEqual(module._headers(module.DEFAULT_RAPIDAPI_URL)['X-RapidAPI-Key'], 'saved-key')
+
+                path.unlink()
+                for module in (headers_api, frames_api):
+                    self.assertEqual(module._headers(module.DEFAULT_RAPIDAPI_URL)['X-RapidAPI-Key'], 'legacy-key')
+
+    def test_packaged_windows_and_linux_signers_read_config_beside_executable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            install_dir = Path(temp)
+            path = install_dir / 'config.json'
+            path.write_text('{"rapidapi_key": "portable-key"}', encoding='utf-8')
+            with patch.object(app_paths.sys, 'frozen', True, create=True), \
+                    patch.dict(os.environ, {'rapidapi_key': '', 'RAPIDAPI_KEY': ''}):
+                for platform, binary in [('win32', 'TikTok.exe'), ('linux', 'TikTok.bin')]:
+                    with self.subTest(platform=platform), \
+                            patch.object(app_paths.sys, 'platform', platform), \
+                            patch.object(app_paths.sys, 'executable', str(install_dir / binary)):
+                        self.assertEqual(Path(app_paths.config_path()), path)
+                        for module in (headers_api, frames_api):
+                            self.assertEqual(module._headers(module.DEFAULT_RAPIDAPI_URL)['X-RapidAPI-Key'], 'portable-key')
 
     def test_http_status_sets_category_even_when_body_words_disagree(self):
         for module in [headers_api, frames_api]:

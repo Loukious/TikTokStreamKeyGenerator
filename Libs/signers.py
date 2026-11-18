@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests
+from Libs.app_paths import read_signer_config
 from Libs.error_reporting import HostedSignerError, SignerFailureKind
 
 try:
@@ -59,25 +60,8 @@ def _logs_dir() -> Path:
 LOG_PATH = _logs_dir() / "signature_api.log"
 
 
-def _read_config() -> dict:
-    for path in (
-        APP_ROOT / "config.json",
-        APP_ROOT.parent / "config.json",
-        Path.cwd() / "config.json",
-    ):
-        try:
-            if path.exists():
-                with path.open("r", encoding="utf-8") as fh:
-                    value = json.load(fh)
-                if isinstance(value, dict):
-                    return value
-        except Exception:
-            continue
-    return {}
-
-
 def _config_value(*names: str) -> str:
-    config = _read_config()
+    config = read_signer_config()
     for name in names:
         value = os.environ.get(name)
         if value:

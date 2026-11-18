@@ -293,7 +293,8 @@ class ResponsiveTests(unittest.TestCase):
             constructor_threads.append(threading.get_ident())
             return client
         event, stop = threading.Event(), threading.Event()
-        with patch.object(gui, 'backup_protocol_registry', return_value={'command': 'fixture'}), \
+        with patch.object(gui.sys, 'platform', 'win32'), \
+             patch.object(gui, 'backup_protocol_registry', return_value={'command': 'fixture'}), \
              patch.object(gui, 'register_temporary_protocol_handler', return_value=True), \
              patch.object(gui, 'restore_protocol_registry') as restore, \
              patch.object(gui, 'start_callback_server', return_value=(object(), 1, event, {'url': None})), \
@@ -312,6 +313,28 @@ class ResponsiveTests(unittest.TestCase):
             client.save_cookies.assert_not_called()
             error.assert_not_called()
         self.assertNotEqual(constructor_threads[0], threading.get_ident())
+
+    def test_macos_login_offers_cookie_export_guide(self):
+        w = self.window()
+        with (
+            patch.object(gui.sys, 'platform', 'darwin'),
+            patch.object(gui.LoginDialog, 'load_qr_code') as load_qr,
+            patch.object(gui.QDesktopServices, 'openUrl') as open_url,
+            patch.object(gui, 'start_callback_server') as start_server,
+        ):
+            dialog = gui.LoginDialog(w)
+            buttons = {button.text(): button for button in dialog.findChildren(gui.QPushButton)}
+            load_qr.assert_called_once()
+            self.assertNotIn('Login in Browser', buttons)
+            buttons['Cookie Export Guide'].click()
+            open_url.assert_called_once_with(gui.QUrl(gui.COOKIE_EXPORT_GUIDE_URL))
+            dialog.reject()
+
+            open_url.reset_mock()
+            w.start_browser_login_flow()
+            wait_until(lambda: w._foreground_task is None)
+            open_url.assert_called_once_with(gui.QUrl(gui.COOKIE_EXPORT_GUIDE_URL))
+            start_server.assert_not_called()
 
     def test_qr_poll_does_not_overlap_and_cancelled_confirmation_does_not_save(self):
         w = self.window()

@@ -140,7 +140,7 @@ If browser login is unavailable or keeps failing, you can skip it by importing c
 1. Install the [Export cookie JSON file for Puppeteer](https://chromewebstore.google.com/detail/export-cookie-json-file-f/nmckokihipjgplolmcmjakknndddifde) extension in Chrome.
 2. Log in to TikTok in Chrome and stay on a `tiktok.com` page.
 3. Click the extension icon and export the cookies. It downloads a JSON file containing the session for the site you are on.
-4. In the app, point the **Cookies file** field at the downloaded JSON file (type or paste the path, or edit `cookies_path` in the config), then use **Refresh Account Info**.
+4. In the app, choose **Account → Import cookies…** and select the downloaded JSON file.
 
 The exported file is a JSON array of `{name, value, domain, ...}` cookie objects, which is the format the app reads directly.
 
