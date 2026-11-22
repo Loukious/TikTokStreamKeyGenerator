@@ -70,11 +70,13 @@ You need a RapidAPI key from:
 
 [TikTok LIVE Studio API Signer on RapidAPI](https://rapidapi.com/Loukious/api/tiktok-live-studio-api-signer1)
 
+See the wiki guide, [Get a RapidAPI key — step-by-step screenshots](https://github.com/Loukious/TikTokStreamKeyGenerator/wiki/Get-a-RapidAPI-key), for signup, subscription, and app setup.
+
 After subscribing:
 
 1. Open the app.
-2. Paste your RapidAPI key into the **RapidAPI Key** field.
-3. Save/apply it.
+2. Open **Settings → Account** and paste your RapidAPI key into the **RapidAPI Key** field.
+3. Click **Done** to save it.
 4. Start the stream normally.
 
 Without a valid RapidAPI key, streaming is expected to fail or receive a LIVE visibility restriction such as an integrity/authenticity violation. Treat the RapidAPI key as required, not optional.
